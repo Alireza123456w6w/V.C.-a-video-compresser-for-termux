@@ -1,4 +1,3 @@
-# 1. آپلود فایل سالم به گیت‌هاب
 git add vc.sh
 git commit -m "Fix syntax error and apply creator branding"
 git push origin main
