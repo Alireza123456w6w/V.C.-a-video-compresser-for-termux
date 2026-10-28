@@ -1,18 +1,12 @@
+cat > vc.sh << 'EOF'
 #!/usr/bin/env bash
 # =============================================================================
 #  VidCompress (vc) - ffmpeg video compression toolkit for Termux
 #  Creator : Alireza123456w6w
 #  Website : offers-pishnahadat.vercel.app
-#
-#  Quick start (in Termux):
-#     bash vc.sh --setup      # install ffmpeg + storage access
-#     bash vc.sh --install    # install the "vc" command
-#     vc                      # interactive menu
-#     vc -p target -t 95 video.mp4        # CLI: compress to ~95 MB
-#     vc -h                   # all options
 # =============================================================================
 
-VERSION="1.0"
+VERSION="1.1"
 CREATOR="Alireza123456w6w"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -79,7 +73,7 @@ trunc() {
   (( m < 12 )) && m=12
   if (( ${#1} > m )); then printf '%s…' "${1:0:m-1}"; else printf '%s' "$1"; fi
 }
-to_sec() {   # "90" | "1:30" | "0:01:30.5"  ->  seconds
+to_sec() {
   [[ $1 =~ ^([0-9]+:){0,2}[0-9]+(\.[0-9]+)?$ ]] || return 1
   awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else if (NF==2) print $1*60+$2; else print $1 }' <<<"$1"
 }
@@ -93,7 +87,7 @@ ask() {
     printf '%s' "$a"
   fi
 }
-ask_int() {   # prompt min max default
+ask_int() {
   local a
   while true; do
     a=$(ask "$1 ($2-$3)" "$4")
@@ -101,7 +95,7 @@ ask_int() {   # prompt min max default
     err "Enter a number between $2 and $3." >&2
   done
 }
-yesno() {     # prompt default(y|n)
+yesno() {
   local a; a=$(ask "$1 (y/n)" "${2:-y}")
   [[ ${a,,} == y* ]]
 }
@@ -210,7 +204,7 @@ probe() {
   return 0
 }
 
-calc_edur() {   # sets EDUR + IN_OPTS from DUR and trim settings
+calc_edur() {
   IN_OPTS=()
   EDUR=$(awk -v d="$DUR" -v s="${TRIM_START:-0}" -v e="${TRIM_END:-0}" \
     'BEGIN{ if (e>0 && e<d) d=e; d-=s; if (d<0) d=0; printf "%.3f", d }')
@@ -219,7 +213,7 @@ calc_edur() {   # sets EDUR + IN_OPTS from DUR and trim settings
   return 0
 }
 
-calc_bitrate() {   # video kbps needed to hit TARGET_MB (decimal MB, 3% safety margin)
+calc_bitrate() {
   local a=0
   case $AUDIO in aac) a=$ABR;; copy) a=${SRC_ABR:-128};; none) a=0;; esac
   awk -v mb="$TARGET_MB" -v d="$EDUR" -v a="$a" \
@@ -241,7 +235,7 @@ build_vf() {
   fi
   (IFS=,; printf '%s' "${f[*]}")
 }
-build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
+build_venc() {
   local pass=$1 br=$2 xp="log-level=error"
   VENC=()
   case $CODEC in
@@ -253,6 +247,253 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
         p2) xp+=":pass=2:stats=$TMPD/x265.stats";;
       esac
       VENC+=(-x265-params "$xp");;
+    x264)
+      VENC+=(-c:v libx264 -preset "$SPEED" -pix_fmt yuv420p)
+      if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi
+      case $pass in
+        p1) VENC+=(-pass 1 -passlogfile "$TMPD/x264");;
+        p2) VENC+=(-pass 2 -passlogfile "$TMPD/x264");;
+      esac;;
+    hw265) VENC+=(-c:v hevc_mediacodec -b:v "${br:-$VBR}k" -tag:v hvc1);;
+    hw264) VENC+=(-c:v h264_mediacodec -b:v "${br:-$VBR}k");;
+  esac
+}
+build_aenc() {
+  case $AUDIO in
+    none) AENC=(-an);;
+    copy) AENC=(-c:a copy);;
+    *)    local ac=2; (( ABR <= 48 )) && ac=1
+          AENC=(-c:a aac -b:a "${ABR}k" -ac "$ac");;
+  esac
+}
+
+# --------------------------------------------------- progress-bar runner -----
+run_ffmpeg() {
+  local label=$1 pi=$2 pt=$3 rc cols w
+  shift 3
+  cols=$(term_cols); w=$(( cols - 34 )); (( w < 8 )) && w=8; (( w > 28 )) && w=28
+  ffmpeg -nostdin -hide_banner -loglevel error -progress pipe:1 -nostats -y "$@" 2>>"$LOG" |
+  {
+    cur=0; spd=""
+    while IFS='=' read -r key val; do
+      case $key in
+        out_time_us|out_time_ms) [[ $val =~ ^[0-9]+$ ]] && cur=$val;;
+        speed) spd=${val//[x ]/}; [[ $spd =~ ^[0-9.]+$ ]] || spd="";;
+        progress)
+          read -r pct eta < <(awk -v c="$cur" -v d="$EDUR" -v pi="$pi" -v pt="$pt" -v s="$spd" 'BEGIN{
+              p = c/1e6/d; if (p > 1) p = 1; if (p < 0) p = 0;
+              pct = int(((pi-1) + p) / pt * 100);
+              if (s+0 > 0) { r = ((1-p) + (pt-pi)) * d / s;
+                printf "%d %02d:%02d:%02d\n", pct, r/3600, (r%3600)/60, r%60 }
+              else printf "%d --:--:--\n", pct }')
+          filled=$(( pct * w / 100 ))
+          printf -v b1 '%*s' "$filled" ''; printf -v b2 '%*s' "$(( w - filled ))" ''
+          sp=${spd:+${spd}x}
+          printf '\r\033[K%s[%s%s] %3d%% %s ETA %s' "${label:+$label }" "${b1// /#}" "${b2// /.}" "$pct" "${sp:---}" "$eta"
+          ;;
+      esac
+    done
+  }
+  rc=${PIPESTATUS[0]}
+  printf '\r\033[K'
+  return "$rc"
+}
+
+# -------------------------------------------------------------- file naming ---
+unique_out() {
+  local src=$1 dir base out n=0
+  dir=${OUTDIR:-$(dirname -- "$src")}
+  mkdir -p -- "$dir" 2>/dev/null
+  base=$(basename -- "$src"); base=${base%.*}
+  out="$dir/${base}${SUFFIX}.mp4"
+  while [[ -e $out ]]; do n=$(( n + 1 )); out="$dir/${base}${SUFFIX}_$n.mp4"; done
+  printf '%s' "$out"
+}
+add_result() { RESULTS+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$@")"); }
+
+# ------------------------------------------------------- compress one file ---
+compress_file() {
+  local src=$1 name dst tmp in_sz out_sz saved passes=1 br="" vf rc=0 odur status t0=$SECONDS
+  name=$(basename -- "$src")
+  if ! probe "$src"; then
+    add_result "$name" "-" "-" "-" "-" "FAILED (unreadable)"; N_FAIL=$(( N_FAIL + 1 )); return 1
+  fi
+  in_sz=$(fsize "$src")
+  if ! calc_edur; then
+    err "Trim range is outside the video."
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (trim)"; N_FAIL=$(( N_FAIL + 1 )); return 1
+  fi
+  printf '  %s%sx%s %s %s fps | %s | %s%s\n' "$C_D" "$SRC_W" "$SRC_H" "$SRC_VCODEC" "$SRC_FPS" \
+    "$(fmt_time "$EDUR")" "$(human "$in_sz")" "$C_0"
+
+  if (( TARGET_MB > 0 )); then
+    if (( in_sz <= TARGET_MB * 1000000 )) && [[ -z $TRIM_START$TRIM_END ]]; then
+      warn "Already under ${TARGET_MB} MB - skipped."
+      add_result "$name" "$(human "$in_sz")" "-" "-" "-" "SKIPPED (under target)"; return 0
+    fi
+    if ! br=$(calc_bitrate); then
+      err "Target ${TARGET_MB} MB is too small for a video this long."
+      add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (target too small)"; N_FAIL=$(( N_FAIL + 1 )); return 1
+    fi
+    echo "  Video bitrate: ${br} kbps"
+  elif [[ $CODEC == hw* ]]; then
+    br=$VBR
+  fi
+  [[ -n $br && $CODEC == x* ]] && passes=2
+
+  TMPD=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
+  dst=$(unique_out "$src"); tmp="$dst.part"; CUR_TMP=$tmp
+  vf=$(build_vf); VFARG=(); [[ -n $vf ]] && VFARG=(-vf "$vf")
+  build_aenc
+  META=(); (( STRIP_META )) && META=(-map_metadata -1 -map_chapters -1)
+
+  if (( passes == 2 )); then
+    build_venc p1 "$br"
+    run_ffmpeg "pass 1/2" 1 2 "${IN_OPTS[@]}" -i "$src" -map 0:v:0 "${VFARG[@]}" "${VENC[@]}" -an -f null /dev/null
+    rc=$?
+    if (( rc == 0 )); then
+      build_venc p2 "$br"
+      run_ffmpeg "pass 2/2" 2 2 "${IN_OPTS[@]}" -i "$src" -map 0:v:0 -map '0:a?' "${VFARG[@]}" "${VENC[@]}" \
+        "${AENC[@]}" "${META[@]}" -movflags +faststart -f mp4 "$tmp"
+      rc=$?
+    fi
+  else
+    build_venc single "$br"
+    run_ffmpeg "" 1 1 "${IN_OPTS[@]}" -i "$src" -map 0:v:0 -map '0:a?' "${VFARG[@]}" "${VENC[@]}" \
+      "${AENC[@]}" "${META[@]}" -movflags +faststart -f mp4 "$tmp"
+    rc=$?
+  fi
+  rm -rf "$TMPD"; TMPD=""
+
+  if (( rc != 0 )) || [[ ! -s $tmp ]]; then
+    err "ffmpeg failed (exit $rc). Last log lines:"
+    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    rm -f -- "$tmp"; CUR_TMP=""
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED"
+    N_FAIL=$(( N_FAIL + 1 )); return 1
+  fi
+  mv -f -- "$tmp" "$dst"; CUR_TMP=""
+
+  out_sz=$(fsize "$dst")
+  saved=$(awk -v a="$in_sz" -v b="$out_sz" 'BEGIN{ d=(1-b/a)*100; printf "%s%.0f%%", (d>=0 ? "-" : "+"), (d>=0 ? d : -d) }')
+  status="OK"
+  odur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$dst" 2>/dev/null | head -n1)
+  if ! awk -v a="${odur:-0}" -v b="$EDUR" 'BEGIN{ d=a-b; if (d<0) d=-d; exit !(d<=2.5) }'; then
+    status="CHECK (duration differs)"; warn "Output duration differs from expected - please check the file."
+  fi
+  if (( out_sz >= in_sz )); then
+    status="OK (not smaller)"; warn "Output is not smaller than the original. Try a higher CRF or lower resolution."
+  fi
+  if (( TARGET_MB > 0 && out_sz > TARGET_MB * 1000000 )); then
+    warn "Output is slightly over the ${TARGET_MB} MB target. Re-run with a smaller target."
+  fi
+  ok "$(basename -- "$dst")  $(human "$in_sz") -> $(human "$out_sz")  (${saved})"
+  if (( DELETE_ORIG )) && [[ $status == OK && -z $TRIM_START$TRIM_END ]]; then
+    rm -f -- "$src" && ok "Original deleted."
+  fi
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$dst" >/dev/null 2>&1 & }
+  N_OK=$(( N_OK + 1 )); TOTAL_IN=$(( TOTAL_IN + in_sz )); TOTAL_OUT=$(( TOTAL_OUT + out_sz ))
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "$status"
+  return 0
+}
+
+# ---------------------------------------------------------------- batch run ---
+wake_lock()   { if command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock; WAKE=1; fi; }
+wake_unlock() { if (( WAKE )) && command -v termux-wake-unlock >/dev/null 2>&1; then termux-wake-unlock; WAKE=0; fi; }
+notify() {
+  if command -v termux-notification >/dev/null 2>&1; then
+    ( timeout 8 termux-notification --title "VidCompress" --content "$1" >/dev/null 2>&1 & )
+  fi
+}
+
+print_summary() {
+  local r name old new pct tm st
+  printf '\n%s== Summary ==%s\n' "$C_B" "$C_0"
+  for r in "${RESULTS[@]}"; do
+    IFS=$'\t' read -r name old new pct tm st <<<"$r"
+    printf '%s\n    %s -> %s  %s  [%s]  %s\n' "$(trunc "$name")" "$old" "$new" "$pct" "$tm" "$st"
+  done
+  if (( N_OK > 0 )); then
+    printf '\n%sTotal:%s %s -> %s  (saved %s)\n' "$C_B" "$C_0" "$(human "$TOTAL_IN")" "$(human "$TOTAL_OUT")" \
+      "$(human $(( TOTAL_IN - TOTAL_OUT )))"
+  fi
+  printf 'Done: %d ok, %d failed.  Log: %s\n' "$N_OK" "$N_FAIL" "$(pretty "$LOG")"
+}
+
+run_batch() {
+  (( ${#SELECTED[@]} )) || { err "No videos selected."; return 1; }
+  if [[ $CODEC == hw* ]] && ! have_enc "$(hw_encoder_name)"; then
+    err "Hardware encoder '$(hw_encoder_name)' is not available in this ffmpeg build."
+    err "Pick x265 or x264 instead (Settings > 1)."
+    return 1
+  fi
+  mkdir -p "$CONF_DIR"; : > "$LOG"
+  RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0
+  wake_lock
+  local i=0 n=${#SELECTED[@]} f
+  for f in "${SELECTED[@]}"; do
+    i=$(( i + 1 ))
+    printf '\n%s[%d/%d] %s%s\n' "$C_B" "$i" "$n" "$(trunc "$(basename -- "$f")")" "$C_0"
+    compress_file "$f"
+  done
+  wake_unlock
+  print_summary
+  notify "Finished: $N_OK ok, $N_FAIL failed"
+  (( N_FAIL == 0 ))
+}
+
+# ------------------------------------------------------ size estimate (test) ---
+estimate_size() {
+  (( ${#SELECTED[@]} )) || { warn "Select a video first."; return; }
+  local src=${SELECTED[0]} slen sstart full tmp sz est br=""
+  probe "$src" || return
+  calc_edur || { err "Trim range is outside the video."; return; }
+  full=$EDUR
+  if (( TARGET_MB > 0 )); then info "Target-size mode: output will be about ${TARGET_MB} MB."; return; fi
+  [[ $CODEC == hw* ]] && br=$VBR
+  slen=$(awk -v d="$full" 'BEGIN{ printf "%.1f", (d > 25) ? 20 : d }')
+  sstart=$(awk -v d="$full" -v t="${TRIM_START:-0}" 'BEGIN{ s=d/2-10; if (s<0) s=0; printf "%.1f", t+s }')
+  info "Encoding a ${slen}s test sample from the middle of: $(basename -- "$src")"
+  TMPD=$(mktemp -d) || return
+  : > "$LOG"
+  EDUR=$slen; tmp="$TMPD/sample.mp4"
+  local vf; vf=$(build_vf); VFARG=(); [[ -n $vf ]] && VFARG=(-vf "$vf")
+  build_aenc; build_venc single "$br"
+  run_ffmpeg "" 1 1 -ss "$sstart" -t "$slen" -i "$src" -map 0:v:0 -map '0:a?' "${VFARG[@]}" "${VENC[@]}" "${AENC[@]}" -f mp4 "$tmp"
+  if [[ -s $tmp ]]; then
+    sz=$(fsize "$tmp")
+    est=$(awk -v s="$sz" -v f="$full" -v l="$slen" 'BEGIN{ printf "%d", s*f/l }')
+    ok "Estimated output: ~$(human "$est")  (original: $(human "$(fsize "$src")"))  - rough, about +/-20%"
+  else
+    err "Test encode failed."; tail -n 5 "$LOG" >&2
+  fi
+  rm -rf "$TMPD"; TMPD=""
+}
+
+# ---------------------------------------------------------- file selection ---
+list_videos() {
+  find "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
+    -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-
+}
+add_sel() {
+  local f x; f=$(readlink -f -- "$1")
+  for x in "${SELECTED[@]}"; do [[ $x == "$f" ]] && return 0; done
+  SELECTED+=("$f")
+}
+pick_from_dir() {
+  local dir=$1 files=() ans toks tok lo hi n added f i
+  mapfile -t files < <(list_videos "$dir" | head -n 60)
+  if (( ${#files[@]} == 0 )); then warn "No videos in $(pretty "$dir")"; return 1; fi
+  while true; do
+    printf '\n%s%s%s  (newest first)\n' "$C_B" "$(pretty "$dir")" "$C_0"
+    for i in "${!files[@]}"; do
+      printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "$(fsize "${files[i]}")")" "$(trunc "$(basename -- "${files[i]}")")"
+    done
+    echo "Numbers (e.g. 1 3 5-7), a = all, b = back"
+    read -r -p "> " ans || return 1
+    case ${ans,,} in
+      b|"") return 1;;
+      a) for f in "${files[@]}"; do add_  VENC+=(-x265-params "$xp");;
     x264)
       VENC+=(-c:v libx264 -preset "$SPEED" -pix_fmt yuv420p)
       if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi
