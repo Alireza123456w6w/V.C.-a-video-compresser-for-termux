@@ -12,7 +12,7 @@
 #     vc -h                   # all options
 # =============================================================================
 
-VERSION="1.0"
+VERSION="1.1"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
