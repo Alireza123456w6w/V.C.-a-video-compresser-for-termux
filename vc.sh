@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.0 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v2.1 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -9,8 +9,20 @@
 #     bash vc.sh --install    # install the "vc" command
 #     vc                      # interactive menu
 #     vc --sub                # subtitle studio (SRT add/extract/remove)
+#     vc --repair movie.mp4   # fix A/V sync drift (TV & USB player ready)
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 2.1:
+#   + Repair & Sync Center: fixes videos that play fine in VLC but drift
+#     out of sync (or refuse to play) on TVs / USB players:
+#       - Diagnose    : finds variable frame rate, bad audio rates,
+#                       A/V start offsets, missing faststart, TV-unsafe codecs
+#       - Auto-Repair : VFR -> CFR, 48 kHz AAC, H.264, clean timestamps,
+#                       faststart MP4 - re-encodes ONLY what is broken
+#       - Quick fix   : seconds-fast remux (faststart + clean timestamps)
+#       - Shift audio : move the soundtrack by +/- milliseconds
+#   + CLI: --repair, --diagnose, --quickfix, --sync-shift, --oldtv, --stereo
 #
 #  What's new in 2.0:
 #   + Subtitle Studio: embed (soft) / burn (hard) / extract / remove SRT
@@ -25,7 +37,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.0"
+VERSION="2.1"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -73,6 +85,9 @@ STATS=""            # per-job stats file (parallel mode)
 RESULT_FILE=""      # per-job results file (parallel mode)
 SUBFILTER=""
 COMPARE_OUT=""
+# --- repair & sync (v2.1)
+REPAIR_ACTION=""; REPAIR_SHIFT_MS=""; REPAIR_FPS=""
+REPAIR_CRF=18; REPAIR_PRESET=medium; REPAIR_OLDTV=0; REPAIR_STEREO=0; REPAIR_AUTO=0
 
 # --------------------------------------------------------- small utilities ---
 fsize()     { stat -c %s -- "$1" 2>/dev/null || echo 0; }
@@ -400,6 +415,159 @@ calc_bitrate() {   # video kbps needed to hit TARGET_MB (decimal MB, 3% safety m
   case $AUDIO in aac) a=$ABR;; copy) a=${SRC_ABR:-128};; none) a=0;; esac
   awk -v mb="$TARGET_MB" -v d="$EDUR" -v a="$a" \
     'BEGIN{ v = mb*8000*0.97/d - a; if (v < 40) exit 1; printf "%d", v }'
+}
+
+# ============================ repair diagnostics (v2.1) ======================
+# Deep checks for the classic "plays fine in VLC, drifts on the TV" problems:
+# variable frame rate (VFR), odd audio sample rates, A/V start offsets,
+# TV-unsafe codecs and missing faststart.
+
+num_or0() { [[ $1 =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$1" || echo 0; }
+
+frac2dec() {   # "30000/1001" | "29.97" -> decimal number
+  awk -v r="$1" 'BEGIN{
+    n = split(r, a, "/")
+    if (n == 2 && a[2] + 0 != 0) printf "%.4f", a[1] / a[2]
+    else if (r ~ /^[0-9]*\.?[0-9]+$/) printf "%.4f", r + 0
+    else print "0" }'
+}
+
+diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream
+  local f=$1 k v
+  D_VCODEC=""; D_W=0; D_H=0; D_PIX=""; D_RFPS=""; D_AFPS=""; D_VSTART=""
+  D_ACODEC=""; D_ARATE=0; D_ACH=0; D_ASTART=""; D_ANUM=0; D_DUR=0; D_FMT=""
+  [[ -f $f ]] || return 1
+  while IFS='=' read -r k v; do
+    case $k in
+      codec_name)     D_VCODEC=$v;;
+      width)          D_W=$v;;
+      height)         D_H=$v;;
+      pix_fmt)        D_PIX=$v;;
+      r_frame_rate)   D_RFPS=$v;;
+      avg_frame_rate) D_AFPS=$v;;
+      start_time)     D_VSTART=$v;;
+    esac
+  done < <(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time \
+    -of default=nw=1 "$f" 2>/dev/null)
+  [[ -n $D_VCODEC ]] || return 1
+  case $D_VCODEC in mjpeg|jpegls|png|bmp|tiff) return 1;; esac
+  D_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null | head -n1)
+  [[ $D_DUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || D_DUR=0
+  D_FMT=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$f" 2>/dev/null | head -n1)
+  D_FMT=${D_FMT%%,*}; D_FMT=${D_FMT//\"/}
+  D_ANUM=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$f" 2>/dev/null | awk 'END{print NR}')
+  if (( D_ANUM > 0 )); then
+    while IFS='=' read -r k v; do
+      case $k in
+        codec_name)  D_ACODEC=$v;;
+        sample_rate) D_ARATE=$v;;
+        channels)    D_ACH=$v;;
+        start_time)  D_ASTART=$v;;
+      esac
+    done < <(ffprobe -v error -select_streams a:0 \
+      -show_entries stream=codec_name,sample_rate,channels,start_time -of default=nw=1 "$f" 2>/dev/null)
+  fi
+  return 0
+}
+
+diag_vfr_scan() {   # $1 file -> D_VFR(0/1) D_FPSMED D_VFRBAD D_VFRDUP D_VFRN
+  local f=$1 out
+  D_VFR=0; D_FPSMED=0; D_VFRBAD=0; D_VFRDUP=0; D_VFRN=0
+  out=$(ffprobe -v error -select_streams v:0 -read_intervals "%+#400" \
+        -show_entries packet=pts_time -of csv=p=0 "$f" 2>/dev/null | awk -F, '
+    $1 ~ /^[0-9]+(\.[0-9]+)?$/ { p[n++] = $1 + 0 }
+    END {
+      if (n < 12) exit
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) if (p[j] < p[i]) { t = p[i]; p[i] = p[j]; p[j] = t }
+      m = n - 1
+      for (i = 0; i < m; i++) { d[i] = p[i+1] - p[i]; s[i] = d[i] }
+      for (i = 0; i < m; i++) for (j = i + 1; j < m; j++) if (s[j] < s[i]) { t = s[i]; s[i] = s[j]; s[j] = t }
+      med = s[int(m/2)]
+      if (med <= 0) exit
+      bad = 0; dup = 0
+      for (i = 0; i < m; i++) {
+        r = d[i] / med
+        if (r < 0.25) dup++
+        else if (r < 0.98 || r > 1.02) bad++
+      }
+      printf "%d %.4f %d %d %d\n", (((bad > m/50) || dup > 0) ? 1 : 0), 1/med, bad, dup, n
+    }')
+  [[ -n $out ]] && read -r D_VFR D_FPSMED D_VFRBAD D_VFRDUP D_VFRN <<<"$out"
+  return 0
+}
+
+diag_faststart() {   # $1 file -> D_FAST: 1 = faststart, 0 = moov at end, -1 = n/a
+  D_FAST=-1
+  local f=$1
+  case ${f##*.} in
+    mp4|MP4|m4v|M4V|mov|MOV|3gp|3GP|3g2|3G2) ;;
+    *) return 0;;
+  esac
+  if LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -aq moov; then D_FAST=1
+  elif LC_ALL=C tail -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -aq moov; then D_FAST=0
+  else D_FAST=0; fi
+}
+
+snap_fps() {   # $1 detected fps -> "<fps-filter arg> <display>" (NTSC as exact fractions)
+  awk -v f="$1" 'BEGIN{
+    split("23.976 24 25 29.97 30 48 50 59.94 60 15", vals, " ")
+    split("24000/1001 24 25 30000/1001 30 48 50 60000/1001 60 15", args, " ")
+    best = 1; bd = f - vals[1]; if (bd < 0) bd = -bd
+    for (i = 2; i <= 10; i++) { d = f - vals[i]; if (d < 0) d = -d; if (d < bd) { bd = d; best = i } }
+    if (bd / vals[best] <= 0.03) printf "%s %.3f", args[best], vals[best]
+    else printf "%.3f %.3f", f, f }'
+}
+
+diag_report() {   # $1 file -> human-readable sync / TV-compatibility report
+  local f=$1 vst ast aoff ms offword i=0
+  local -a probs=()
+  diag_probe "$f" || { err "No video stream: $(basename -- "$f")"; return 1; }
+  diag_vfr_scan "$f"; diag_faststart "$f"
+  vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
+  printf '\n%s== Diagnosis: %s ==%s\n' "$C_B" "$(basename -- "$f")" "$C_0"
+  printf '  File       : %s, %s, %s\n' "${D_FMT:-?}" "$(fmt_time "$D_DUR")" "$(human "$(fsize "$f")")"
+  printf '  Video      : %sx%s %s %s, %s fps\n' "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_RFPS")"
+  if (( D_VFR )); then
+    probs+=("variable frame rate (VFR) - the No.1 cause of audio drift on TVs")
+    printf '  Timing     : %svariable frame rate%s (%d of %d frames uneven, %d dup, median %.2f fps)\n' \
+      "$C_Y" "$C_0" "$D_VFRBAD" "$D_VFRN" "$D_VFRDUP" "$D_FPSMED"
+  else
+    printf '  Timing     : constant frame rate%s (ok)%s\n' "$C_D" "$C_0"
+  fi
+  if (( D_ANUM > 0 )); then
+    printf '  Audio      : %s %s Hz, %s ch, starts at %s s\n' "${D_ACODEC:-?}" "$D_ARATE" "$D_ACH" "$ast"
+    case $D_ACODEC in aac|mp3|ac3|eac3) ;; *) probs+=("audio codec '$D_ACODEC' - many TV/USB players cannot decode it");; esac
+    case $D_ARATE in 44100|48000) ;; *) probs+=("audio sample rate ${D_ARATE} Hz - non-48k audio drifts on some players");; esac
+  else
+    printf '  Audio      : (none)\n'
+  fi
+  aoff=$(awk -v a="$ast" -v v="$vst" 'BEGIN{ printf "%.3f", a - v }')
+  if awk -v x="$aoff" 'BEGIN{ x = (x < 0) ? -x : x; exit !(x > 0.04) }'; then
+    ms=$(awk -v x="$aoff" 'BEGIN{ printf "%d", x * 1000 }')
+    offword=$(awk -v x="$aoff" 'BEGIN{ print (x > 0) ? "late" : "early" }')
+    probs+=("audio starts ${ms#-} ms $offword relative to the video (constant offset)")
+    printf '  A/V start  : video %s s, audio %s s -> %saudio starts %s ms %s%s\n' \
+      "$vst" "$ast" "$C_Y" "${ms#-}" "$offword" "$C_0"
+  else
+    printf '  A/V start  : aligned (video %s s, audio %s s)\n' "$vst" "$ast"
+  fi
+  [[ $D_VCODEC != h264 ]] && probs+=("video codec '$D_VCODEC' - old TVs want H.264")
+  [[ $D_PIX != yuv420p ]] && probs+=("pixel format '$D_PIX' - old TVs want 8-bit yuv420p")
+  case $D_FAST in
+    1)  printf '  MP4 index  : faststart (ok)\n';;
+    0)  probs+=("MP4 index (moov) at the end - slow or broken start on TV/USB players")
+        printf '  MP4 index  : %smoov at the end (no faststart)%s\n' "$C_Y" "$C_0";;
+    *)  printf '  MP4 index  : (not an MP4-family file)\n';;
+  esac
+  if (( ${#probs[@]} )); then
+    printf '\n  %s! Problems found (%d):%s\n' "$C_Y" "${#probs[@]}" "$C_0"
+    for p in "${probs[@]}"; do i=$(( i + 1 )); printf '    %d. %s\n' "$i" "$p"; done
+    printf '\n  %s-> Fix them with:  vc --repair %s%s\n' "$C_G" "$(basename -- "$f")" "$C_0"
+  else
+    printf '\n  %sNo sync problems found - should play fine on any device.%s\n' "$C_G" "$C_0"
+  fi
+  return 0
 }
 
 # ----------------------------------------------------- ffmpeg arg builders ---
@@ -1257,6 +1425,317 @@ sub_studio() {
   done
 }
 
+# ================================================== REPAIR & SYNC (v2.1)
+# For videos that play fine in VLC/MX Player but drift out of sync (or refuse
+# to play) on TVs and USB players. Typical causes: variable frame rate, odd
+# audio sample rates, TV-unsafe codecs, broken start timestamps, no faststart.
+
+extract_subs_silent() {   # $1 video  $2 output path without extension
+  local vid=$1 obase=$2 i=0 n=0 codec lang out skipped
+  while IFS=, read -r codec lang; do
+    i=$(( i + 1 ))
+    case $codec in
+      subrip|srt|ass|ssa|mov_text|webvtt|text|stl) ;;
+      *) continue;;
+    esac
+    if (( n == 0 )); then out="$obase.srt"; else out="${obase}.${i}.srt"; fi
+    if ffmpeg -nostdin -hide_banner -loglevel error -y -i "$vid" -map "0:s:$(( i - 1 ))" \
+        -c:s srt "$out" 2>>"$LOG"; then
+      n=$(( n + 1 )); ok "Subtitle extracted: $(basename -- "$out")${lang:+ ($lang)}"
+    fi
+  done < <(ffprobe -v error -select_streams s -show_entries stream=codec_name:stream_tags=language \
+           -of csv=p=0 -- "$vid" 2>/dev/null)
+  skipped=$(( $(count_subs "$vid") - n ))
+  (( skipped > 0 )) && warn "$skipped bitmap subtitle track(s) cannot become .srt - skipped."
+  (( n > 0 )) && info "Tip: keep the .srt next to the video - most TV players auto-load it."
+  return 0
+}
+
+repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
+  local src=$(readlink -f -- "$1") tag=${2:-}
+  local name base dir out tmp rc t0=$SECONDS in_sz out_sz saved
+  local vfix=0 afix=0 vf="" fps_arg="" fps_show="" abr=192 vfps=0 stereo=""
+  local vst ast b_timing b_vinfo b_ainfo b_fast b_gap n_vst n_ast n_gap negts=0 c
+  local after_timing="?" after_fast="?" nsubs extra_audio
+  local -a vreasons=() areasons=() fargs=() venc=() aargs=()
+  name=$(basename -- "$src"); in_sz=$(fsize "$src")
+  if ! diag_probe "$src"; then err "${tag}Not a (supported) video file: $name"; return 1; fi
+  diag_vfr_scan "$src"; diag_faststart "$src"
+  vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
+  dir=$(dirname -- "$src"); base=${name%.*}
+  printf '  %s%s%s %dx%d %s %s | %s fps | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
+    "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_AFPS")" "$(fmt_time "$D_DUR")" \
+    "$(human "$in_sz")" "$C_0"
+
+  # ---- decide what has to be fixed (re-encode only what is broken)
+  (( D_VFR )) && { vfix=1; vreasons+=("variable frame rate"); }
+  [[ $D_VCODEC != h264 ]] && { vfix=1; vreasons+=("codec $D_VCODEC"); }
+  [[ $D_PIX != yuv420p ]] && { vfix=1; vreasons+=("pixel format $D_PIX"); }
+  if (( D_W % 2 != 0 || D_H % 2 != 0 )); then vfix=1; vreasons+=("odd ${D_W}x${D_H} size"); fi
+  if (( D_ANUM > 0 )); then
+    case $D_ACODEC in aac|mp3|ac3|eac3) ;; *) afix=1; areasons+=("codec $D_ACODEC");; esac
+    case $D_ARATE in 44100|48000) ;; *) afix=1; areasons+=("${D_ARATE} Hz sample rate");; esac
+    if (( REPAIR_STEREO && D_ACH > 2 )); then afix=1; areasons+=("${D_ACH}-channel audio"); fi
+    (( D_ACH > 2 )) && abr=256
+  fi
+  [[ -n $REPAIR_FPS ]] && { vfix=1; vreasons+=("forced --fps"); }
+  extra_audio=$(( D_ANUM > 1 ? D_ANUM - 1 : 0 ))
+  nsubs=$(count_subs "$src")
+  awk -v v="$vst" -v a="$ast" 'BEGIN{ if (v < -0.005 || a < -0.005) exit 1 }' || negts=1
+  b_timing="CFR"; (( D_VFR )) && b_timing="VFR (drifts!)"
+  b_vinfo="$D_VCODEC $D_PIX"
+  b_ainfo="no audio"; (( D_ANUM > 0 )) && b_ainfo="$D_ACODEC ${D_ARATE} Hz"
+  b_fast="faststart"; [[ $D_FAST == 0 ]] && b_fast="moov at end"
+  [[ $D_FMT != mov ]] && b_fast="$D_FMT"
+  b_gap=$(awk -v a="$ast" -v v="$vst" 'BEGIN{ d = a - v; if (d < 0) d = -d; printf "%d ms", d * 1000 }')
+
+  if (( vfix == 0 && afix == 0 && D_FAST == 1 && negts == 0 )) && [[ $D_FMT == mov ]]; then
+    ok "${tag}Already TV-friendly (H.264, constant frame rate, safe audio, faststart) - nothing to do."
+    return 0
+  fi
+
+  # ---- constant frame rate target (snap to the nearest standard rate)
+  if (( vfix )); then
+    vfps=$D_FPSMED
+    awk -v x="$vfps" 'BEGIN{ exit !(x + 0 > 1) }' || vfps=$(frac2dec "$D_AFPS")
+    [[ -n $REPAIR_FPS ]] && vfps=$(frac2dec "$REPAIR_FPS")
+    read -r fps_arg fps_show < <(snap_fps "$vfps")
+    if (( REPAIR_OLDTV )) && awk -v x="$fps_show" 'BEGIN{ exit !(x > 30.5) }'; then
+      fps_arg=30; fps_show="30.000"; info "Ultra-TV mode: frame rate capped at 30 fps."
+    fi
+    vf="fps=$fps_arg"
+    if (( D_W % 2 != 0 || D_H % 2 != 0 )); then vf="scale=trunc(iw/2)*2:trunc(ih/2)*2,$vf"; fi
+  fi
+
+  # ---- plan + confirmation (interactive mode only)
+  if (( REPAIR_AUTO == 0 )); then
+    while true; do
+      printf '\n%s== Repair plan ==%s\n' "$C_B" "$C_0"
+      if (( vfix )); then
+        printf '  Video : %sre-encode%s H.264 %s profile, CRF %s, constant %s fps\n' "$C_Y" "$C_0" \
+          "$( (( REPAIR_OLDTV )) && echo Main || echo High )" "$REPAIR_CRF" "$fps_show"
+        printf '         fixes : %s\n' "$(IFS=', '; printf '%s' "${vreasons[*]}")"
+      else
+        printf '  Video : %sstream copy%s (already fine - no quality loss)\n' "$C_G" "$C_0"
+      fi
+      if (( D_ANUM == 0 )); then
+        printf '  Audio : (file has no audio)\n'
+      elif (( afix )); then
+        (( REPAIR_STEREO && D_ACH > 2 )) && stereo=", stereo"
+        printf '  Audio : %sre-encode%s AAC %s kbps, 48000 Hz%s\n' "$C_Y" "$C_0" "$abr" "$stereo"
+        printf '         fixes : %s\n' "$(IFS=', '; printf '%s' "${areasons[*]}")"
+      else
+        printf '  Audio : %sstream copy%s (already fine - no quality loss)\n' "$C_G" "$C_0"
+      fi
+      printf '  Output: MP4 + faststart, clean timestamps, metadata stripped\n'
+      (( extra_audio > 0 )) && printf '          %d extra audio track(s) will be dropped\n' "$extra_audio"
+      (( nsubs > 0 )) && printf '  Subs  : %d track(s) saved as .srt next to the video\n' "$nsubs"
+      printf '  y) start    q) change quality    b) cancel\n'
+      read -r -p "> " c || return 1
+      case ${c,,} in
+        y|"") break;;
+        b) return 1;;
+        q) REPAIR_CRF=$(ask_int "CRF quality (10-28, lower = better)" 10 28 "$REPAIR_CRF")
+           REPAIR_PRESET=$(ask "Encoder speed (ultrafast..veryslow)" "$REPAIR_PRESET");;
+      esac
+    done
+  fi
+
+  # ---- run the repair
+  out=$(unique_file "$dir" "${base}_repaired" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  EDUR=$D_DUR
+  fargs=(-fflags +genpts -i "$src" -map 0:v:0)
+  (( D_ANUM > 0 )) && fargs+=(-map 0:a:0)
+  if (( vfix )); then
+    if (( REPAIR_OLDTV )); then
+      venc=(-c:v libx264 -preset "$REPAIR_PRESET" -crf "$REPAIR_CRF" -pix_fmt yuv420p -profile:v main -bf 0)
+    else
+      venc=(-c:v libx264 -preset "$REPAIR_PRESET" -crf "$REPAIR_CRF" -pix_fmt yuv420p -profile:v high)
+    fi
+    fargs+=(-vf "$vf" "${venc[@]}")
+  else
+    fargs+=(-c:v copy)
+  fi
+  if (( D_ANUM > 0 )); then
+    if (( afix )); then
+      aargs=(-af "aresample=48000:async=1" -c:a aac -b:a "${abr}k")
+      (( REPAIR_STEREO && D_ACH > 2 )) && aargs+=(-ac 2)
+    else
+      aargs=(-c:a copy)
+    fi
+    fargs+=("${aargs[@]}")
+  fi
+  fargs+=(-sn -map_metadata -1 -map_chapters -1 -muxdelay 0 \
+    -video_track_timescale 90000 -movflags +faststart -max_muxing_queue_size 4096 -f mp4 "$tmp")
+  run_ffmpeg "repair" 1 1 "${fargs[@]}"
+  rc=$?
+  CUR_TMP=""
+  if (( rc != 0 )) || [[ ! -s $tmp ]]; then
+    err "${tag}Repair failed (ffmpeg exit $rc). Last log lines:"
+    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    rm -f -- "$tmp"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED" "$src" ""
+    return 1
+  fi
+  mv -f -- "$tmp" "$out"
+  (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
+  out_sz=$(fsize "$out")
+
+  # ---- verify: show what changed
+  if diag_probe "$out" && diag_vfr_scan "$out" && diag_faststart "$out"; then
+    n_vst=$(num_or0 "$D_VSTART"); n_ast=$(num_or0 "$D_ASTART")
+    n_gap=$(awk -v a="$n_ast" -v v="$n_vst" 'BEGIN{ d = a - v; if (d < 0) d = -d; printf "%d", d * 1000 }')
+    after_timing="CFR"; (( D_VFR )) && after_timing="${C_R}still VFR!${C_0}"
+    (( D_FAST == 1 )) && after_fast="faststart"
+    printf '\n  %s-------------- before -> after --------------%s\n' "$C_D" "$C_0"
+    printf '  %-14s %-22s -> %s\n' "Frame timing" "$b_timing" "$after_timing"
+    printf '  %-14s %-22s -> %s\n' "Video" "$b_vinfo" "$D_VCODEC $D_PIX"
+    printf '  %-14s %-22s -> %s\n' "Audio" "$b_ainfo" \
+      "$( (( D_ANUM == 0 )) && echo "no audio" || echo "$D_ACODEC $D_ARATE Hz")"
+    printf '  %-14s %-22s -> %s\n' "MP4 index" "$b_fast" "$after_fast"
+    printf '  %-14s %-22s -> %s\n' "A/V start gap" "$b_gap" "${n_gap} ms"
+    if (( n_gap > 150 )); then
+      info "Audio starts $n_gap ms after the video - if lips look late, run:"
+      info "  vc --sync-shift -$n_gap $(basename -- "$out")"
+    fi
+  fi
+  saved=$(awk -v a="$in_sz" -v b="$out_sz" 'BEGIN{ if (a+0<=0) { print "0%"; exit }
+    d=(1-b/a)*100; printf "%s%.0f%%", (d>=0 ? "-" : "+"), (d>=0 ? d : -d) }')
+  ok "${tag}Repaired: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  (${saved}, $(fmt_time $(( SECONDS - t0 ))))"
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "REPAIRED" "$src" "$out"
+  if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
+  return 0
+}
+
+quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 (seconds)
+  local src=$(readlink -f -- "$1") tag=${2:-}
+  local name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs
+  local -a fargs=()
+  name=$(basename -- "$src")
+  if ! diag_probe "$src"; then err "${tag}Not a (supported) video file: $name"; return 1; fi
+  diag_vfr_scan "$src"
+  in_sz=$(fsize "$src"); dir=$(dirname -- "$src"); base=${name%.*}
+  printf '  %s%s%s %dx%d %s %s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
+    "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(fmt_time "$D_DUR")" "$(human "$in_sz")" "$C_0"
+  out=$(unique_file "$dir" "${base}_fixed" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  EDUR=$D_DUR
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  fargs=(-fflags +genpts -i "$src" -map 0:v:0)
+  (( D_ANUM > 0 )) && fargs+=(-map 0:a:0)
+  fargs+=(-c copy -sn -map_metadata -1 -map_chapters -1 -muxdelay 0 \
+    -movflags +faststart -max_muxing_queue_size 4096 -f mp4 "$tmp")
+  run_ffmpeg "quickfix" 1 1 "${fargs[@]}"
+  rc=$?; CUR_TMP=""
+  if (( rc != 0 )) || [[ ! -s $tmp ]]; then
+    err "${tag}Quick fix failed (ffmpeg exit $rc). Last log lines:"
+    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$out"
+  nsubs=$(count_subs "$src"); (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
+  out_sz=$(fsize "$out")
+  ok "${tag}Fixed: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  ($(fmt_time $(( SECONDS - t0 ))))"
+  (( D_VFR )) && warn "Video is still variable frame rate - run Auto-Repair to stop the drift."
+  [[ $D_VCODEC != h264 ]] && warn "Video codec kept as '$D_VCODEC' - run Auto-Repair to convert to H.264."
+  if (( D_ANUM > 0 )); then
+    case $D_ACODEC in aac|mp3|ac3|eac3) ;; *) warn "Audio codec kept as '$D_ACODEC' - run Auto-Repair to convert to AAC.";; esac
+    case $D_ARATE in 44100|48000) ;; *) warn "Audio kept at ${D_ARATE} Hz - run Auto-Repair to resample to 48 kHz.";; esac
+  fi
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "QUICKFIXED" "$src" "$out"
+  if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
+  return 0
+}
+
+sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
+  local src=$(readlink -f -- "$1") ms=$2 off name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs
+  local -a aargs=()
+  [[ $ms =~ ^-?[0-9]+$ ]] || { err "Shift must be a number of milliseconds (e.g. 250 or -250)."; return 1; }
+  (( ms == 0 )) && { err "A shift of 0 ms does nothing."; return 1; }
+  (( ms > 10000 || ms < -10000 )) && { err "Use a shift between -10000 and 10000 ms."; return 1; }
+  if ! diag_probe "$src"; then err "Not a (supported) video file."; return 1; fi
+  (( D_ANUM > 0 )) || { err "This file has no audio track."; return 1; }
+  off=$(awk -v m="$ms" 'BEGIN{ printf "%.3f", m / 1000 }')
+  name=$(basename -- "$src"); base=${name%.*}; dir=$(dirname -- "$src"); in_sz=$(fsize "$src")
+  if (( ms > 0 )); then info "Delaying audio by ${ms} ms (audio was too early)."
+  else info "Advancing audio by ${ms#-} ms (audio was too late)."; fi
+  case $D_ACODEC in
+    aac|mp3|ac3|eac3) aargs=(-c:a copy);;
+    *) aargs=(-c:a aac -b:a 192k -af "aresample=async=1")
+       warn "Audio re-encoded to AAC ('$D_ACODEC' is not safe in MP4).";;
+  esac
+  out=$(unique_file "$dir" "${base}_shifted" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  EDUR=$D_DUR
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  run_ffmpeg "shift" 1 1 -i "$src" -itsoffset "$off" -i "$src" \
+    -map 0:v:0 -map 1:a:0 -c:v copy "${aargs[@]}" -sn -map_metadata -1 \
+    -avoid_negative_ts make_zero -muxdelay 0 -movflags +faststart \
+    -max_muxing_queue_size 4096 -f mp4 "$tmp"
+  rc=$?; CUR_TMP=""
+  if (( rc != 0 )) || [[ ! -s $tmp ]]; then
+    err "Audio shift failed (ffmpeg exit $rc). Last log lines:"
+    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$out"
+  nsubs=$(count_subs "$src"); (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
+  out_sz=$(fsize "$out")
+  if diag_probe "$out"; then
+    ok "New start times - video: $(num_or0 "$D_VSTART") s, audio: $(num_or0 "$D_ASTART") s"
+  fi
+  ok "Shifted file: $(pretty "$out")  ($(human "$in_sz") -> $(human "$out_sz"))"
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "SHIFTED" "$src" "$out"
+  if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
+  return 0
+}
+
+shift_audio_dialog() {   # $1 video
+  local ms
+  echo " Positive = delay the audio (sound is too early)."
+  echo " Negative = advance the audio (sound is too late)."
+  echo " Example: 250    or    -250"
+  ms=$(ask "Shift audio by (ms)" "")
+  [[ -n $ms ]] && sync_shift_file "$1" "$ms"
+  return 0
+}
+
+repair_menu() {
+  local vid="" c f
+  while true; do
+    clear_screen
+    printf '%s== Repair & Sync ==%s\n\n' "$C_B" "$C_0"
+    if [[ -n $vid ]]; then printf ' Target: %s\n' "$(trunc "$(pretty "$vid")")"
+    else printf ' Target: (none selected)\n'; fi
+    printf ' Fixes audio/video drift and playback problems on TVs & USB players.\n\n'
+    echo " 1) Select target video"
+    echo " 2) Diagnose (check sync & TV compatibility)"
+    echo " 3) Auto-Repair (fixes drift - re-encodes only what is broken)"
+    echo " 4) Quick fix (seconds - faststart + clean MP4, no re-encode)"
+    echo " 5) Shift audio by +/- milliseconds (constant early/late audio)"
+    echo " 6) Repair all queued videos (batch)"
+    echo " b) back"
+    read -r -p "> " c || return
+    case $c in
+      1) if pick_target; then vid=$PICK_RESULT; ok "Target: $(basename -- "$vid")"; fi;;
+      2) if [[ -n $vid ]]; then diag_report "$vid"; pause; fi;;
+      3) if [[ -n $vid ]]; then repair_file "$vid"; pause; fi;;
+      4) if [[ -n $vid ]]; then quickfix_file "$vid"; pause; fi;;
+      5) if [[ -n $vid ]]; then shift_audio_dialog "$vid"; pause; fi;;
+      6) if (( ${#SELECTED[@]} )); then
+           REPAIR_AUTO=1
+           for f in "${SELECTED[@]}"; do printf '\n'; repair_file "$f"; done
+           REPAIR_AUTO=0; pause
+         else warn "Queue is empty - choose videos from the main menu first."; fi;;
+      b|B|"") return;;
+    esac
+  done
+}
+
 # ====================================================== EXTRA TOOLS (v2.0)
 make_gif() {
   local src s l w fps out base rc
@@ -1732,9 +2211,10 @@ main_menu() {
     echo " 4) Advanced settings"
     echo " 5) Profiles (save / load)"
     echo " 6) Subtitle studio (SRT add / extract / remove)"
-    echo " 7) Tools (info, estimate, GIF, audio, thumbs)"
-    echo " 8) START compression"
-    echo " 9) Results & compare (last batch)"
+    echo " 7) Repair & sync (fix A/V drift for TVs)"
+    echo " 8) Tools (info, estimate, GIF, audio, thumbs)"
+    echo " 9) START compression"
+    echo " r) Results & compare (last batch)"
     echo " c) Clear selection"
     echo " 0) Quit"
     read -r -p "> " c || exit 0
@@ -1745,9 +2225,10 @@ main_menu() {
       4) settings_menu;;
       5) profile_menu;;
       6) sub_studio;;
-      7) tools_menu;;
-      8) start_flow;;
-      9) results_menu;;
+      7) repair_menu;;
+      8) tools_menu;;
+      9) start_flow;;
+      r|R) results_menu;;
       c|C) SELECTED=();;
       0|q|Q) exit 0;;
     esac
@@ -1792,6 +2273,19 @@ Subtitle options:
   --mkv            output as .mkv instead of .mp4
   (FILE='auto' finds a .srt with the same name next to the video)
 
+Repair & sync options:
+  --repair FILE...       fix A/V drift and make the file play on any TV/USB
+                         player (constant frame rate, H.264, AAC 48 kHz,
+                         clean timestamps, faststart MP4)
+  --diagnose FILE        report sync / compatibility problems (no changes)
+  --quickfix FILE        remux only, no re-encode: faststart + clean timestamps
+  --sync-shift MS FILE   shift the audio: +250 = delay 250 ms, -250 = advance
+  --fps RATE             force the output frame rate for --repair (e.g. 25)
+  --repair-crf N         repair re-encode quality (default 18, lower = better)
+  --repair-preset NAME   repair encoder speed (default medium)
+  --oldtv                ultra compatibility: Main profile, no B-frames, <=30 fps
+  --stereo               downmix surround audio to stereo
+
 Other commands:
   vc --setup      install ffmpeg and storage access
   vc --install    install this script as the 'vc' command
@@ -1804,6 +2298,10 @@ Examples:
   vc -y --srt auto -p balanced movie.mp4      # compress + embed movie.srt
   vc -y --srt-burn auto -p social movie.mp4   # compress + burn subtitles
   vc -y -p small --mkv movie.mp4              # mkv output (native srt subs)
+  vc --diagnose movie.mkv                     # what is wrong with this file?
+  vc --repair movie.mkv                       # fix drift, TV-ready output
+  vc --repair --oldtv movie.mkv               # ancient TV / USB stick mode
+  vc --sync-shift -250 movie.mp4              # audio was 250 ms late
 EOF
 }
 
@@ -1859,10 +2357,32 @@ main() {
       --keepsubs) KEEP_SUBS=1; shift;;
       --nosubs)   KEEP_SUBS=0; shift;;
       --mkv)      OUT_EXT=mkv; shift;;
+      --repair)   REPAIR_ACTION=repair; shift;;
+      --diagnose) REPAIR_ACTION=diagnose; shift;;
+      --quickfix) REPAIR_ACTION=quickfix; shift;;
+      --sync-shift)
+        if [[ $2 =~ ^-?[0-9]+$ ]]; then REPAIR_SHIFT_MS=$2; REPAIR_ACTION=shift; shift 2
+        else err "--sync-shift needs a number of milliseconds (e.g. --sync-shift 250)"; exit 1; fi;;
+      --fps)        if (( $# >= 2 )); then REPAIR_FPS=$2; shift 2; else err "--fps needs a value"; exit 1; fi;;
+      --repair-crf) if [[ $2 =~ ^[0-9]+$ ]]; then REPAIR_CRF=$2; shift 2; else err "--repair-crf needs a number"; exit 1; fi;;
+      --repair-preset)
+        if (( $# >= 2 )); then REPAIR_PRESET=$2; shift 2; else err "--repair-preset needs a value"; exit 1; fi;;
+      --oldtv)    REPAIR_OLDTV=1; shift;;
+      --stereo)   REPAIR_STEREO=1; shift;;
       *) newargs+=("$1"); shift;;
     esac
   done
   set -- "${newargs[@]}"
+  if [[ -n $REPAIR_FPS ]] && ! awk -v x="$(frac2dec "$REPAIR_FPS")" 'BEGIN{ exit !(x + 0 > 0) }'; then
+    err "Bad --fps value: $REPAIR_FPS"; exit 1
+  fi
+  if [[ ! $REPAIR_CRF =~ ^[0-9]+$ ]] || (( REPAIR_CRF < 0 || REPAIR_CRF > 51 )); then
+    err "Bad --repair-crf value (0-51)."; exit 1
+  fi
+  case $REPAIR_PRESET in
+    ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow) ;;
+    *) err "Bad --repair-preset value."; exit 1;;
+  esac
 
   local OPT PRESET_ARG="" OV_T="" OV_C="" OV_R="" OV_F="" OV_S="" OV_K="" OV_A="" OV_O="" OV_J="" OV_TS="" OV_TE="" OV_D=0 AUTO=0
   while getopts "p:t:c:r:f:s:k:a:S:E:o:j:dyh" OPT; do
@@ -1913,6 +2433,43 @@ main() {
 
   trap on_int INT TERM
   trap cleanup EXIT
+
+  if [[ -n $REPAIR_ACTION ]]; then
+    local rf
+    case $REPAIR_ACTION in
+      diagnose)
+        (( ${#SELECTED[@]} )) || { err "Usage: vc --diagnose FILE"; exit 1; }
+        for rf in "${SELECTED[@]}"; do diag_report "$rf" || true; done
+        exit 0;;
+      quickfix)
+        (( ${#SELECTED[@]} )) || { err "Usage: vc --quickfix FILE"; exit 1; }
+        REPAIR_AUTO=1
+        for rf in "${SELECTED[@]}"; do quickfix_file "$rf"; done
+        exit 0;;
+      shift)
+        (( ${#SELECTED[@]} == 1 )) || { err "Usage: vc --sync-shift MS FILE (exactly one file)"; exit 1; }
+        REPAIR_AUTO=1
+        sync_shift_file "${SELECTED[0]}" "$REPAIR_SHIFT_MS"
+        exit $?;;
+      repair)
+        if (( ${#SELECTED[@]} )); then
+          REPAIR_AUTO=1
+          local ri=0 rn=${#SELECTED[@]}
+          for rf in "${SELECTED[@]}"; do
+            ri=$(( ri + 1 ))
+            printf '\n%s== Repair [%d/%d]: %s ==%s\n' "$C_B" "$ri" "$rn" "$(basename -- "$rf")" "$C_0"
+            repair_file "$rf" "[$ri/$rn] " || true
+          done
+          exit 0
+        elif [[ -t 0 ]]; then
+          repair_menu
+          exit 0
+        else
+          err "Usage: vc --repair FILE ...  (no files given and no terminal for the menu)"
+          exit 1
+        fi;;
+    esac
+  fi
 
   if (( STUDIO )); then
     [[ -t 0 ]] || { err "--sub needs an interactive terminal."; exit 1; }
