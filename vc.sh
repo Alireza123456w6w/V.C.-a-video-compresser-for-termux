@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.1 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v2.2 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -12,6 +12,23 @@
 #     vc --repair movie.mp4   # fix A/V sync drift (TV & USB player ready)
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 2.2:
+#   + FIXED the Android error "Unable to re-open ... output file for
+#     shifting data / Error writing trailer": every MP4 is now BUILT on fast
+#     local storage (Termux-private) and moved to the destination in one
+#     pass. Also faster, atomic, and no .part files left in your folders.
+#   + Repair speed overhaul - speed first, quality never below before:
+#     - Turbo re-encode by default: CRF 16 @ veryfast = the quality of
+#       CRF 18 @ medium, roughly 2x faster
+#     - Smart tiers: remux-only / audio-only rebuild (minutes!) / full
+#       rebuild - re-encodes ONLY what is actually broken
+#     - Parallel repair:  vc --repair a.mp4 b.mp4 -j 4
+#   + Drift-proof timestamps: detects & rebuilds millisecond-rounded frame
+#     timestamps (the No.1 cause of GRADUAL drift on TVs) and drops the old
+#     forced 90000 timescale that itself planted rounding on 23.976 fps films
+#   + Deeper diagnosis: samples 3 sections of the file (start/middle/end),
+#     stricter audio checks (mp3 & 44.1 kHz now flagged for TV safety)
 #
 #  What's new in 2.1:
 #   + Repair & Sync Center: fixes videos that play fine in VLC but drift
@@ -37,7 +54,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.1"
+VERSION="2.2"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -87,7 +104,8 @@ SUBFILTER=""
 COMPARE_OUT=""
 # --- repair & sync (v2.1)
 REPAIR_ACTION=""; REPAIR_SHIFT_MS=""; REPAIR_FPS=""
-REPAIR_CRF=18; REPAIR_PRESET=medium; REPAIR_OLDTV=0; REPAIR_STEREO=0; REPAIR_AUTO=0
+REPAIR_CRF=16; REPAIR_PRESET=veryfast; REPAIR_OLDTV=0; REPAIR_STEREO=0; REPAIR_AUTO=0
+STAGE_ROOT=""; STAGE_WARNED=0; OT_TMP=""; OT_DIRECT=0
 
 # --------------------------------------------------------- small utilities ---
 fsize()     { stat -c %s -- "$1" 2>/dev/null || echo 0; }
@@ -434,7 +452,7 @@ frac2dec() {   # "30000/1001" | "29.97" -> decimal number
 
 diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream
   local f=$1 k v
-  D_VCODEC=""; D_W=0; D_H=0; D_PIX=""; D_RFPS=""; D_AFPS=""; D_VSTART=""
+  D_VCODEC=""; D_W=0; D_H=0; D_PIX=""; D_RFPS=""; D_AFPS=""; D_VSTART=""; D_VTB=""
   D_ACODEC=""; D_ARATE=0; D_ACH=0; D_ASTART=""; D_ANUM=0; D_DUR=0; D_FMT=""
   [[ -f $f ]] || return 1
   while IFS='=' read -r k v; do
@@ -446,12 +464,14 @@ diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream
       r_frame_rate)   D_RFPS=$v;;
       avg_frame_rate) D_AFPS=$v;;
       start_time)     D_VSTART=$v;;
+      time_base)      D_VTB=$v;;
     esac
   done < <(ffprobe -v error -select_streams v:0 \
-    -show_entries stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time \
+    -show_entries stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base \
     -of default=nw=1 "$f" 2>/dev/null)
   [[ -n $D_VCODEC ]] || return 1
   case $D_VCODEC in mjpeg|jpegls|png|bmp|tiff) return 1;; esac
+  D_VTS=$(awk -v tb="${D_VTB:-}" 'BEGIN{ n=split(tb,a,"/"); if (n==2 && a[2]+0>0) printf "%d", a[2]; else print 0 }')
   D_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null | head -n1)
   [[ $D_DUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || D_DUR=0
   D_FMT=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$f" 2>/dev/null | head -n1)
@@ -471,42 +491,81 @@ diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream
   return 0
 }
 
-diag_vfr_scan() {   # $1 file -> D_VFR(0/1) D_FPSMED D_VFRBAD D_VFRDUP D_VFRN
-  local f=$1 out
-  D_VFR=0; D_FPSMED=0; D_VFRBAD=0; D_VFRDUP=0; D_VFRN=0
-  out=$(ffprobe -v error -select_streams v:0 -read_intervals "%+#400" \
-        -show_entries packet=pts_time -of csv=p=0 "$f" 2>/dev/null | awk -F, '
-    $1 ~ /^[0-9]+(\.[0-9]+)?$/ { p[n++] = $1 + 0 }
+diag_vfr_scan() {   # $1 file -> D_VFR D_FPSMED D_VFRBAD D_VFRDUP D_VFRN D_ROUND D_TSX
+  # Samples three sections of the file (start / middle / near the end) so
+  # timing problems hiding deep inside a movie are found too. Finds:
+  #   D_VFR=1   variable frame rate (frames at genuinely uneven intervals)
+  #   D_ROUND=1 constant rate but timestamps snapped to coarse ticks (e.g.
+  #             whole milliseconds) - the classic GRADUAL-drift-on-TV cause
+  #   D_TSX     1 = every sampled frame duration identical (exact timing),
+  #             0 = not uniform, -1 = unknown (container has no durations)
+  local f=$1 out iv all=""
+  D_VFR=0; D_FPSMED=0; D_VFRBAD=0; D_VFRDUP=0; D_VFRN=0; D_ROUND=0; D_TSX=-1
+  local -a ivs=("%+#300")
+  if (( $(awk -v d="${D_DUR:-0}" 'BEGIN{print (d+0 > 25) ? 1 : 0}') )); then
+    ivs+=("$(awk -v d="${D_DUR:-0}" 'BEGIN{printf "%.0f%%+#300", d/2}')" \
+          "$(awk -v d="${D_DUR:-0}" 'BEGIN{printf "%.0f%%+#300", d*0.9}')")
+  fi
+  for iv in "${ivs[@]}"; do
+    all+=$'\n'$(ffprobe -v error -select_streams v:0 -read_intervals "$iv" \
+      -show_entries packet=pts_time,duration -of csv=p=0 "$f" 2>/dev/null)
+  done
+  out=$(printf '%s' "$all" | awk -F, '
+    BEGIN { vfr=0; fps=0; bad=0; dup=0; n1=0; rnd=0; tsx=-1 }
+    $1 ~ /^[0-9]+(\.[0-9]+)?$/ { p[np++] = $1 + 0 }
+    $2 ~ /^[0-9]+$/ && $2 + 0 > 0 { d[nd++] = $2 + 0 }
     END {
-      if (n < 12) exit
-      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) if (p[j] < p[i]) { t = p[i]; p[i] = p[j]; p[j] = t }
-      m = n - 1
-      for (i = 0; i < m; i++) { d[i] = p[i+1] - p[i]; s[i] = d[i] }
-      for (i = 0; i < m; i++) for (j = i + 1; j < m; j++) if (s[j] < s[i]) { t = s[i]; s[i] = s[j]; s[j] = t }
-      med = s[int(m/2)]
-      if (med <= 0) exit
-      bad = 0; dup = 0
-      for (i = 0; i < m; i++) {
-        r = d[i] / med
-        if (r < 0.25) dup++
-        else if (r < 0.98 || r > 1.02) bad++
+      if (np >= 12) {
+        m = np - 1
+        for (i = 0; i < m; i++) for (j = i + 1; j < np; j++) if (p[j] < p[i]) { t = p[i]; p[i] = p[j]; p[j] = t }
+        for (i = 0; i < m; i++) { dd[i] = p[i+1] - p[i]; s[i] = dd[i] }
+        for (i = 0; i < m; i++) for (j = i + 1; j < m; j++) if (s[j] < s[i]) { t = s[i]; s[i] = s[j]; s[j] = t }
+        med = s[int(m/2)]
+        if (med > 0) {
+          bad = 0; dup = 0
+          for (i = 0; i < m; i++) {
+            r = dd[i] / med
+            if (r < 0.25) dup++
+            else if (r < 0.98 || r > 1.02) bad++
+          }
+          vfr = ((bad > m/50) || dup > 0) ? 1 : 0
+          fps = 1/med; n1 = np
+        }
       }
-      printf "%d %.4f %d %d %d\n", (((bad > m/50) || dup > 0) ? 1 : 0), 1/med, bad, dup, n
+      if (nd >= 10) {
+        for (i = 0; i < nd; i++) for (j = i + 1; j < nd; j++) if (d[j] < d[i]) { t = d[i]; d[i] = d[j]; d[j] = t }
+        dmed = d[int(nd/2)]
+        if (dmed > 0) {
+          u = 0; prev = -1
+          for (i = 0; i < nd; i++) if (d[i] != prev) { u++; prev = d[i] }
+          tsx = (u == 1) ? 1 : 0
+          # constant rate but only 2-3 nearly-equal tick values -> rounded
+          if (tsx == 0 && u <= 3 && (d[nd-1] - d[0]) / dmed < 0.06) rnd = 1
+        }
+      }
+      printf "%d %.6f %d %d %d %d %d\n", vfr, fps, bad, dup, n1, rnd, tsx
     }')
-  [[ -n $out ]] && read -r D_VFR D_FPSMED D_VFRBAD D_VFRDUP D_VFRN <<<"$out"
+  [[ -n $out ]] && read -r D_VFR D_FPSMED D_VFRBAD D_VFRDUP D_VFRN D_ROUND D_TSX <<<"$out"
   return 0
 }
 
 diag_faststart() {   # $1 file -> D_FAST: 1 = faststart, 0 = moov at end, -1 = n/a
   D_FAST=-1
-  local f=$1
+  local f=$1 mo mdat
   case ${f##*.} in
     mp4|MP4|m4v|M4V|mov|MOV|3gp|3GP|3g2|3G2) ;;
     *) return 0;;
   esac
-  if LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -aq moov; then D_FAST=1
-  elif LC_ALL=C tail -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -aq moov; then D_FAST=0
-  else D_FAST=0; fi
+  # 'moov' before 'mdat' = faststart. Small files fit entirely into the
+  # sample window, so the ATOM ORDER must be compared - just searching for
+  # 'moov' gave false "faststart" results on files under 2 MB.
+  mo=$(LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -abo moov | head -n1 | cut -d: -f1)
+  mdat=$(LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -abo mdat | head -n1 | cut -d: -f1)
+  if [[ -n $mo ]]; then
+    if [[ -z $mdat ]] || (( mo < mdat )); then D_FAST=1; else D_FAST=0; fi
+  else
+    D_FAST=0
+  fi
 }
 
 snap_fps() {   # $1 detected fps -> "<fps-filter arg> <display>" (NTSC as exact fractions)
@@ -527,18 +586,22 @@ diag_report() {   # $1 file -> human-readable sync / TV-compatibility report
   vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
   printf '\n%s== Diagnosis: %s ==%s\n' "$C_B" "$(basename -- "$f")" "$C_0"
   printf '  File       : %s, %s, %s\n' "${D_FMT:-?}" "$(fmt_time "$D_DUR")" "$(human "$(fsize "$f")")"
-  printf '  Video      : %sx%s %s %s, %s fps\n' "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_RFPS")"
-  if (( D_VFR )); then
-    probs+=("variable frame rate (VFR) - the No.1 cause of audio drift on TVs")
+  printf '  Video      : %sx%s %s %s, %s fps, 1/%s time base\n' "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_RFPS")" "$( (( D_VTS > 0 )) && echo "$D_VTS" || echo "?" )"
+  if (( D_ROUND )); then
+    probs+=("rounded video timestamps - the No.1 cause of GRADUAL audio drift on TVs")
+    printf '  Timing     : %srounded timestamps%s (frame times snapped to coarse 1/%s ticks)\n' \
+      "$C_Y" "$C_0" "$( (( D_VTS > 0 )) && echo "$D_VTS" || echo "?" )"
+  elif (( D_VFR )); then
+    probs+=("variable frame rate (VFR) - causes stutter and drift on TVs")
     printf '  Timing     : %svariable frame rate%s (%d of %d frames uneven, %d dup, median %.2f fps)\n' \
       "$C_Y" "$C_0" "$D_VFRBAD" "$D_VFRN" "$D_VFRDUP" "$D_FPSMED"
   else
-    printf '  Timing     : constant frame rate%s (ok)%s\n' "$C_D" "$C_0"
+    printf '  Timing     : constant frame rate, exact timestamps%s (ok)%s\n' "$C_D" "$C_0"
   fi
   if (( D_ANUM > 0 )); then
     printf '  Audio      : %s %s Hz, %s ch, starts at %s s\n' "${D_ACODEC:-?}" "$D_ARATE" "$D_ACH" "$ast"
-    case $D_ACODEC in aac|mp3|ac3|eac3) ;; *) probs+=("audio codec '$D_ACODEC' - many TV/USB players cannot decode it");; esac
-    case $D_ARATE in 44100|48000) ;; *) probs+=("audio sample rate ${D_ARATE} Hz - non-48k audio drifts on some players");; esac
+    case $D_ACODEC in aac|ac3|eac3) ;; *) probs+=("audio codec '$D_ACODEC' - not reliably playable on TV/USB players");; esac
+    [[ $D_ARATE == 48000 ]] || probs+=("audio sample rate ${D_ARATE} Hz - non-48k audio drifts on some players")
   else
     printf '  Audio      : (none)\n'
   fi
@@ -689,6 +752,88 @@ tally() {   # ok|fail|skip  in_sz  out_sz   (parallel-safe via STATS file)
   [[ -n $STATS ]] && printf '%s %s %s\n' "$1" "${2:-0}" "${3:-0}" >> "$STATS"
 }
 
+# --------------------------------------------------------- output staging ---
+# Android shared storage (/storage/emulated/0) is a FUSE mount: ffmpeg's
+# +faststart trailer step re-opens the finished file to move the MP4 index
+# to the front, and on that bridge it dies with "Unable to re-open ... output
+# file for shifting data" after long encodes - hours of work lost at the very
+# last second. So every MP4 is BUILT on fast local storage first and moved to
+# the destination in one sequential pass: faststart always works, encoding
+# writes stay on the fast filesystem, and no half-written files (or .part
+# leftovers that download managers love to grab) ever appear in your folders.
+stage_root() {   # pick a local-fast build directory (once per run)
+  [[ -n $STAGE_ROOT && -d $STAGE_ROOT ]] && return 0
+  local -a try=()
+  [[ -n $TMPDIR && -d $TMPDIR ]] && try+=("$TMPDIR")
+  [[ -n $PREFIX && -d $PREFIX/tmp ]] && try+=("$PREFIX/tmp")
+  [[ -d /data/data/com.termux/files/usr/tmp ]] && try+=("/data/data/com.termux/files/usr/tmp")
+  [[ -d /tmp && -w /tmp ]] && try+=("/tmp")
+  try+=("$HOME/.vc-tmp")
+  local d
+  STAGE_ROOT=""
+  for d in "${try[@]}"; do
+    [[ -d $d && -w $d ]] || continue
+    STAGE_ROOT=$(mktemp -d "$d/vc.XXXXXX" 2>/dev/null) && return 0
+  done
+  return 1
+}
+stage_free() {   # bytes free on the staging filesystem (0 = unknown)
+  [[ -n $STAGE_ROOT ]] || { echo 0; return; }
+  df -Pk "$STAGE_ROOT" 2>/dev/null | awk 'NR==2{printf "%d", $4*1024}'
+}
+out_tmp() {   # $1 final path, $2 approx bytes needed -> sets OT_TMP, OT_DIRECT
+  OT_TMP=""; OT_DIRECT=0
+  local fin=$1 need=${2:-0} free
+  [[ $fin == /* ]] || fin="$PWD/$fin"
+  if [[ -z $VC_NOSTAGE ]] && stage_root; then
+    free=$(stage_free)
+    if (( need <= 0 )) || (( free > need + 52428800 )) || (( free > 268435456 )); then
+      OT_TMP=$(mktemp "${STAGE_ROOT%/}/$(basename -- "$fin").XXXXXX" 2>/dev/null) && return 0
+    fi
+  fi
+  # last resort: build right next to the destination, without faststart
+  OT_DIRECT=1; OT_TMP="$fin.vcpart"
+  if (( STAGE_WARNED++ == 0 )); then
+    warn "No local staging space - writing next to the destination without faststart."
+    warn "Free some space inside Termux (\$HOME) to switch the safe fast path on."
+  fi
+}
+commit_out() {   # $1 built tmp, $2 final path -> 0 = the file is in place
+  local src=$1 dst=$2 sz dev1 dev2 copid p rc
+  [[ -s $src ]] || return 1
+  sz=$(fsize "$src")
+  mkdir -p -- "$(dirname -- "$dst")" 2>/dev/null
+  dev1=$(stat -c %d -- "$src" 2>/dev/null) || dev1=??
+  dev2=$(stat -c %d -- "$(dirname -- "$dst")" 2>/dev/null) || dev2=??
+  if [[ $dev1 == "$dev2" ]] || (( sz < 52428800 )); then
+    if mv -f -- "$src" "$dst" 2>/dev/null && [[ -s $dst ]]; then return 0; fi
+    rm -f -- "$dst" 2>/dev/null
+  fi
+  # big file onto a different filesystem (e.g. Termux -> /storage/emulated):
+  # copy with a progress display, then drop the staged original
+  if (( SIMPLE )); then
+    if cp -f -- "$src" "$dst" && rm -f -- "$src" && [[ -s $dst ]]; then return 0; fi
+    rm -f -- "$dst" 2>/dev/null; return 1
+  fi
+  printf '\n'
+  info "Moving $(human "$sz") to $(pretty "$(dirname -- "$dst")") ..."
+  cp -f -- "$src" "$dst.vcmove" & copid=$!
+  while kill -0 "$copid" 2>/dev/null; do
+    p=$(awk -v a="$(fsize "$dst.vcmove" 2>/dev/null || echo 0)" -v b="$sz" \
+      'BEGIN{ if (b+0>0) { x=int(a*100/b); if (x>100) x=100 } else x=0; printf "%d", x }')
+    printf '\r  %3d%%' "$p"
+    sleep 0.4
+  done
+  wait "$copid"; rc=$?
+  printf '\r\033[K'
+  if (( rc != 0 )) || ! mv -f -- "$dst.vcmove" "$dst" 2>/dev/null; then
+    rm -f -- "$dst.vcmove" 2>/dev/null; return 1
+  fi
+  rm -f -- "$src"
+  [[ -s $dst ]] && return 0
+  return 1
+}
+
 # ------------------------------------------------------- compress one file ---
 compress_file() {
   local src=$1 fidx=${2:-0} fn=${3:-0} tag=""
@@ -728,7 +873,13 @@ compress_file() {
   [[ -n $br && $CODEC == x* ]] && passes=2
 
   TMPD=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
-  dst=$(unique_out "$src"); tmp="$dst.part"; CUR_TMP=$tmp
+  dst=$(unique_out "$src")
+  if [[ $OUT_EXT == mp4 ]]; then
+    out_tmp "$dst" "$in_sz"; tmp=$OT_TMP          # built locally, moved at the end
+  else
+    tmp="$dst.part"; OT_DIRECT=0                   # MKV needs no faststart pass
+  fi
+  CUR_TMP=$tmp
   [[ -n $BATCH_TMP && $fidx -gt 0 ]] && printf '%s\n' "$tmp" > "$BATCH_TMP/part_$fidx"
 
   # ---- subtitle handling (v2.0)
@@ -775,6 +926,7 @@ compress_file() {
 
   fmt=(-f mp4); fast=(-movflags +faststart)
   [[ $OUT_EXT == mkv ]] && { fmt=(-f matroska); fast=(); }
+  (( OT_DIRECT )) && fast=()
 
   vf=$(build_vf)
   [[ -n $subfilter ]] && vf="${vf:+$vf,}$subfilter"
@@ -808,7 +960,14 @@ compress_file() {
     add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED" "$src" ""
     tally fail; return 1
   fi
-  mv -f -- "$tmp" "$dst"; CUR_TMP=""
+  if ! commit_out "$tmp" "$dst"; then
+    err "Could not move the output into place (destination writable? enough space?)."
+    rm -f -- "$tmp" 2>/dev/null; CUR_TMP=""
+    [[ -n $BATCH_TMP && -f $BATCH_TMP/part_$fidx ]] && rm -f -- "$BATCH_TMP/part_$fidx"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED (move)" "$src" ""
+    tally fail; return 1
+  fi
+  CUR_TMP=""
   [[ -n $BATCH_TMP && -f $BATCH_TMP/part_$fidx ]] && rm -f -- "$BATCH_TMP/part_$fidx"
 
   out_sz=$(fsize "$dst")
@@ -861,6 +1020,7 @@ run_batch() {
   RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0
   BATCH_TMP=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
   wake_lock
+  [[ -z $VC_NOSTAGE ]] && stage_root   # one shared build area: parallel children inherit it
   local i=0 n=${#SELECTED[@]} f st a b
   if (( PARALLEL_JOBS > 1 )); then
     info "Parallel mode: up to $PARALLEL_JOBS files at once ($n total)"
@@ -1148,11 +1308,14 @@ compare_info() {   # $1 original  $2 output -> side-by-side info table
 
 compare_video() {   # $1 original  $2 output -> side-by-side sample with labels
   local f1=$1 f2=$2 dur start len out dir base tmp fc lblfont rc
+  local -a cfast=()
   probe "$f1" || return 1; dur=$DUR
   len=$(awk -v d="$dur" 'BEGIN{ l=(d<20)?d/2:20; printf "%.1f", l }')
   start=$(awk -v d="$dur" -v l="$len" 'BEGIN{ s=(d-l)/2; if (s<0) s=0; printf "%.1f", s }')
   dir=$(dirname -- "$f2"); base=$(basename -- "$f2"); base=${base%.*}
-  out=$(unique_file "$dir" "${base}_compare" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  out=$(unique_file "$dir" "${base}_compare" "mp4")
+  out_tmp "$out" 0; tmp=$OT_TMP; CUR_TMP=$tmp
+  cfast=(-movflags +faststart); (( OT_DIRECT )) && cfast=()
   lblfont=$(label_font)
   if [[ -n $lblfont ]]; then
     fc="[0:v]scale=-2:360,setsar=1,drawtext=fontfile=${lblfont}:text='ORIGINAL':x=10:y=8:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.45[l];[1:v]scale=-2:360,setsar=1,drawtext=fontfile=${lblfont}:text='COMPRESSED':x=10:y=8:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.45[r];[l][r]hstack[v]"
@@ -1164,11 +1327,10 @@ compare_video() {   # $1 original  $2 output -> side-by-side sample with labels
   info "Creating ${len}s side-by-side comparison (original left, output right)..."
   run_ffmpeg "compare" 1 1 -ss "$start" -t "$len" -i "$f1" -ss "$start" -t "$len" -i "$f2" \
     -filter_complex "$fc" -map "[v]" -an -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p \
-    -movflags +faststart -f mp4 "$tmp"
+    "${cfast[@]}" -f mp4 "$tmp"
   rc=$?
   CUR_TMP=""
-  if (( rc == 0 )) && [[ -s $tmp ]]; then
-    mv -f -- "$tmp" "$out"
+  if (( rc == 0 )) && [[ -s $tmp ]] && commit_out "$tmp" "$out"; then
     COMPARE_OUT=$out
     ok "Comparison video: $(pretty "$out")"
     command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
@@ -1252,11 +1414,11 @@ pick_target() {   # sets PICK_RESULT (prints prompts to stdout, not the result)
 
 # =========================================================== SUBTITLE STUDIO
 sub_embed_soft() {   # $1 video -> embed SRT as a selectable track (no re-encode)
-  local vid=$(readlink -f -- "$1") srt lang ext scodec fmt existing keepmaps subidx out rc base aenc
+  local vid=$(readlink -f -- "$1") srt lang ext scodec fmt existing keepmaps subidx out rc base aenc tmp
   srt=$(resolve_srt "$vid") || { warn "Cancelled."; return 1; }
   lang=$(ask "Language code (fa, en, ar, ...)" "$SUB_LANG")
-  ext="mp4"; scodec=(-c:s mov_text); fmt=(-f mp4 -movflags +faststart)
-  case ${vid##*.} in mkv|MKV) ext="mkv"; scodec=(-c:s srt); fmt=(-f matroska);; esac
+  ext="mp4"; scodec=(-c:s mov_text)
+  case ${vid##*.} in mkv|MKV) ext="mkv"; scodec=(-c:s srt);; esac
   [[ $ext == mp4 ]] && lang=$(lang3 "$lang")
   probe "$vid" || return 1
   EDUR=$DUR
@@ -1272,24 +1434,33 @@ sub_embed_soft() {   # $1 video -> embed SRT as a selectable track (no re-encode
   base=$(basename -- "$vid"); base=${base%.*}
   out=$(unique_file "$(dirname -- "$vid")" "${base}_subbed" "$ext")
   mkdir -p "$CONF_DIR" 2>/dev/null
+  if [[ $ext == mp4 ]]; then
+    out_tmp "$out" "$(fsize "$vid")"; tmp=$OT_TMP
+    fmt=(-f mp4); (( OT_DIRECT )) || fmt+=(-movflags +faststart)
+  else
+    tmp="$out.part"; OT_DIRECT=0
+    fmt=(-f matroska)
+  fi
+  CUR_TMP=$tmp
   run_ffmpeg "subs" 1 1 -i "$vid" -i "$srt" -map 0:v:0 -map '0:a?' "${keepmaps[@]}" -map 1:0 \
     -c:v copy "${aenc[@]}" "${scodec[@]}" -metadata:s:s:$subidx language="$lang" \
-    "${fmt[@]}" -max_muxing_queue_size 2048 "$out"
-  rc=$?
-  if (( rc == 0 )) && [[ -s $out ]]; then
+    "${fmt[@]}" -max_muxing_queue_size 2048 "$tmp"
+  rc=$?; CUR_TMP=""
+  if (( rc == 0 )) && [[ -s $tmp ]] && commit_out "$tmp" "$out"; then
     ok "Subtitled file: $(pretty "$out")"
     command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
     yesno "Open it now?" n && open_file "$out"
     return 0
   fi
+  rm -f -- "$tmp" 2>/dev/null
   err "Embedding failed."
   tail -n 5 "$LOG" >&2
-  rm -f -- "$out" 2>/dev/null
   return 1
 }
 
 sub_burn() {   # $1 video -> burn SRT permanently into the picture (re-encode)
   local vid=$(readlink -f -- "$1") srt style mode sz col out base venc aenc tmp rc
+  local -a bfast=()
   srt=$(resolve_srt "$vid") || { warn "Cancelled."; return 1; }
   echo " 1) Small white    2) Medium white (default)   3) Medium yellow   4) Large white"
   style=$(ask "Style" "2")
@@ -1308,7 +1479,8 @@ sub_burn() {   # $1 video -> burn SRT permanently into the picture (re-encode)
   case $SRC_ACODEC in ""|none) aenc=(-an);; aac|mp3|ac3|eac3) ;; *) aenc=(-c:a aac -b:a 128k);; esac
   base=$(basename -- "$vid"); base=${base%.*}
   out=$(unique_file "$(dirname -- "$vid")" "${base}_burned" "mp4")
-  tmp="$out.part"; CUR_TMP=$tmp
+  out_tmp "$out" "$(fsize "$vid")"; tmp=$OT_TMP; CUR_TMP=$tmp
+  bfast=(-movflags +faststart); (( OT_DIRECT )) && bfast=()
   if [[ $mode == 1 ]]; then
     venc=(-c:v libx264 -preset veryfast -crf 21 -pix_fmt yuv420p)
   else
@@ -1319,20 +1491,19 @@ sub_burn() {   # $1 video -> burn SRT permanently into the picture (re-encode)
   mkdir -p "$CONF_DIR" 2>/dev/null
   info "Burning subtitles (this re-encodes the video)..."
   ( cd "$TMPD" && run_ffmpeg "burn" 1 1 -i "$vid" -map 0:v:0 -map '0:a?' \
-      -vf "$(make_sub_filter "$sz" "$col")" "${venc[@]}" "${aenc[@]}" -movflags +faststart -f mp4 "$tmp" )
+      -vf "$(make_sub_filter "$sz" "$col")" "${venc[@]}" "${aenc[@]}" "${bfast[@]}" -f mp4 "$tmp" )
   rc=$?
   rm -rf "$TMPD"; TMPD=""
   CUR_TMP=""
-  if (( rc == 0 )) && [[ -s $tmp ]]; then
-    mv -f -- "$tmp" "$out"
+  if (( rc == 0 )) && [[ -s $tmp ]] && commit_out "$tmp" "$out"; then
     ok "Burned file: $(pretty "$out")"
     command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
     yesno "Open it now?" n && open_file "$out"
     return 0
   fi
+  rm -f -- "$tmp" 2>/dev/null
   err "Burn failed."
   tail -n 5 "$LOG" >&2
-  rm -f -- "$tmp" 2>/dev/null
   return 1
 }
 
@@ -1365,26 +1536,33 @@ sub_extract() {   # $1 video -> dump subtitle streams to .srt files
 }
 
 sub_remove() {   # $1 video -> drop all subtitle tracks (instant, no re-encode)
-  local vid=$(readlink -f -- "$1") ext fmt out rc base
+  local vid=$(readlink -f -- "$1") ext fmt out rc base tmp
   (( $(count_subs "$vid") > 0 )) || { warn "No subtitle streams in this file."; return 1; }
-  ext="mp4"; fmt=(-f mp4 -movflags +faststart)
-  case ${vid##*.} in mkv|MKV) ext="mkv"; fmt=(-f matroska);; esac
+  ext="mp4"
+  case ${vid##*.} in mkv|MKV) ext="mkv";; esac
   probe "$vid" || return 1
   EDUR=$DUR
   base=$(basename -- "$vid"); base=${base%.*}
   out=$(unique_file "$(dirname -- "$vid")" "${base}_nosub" "$ext")
   mkdir -p "$CONF_DIR" 2>/dev/null
-  run_ffmpeg "subs" 1 1 -i "$vid" -map 0:v:0 -map '0:a?' -map '-0:s' -c:v copy -c:a copy "${fmt[@]}" "$out"
-  rc=$?
-  if (( rc == 0 )) && [[ -s $out ]]; then
+  if [[ $ext == mp4 ]]; then
+    out_tmp "$out" "$(fsize "$vid")"; tmp=$OT_TMP
+    fmt=(-f mp4); (( OT_DIRECT )) || fmt+=(-movflags +faststart)
+  else
+    tmp="$out.part"; OT_DIRECT=0; fmt=(-f matroska)
+  fi
+  CUR_TMP=$tmp
+  run_ffmpeg "subs" 1 1 -i "$vid" -map 0:v:0 -map '0:a?' -map '-0:s' -c:v copy -c:a copy "${fmt[@]}" "$tmp"
+  rc=$?; CUR_TMP=""
+  if (( rc == 0 )) && [[ -s $tmp ]] && commit_out "$tmp" "$out"; then
     ok "Clean file: $(pretty "$out")"
     command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
     yesno "Open it now?" n && open_file "$out"
     return 0
   fi
+  rm -f -- "$tmp" 2>/dev/null
   err "Removing subtitles failed."
   tail -n 5 "$LOG" >&2
-  rm -f -- "$out" 2>/dev/null
   return 1
 }
 
@@ -1453,28 +1631,30 @@ extract_subs_silent() {   # $1 video  $2 output path without extension
 
 repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   local src=$(readlink -f -- "$1") tag=${2:-}
-  local name base dir out tmp rc t0=$SECONDS in_sz out_sz saved
+  local name base dir out tmp rc t0=$SECONDS in_sz out_sz saved need tier
   local vfix=0 afix=0 vf="" fps_arg="" fps_show="" abr=192 vfps=0 stereo=""
-  local vst ast b_timing b_vinfo b_ainfo b_fast b_gap n_vst n_ast n_gap negts=0 c
-  local after_timing="?" after_fast="?" nsubs extra_audio
-  local -a vreasons=() areasons=() fargs=() venc=() aargs=()
+  local vst ast b_timing b_ts b_vts b_vinfo b_ainfo b_fast b_gap n_vst n_ast n_gap negts=0 c
+  local after_timing="?" after_ts="?" after_fast="?" nsubs extra_audio
+  local -a vreasons=() areasons=() fargs=() venc=() aargs=() fast=()
   name=$(basename -- "$src"); in_sz=$(fsize "$src")
   if ! diag_probe "$src"; then err "${tag}Not a (supported) video file: $name"; return 1; fi
   diag_vfr_scan "$src"; diag_faststart "$src"
   vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
   dir=$(dirname -- "$src"); base=${name%.*}
-  printf '  %s%s%s %dx%d %s %s | %s fps | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
-    "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_AFPS")" "$(fmt_time "$D_DUR")" \
+  printf '  %s%s%s %dx%d %s %s | %s fps, 1/%s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
+    "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_AFPS")" \
+    "$( (( D_VTS > 0 )) && echo "$D_VTS" || echo "?" )" "$(fmt_time "$D_DUR")" \
     "$(human "$in_sz")" "$C_0"
 
-  # ---- decide what has to be fixed (re-encode only what is broken)
-  (( D_VFR )) && { vfix=1; vreasons+=("variable frame rate"); }
+  # ---- decide what has to be fixed (re-encode ONLY what is broken)
+  if (( D_ROUND )); then vfix=1; vreasons+=("rounded timestamps")
+  elif (( D_VFR )); then vfix=1; vreasons+=("variable frame rate"); fi
   [[ $D_VCODEC != h264 ]] && { vfix=1; vreasons+=("codec $D_VCODEC"); }
   [[ $D_PIX != yuv420p ]] && { vfix=1; vreasons+=("pixel format $D_PIX"); }
   if (( D_W % 2 != 0 || D_H % 2 != 0 )); then vfix=1; vreasons+=("odd ${D_W}x${D_H} size"); fi
   if (( D_ANUM > 0 )); then
-    case $D_ACODEC in aac|mp3|ac3|eac3) ;; *) afix=1; areasons+=("codec $D_ACODEC");; esac
-    case $D_ARATE in 44100|48000) ;; *) afix=1; areasons+=("${D_ARATE} Hz sample rate");; esac
+    case $D_ACODEC in aac|ac3|eac3) ;; *) afix=1; areasons+=("codec $D_ACODEC");; esac
+    [[ $D_ARATE == 48000 ]] || { afix=1; areasons+=("${D_ARATE:-no} Hz sample rate"); }
     if (( REPAIR_STEREO && D_ACH > 2 )); then afix=1; areasons+=("${D_ACH}-channel audio"); fi
     (( D_ACH > 2 )) && abr=256
   fi
@@ -1482,7 +1662,11 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   extra_audio=$(( D_ANUM > 1 ? D_ANUM - 1 : 0 ))
   nsubs=$(count_subs "$src")
   awk -v v="$vst" -v a="$ast" 'BEGIN{ if (v < -0.005 || a < -0.005) exit 1 }' || negts=1
-  b_timing="CFR"; (( D_VFR )) && b_timing="VFR (drifts!)"
+  b_timing="CFR + exact ticks"
+  (( D_ROUND )) && b_timing="CFR + rounded ticks"
+  (( D_VFR && ! D_ROUND )) && b_timing="VFR (uneven)"
+  b_ts="exact"; (( D_TSX == 0 )) && b_ts="uneven"; (( D_ROUND )) && b_ts="rounded"; (( D_TSX == -1 )) && b_ts="?"
+  b_vts=$D_VTS
   b_vinfo="$D_VCODEC $D_PIX"
   b_ainfo="no audio"; (( D_ANUM > 0 )) && b_ainfo="$D_ACODEC ${D_ARATE} Hz"
   b_fast="faststart"; [[ $D_FAST == 0 ]] && b_fast="moov at end"
@@ -1490,8 +1674,15 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   b_gap=$(awk -v a="$ast" -v v="$vst" 'BEGIN{ d = a - v; if (d < 0) d = -d; printf "%d ms", d * 1000 }')
 
   if (( vfix == 0 && afix == 0 && D_FAST == 1 && negts == 0 )) && [[ $D_FMT == mov ]]; then
-    ok "${tag}Already TV-friendly (H.264, constant frame rate, safe audio, faststart) - nothing to do."
+    ok "${tag}Already TV-friendly (H.264, constant rate, exact timestamps, safe audio, faststart) - nothing to do."
     return 0
+  fi
+
+  # ---- speed tier: the cheapest fix that actually solves the problem
+  tier="full rebuild (video + audio)"
+  if   (( vfix == 0 && afix == 0 )); then tier="remux only - seconds, no re-encode"
+  elif (( vfix == 0 && afix == 1 )); then tier="fast - audio rebuild only, video copied"
+  elif (( D_ANUM == 0 || afix == 0 )); then tier="video rebuild, audio copied"
   fi
 
   # ---- constant frame rate target (snap to the nearest standard rate)
@@ -1511,9 +1702,11 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   if (( REPAIR_AUTO == 0 )); then
     while true; do
       printf '\n%s== Repair plan ==%s\n' "$C_B" "$C_0"
+      printf '  Mode  : %s\n' "$tier"
       if (( vfix )); then
-        printf '  Video : %sre-encode%s H.264 %s profile, CRF %s, constant %s fps\n' "$C_Y" "$C_0" \
-          "$( (( REPAIR_OLDTV )) && echo Main || echo High )" "$REPAIR_CRF" "$fps_show"
+        printf '  Video : %sre-encode%s H.264 %s profile, CRF %s @ %s, %s fps%s\n' "$C_Y" "$C_0" \
+          "$( (( REPAIR_OLDTV )) && echo Main || echo High )" "$REPAIR_CRF" "$REPAIR_PRESET" "$fps_show" \
+          "$( [[ $REPAIR_PRESET == veryfast && $REPAIR_CRF == 16 ]] && printf ' (turbo: = CRF 18 @ medium quality, ~2x faster)' )"
         printf '         fixes : %s\n' "$(IFS=', '; printf '%s' "${vreasons[*]}")"
       else
         printf '  Video : %sstream copy%s (already fine - no quality loss)\n' "$C_G" "$C_0"
@@ -1527,7 +1720,8 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
       else
         printf '  Audio : %sstream copy%s (already fine - no quality loss)\n' "$C_G" "$C_0"
       fi
-      printf '  Output: MP4 + faststart, clean timestamps, metadata stripped\n'
+      printf '  Output: MP4 + faststart + exact frame timestamps\n'
+      printf '          built on fast local storage, moved here when done\n'
       (( extra_audio > 0 )) && printf '          %d extra audio track(s) will be dropped\n' "$extra_audio"
       (( nsubs > 0 )) && printf '  Subs  : %d track(s) saved as .srt next to the video\n' "$nsubs"
       printf '  y) start    q) change quality    b) cancel\n'
@@ -1535,14 +1729,21 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
       case ${c,,} in
         y|"") break;;
         b) return 1;;
-        q) REPAIR_CRF=$(ask_int "CRF quality (10-28, lower = better)" 10 28 "$REPAIR_CRF")
+        q) REPAIR_CRF=$(ask_int "CRF quality (10-28; 16 turbo = 18 medium quality)" 10 28 "$REPAIR_CRF")
            REPAIR_PRESET=$(ask "Encoder speed (ultrafast..veryslow)" "$REPAIR_PRESET");;
       esac
     done
+  else
+    info "${tag}Plan: $tier$( (( vfix )) && printf ' - %s' "$(IFS=', '; printf '%s' "${vreasons[*]}")" )$( (( afix && D_ANUM > 0 )) && printf ' + audio fix' )"
   fi
 
-  # ---- run the repair
-  out=$(unique_file "$dir" "${base}_repaired" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  # ---- run the repair (output is BUILT on fast local storage first, so
+  #      ffmpeg's faststart index shift can never fail on Android storage)
+  out=$(unique_file "$dir" "${base}_repaired" "mp4")
+  need=$(( in_sz + 65536 ))
+  (( vfix )) && need=$(( in_sz * 3 / 4 + 1048576 ))
+  out_tmp "$out" "$need"; tmp=$OT_TMP; CUR_TMP=$tmp
+  fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
   mkdir -p "$CONF_DIR" 2>/dev/null
   EDUR=$D_DUR
   fargs=(-fflags +genpts -i "$src" -map 0:v:0)
@@ -1566,8 +1767,11 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     fi
     fargs+=("${aargs[@]}")
   fi
-  fargs+=(-sn -map_metadata -1 -map_chapters -1 -muxdelay 0 \
-    -video_track_timescale 90000 -movflags +faststart -max_muxing_queue_size 4096 -f mp4 "$tmp")
+  # no forced timescale: ffmpeg writes an exact 1/fps base (e.g. 1/24000 with
+  # uniform 1001-tick frames) - the old forced 90000 planted rounding on
+  # 23.976 fps films, which itself caused gradual drift on TVs
+  fargs+=(-sn -map_metadata -1 -map_chapters -1 -muxdelay 0 -avoid_negative_ts make_zero \
+    "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
   run_ffmpeg "repair" 1 1 "${fargs[@]}"
   rc=$?
   CUR_TMP=""
@@ -1576,9 +1780,15 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     tail -n 6 "$LOG" | sed 's/^/    /' >&2
     rm -f -- "$tmp"
     add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED" "$src" ""
+    tally fail
     return 1
   fi
-  mv -f -- "$tmp" "$out"
+  if ! commit_out "$tmp" "$out"; then
+    err "${tag}Could not move the repaired file into place - is the destination writable?"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED (move)" "$src" ""
+    tally fail
+    return 1
+  fi
   (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
   out_sz=$(fsize "$out")
 
@@ -1586,15 +1796,21 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   if diag_probe "$out" && diag_vfr_scan "$out" && diag_faststart "$out"; then
     n_vst=$(num_or0 "$D_VSTART"); n_ast=$(num_or0 "$D_ASTART")
     n_gap=$(awk -v a="$n_ast" -v v="$n_vst" 'BEGIN{ d = a - v; if (d < 0) d = -d; printf "%d", d * 1000 }')
-    after_timing="CFR"; (( D_VFR )) && after_timing="${C_R}still VFR!${C_0}"
+    after_timing="CFR + exact ticks"
+    (( D_ROUND )) && after_timing="${C_R}still rounded!${C_0}"
+    (( D_VFR && ! D_ROUND )) && after_timing="${C_R}still uneven!${C_0}"
+    after_ts="exact (1/$D_VTS)"
+    (( D_TSX == 0 )) && after_ts="uneven (1/$D_VTS)"
+    (( D_TSX == -1 )) && after_ts="?"
     (( D_FAST == 1 )) && after_fast="faststart"
     printf '\n  %s-------------- before -> after --------------%s\n' "$C_D" "$C_0"
-    printf '  %-14s %-22s -> %s\n' "Frame timing" "$b_timing" "$after_timing"
-    printf '  %-14s %-22s -> %s\n' "Video" "$b_vinfo" "$D_VCODEC $D_PIX"
-    printf '  %-14s %-22s -> %s\n' "Audio" "$b_ainfo" \
+    printf '  %-14s %-24s -> %s\n' "Frame timing" "$b_timing" "$after_timing"
+    printf '  %-14s %-24s -> %s\n' "Timestamps" "${b_ts} (1/$b_vts)" "$after_ts"
+    printf '  %-14s %-24s -> %s\n' "Video" "$b_vinfo" "$D_VCODEC $D_PIX"
+    printf '  %-14s %-24s -> %s\n' "Audio" "$b_ainfo" \
       "$( (( D_ANUM == 0 )) && echo "no audio" || echo "$D_ACODEC $D_ARATE Hz")"
-    printf '  %-14s %-22s -> %s\n' "MP4 index" "$b_fast" "$after_fast"
-    printf '  %-14s %-22s -> %s\n' "A/V start gap" "$b_gap" "${n_gap} ms"
+    printf '  %-14s %-24s -> %s\n' "MP4 index" "$b_fast" "$after_fast"
+    printf '  %-14s %-24s -> %s\n' "A/V start gap" "$b_gap" "${n_gap} ms"
     if (( n_gap > 150 )); then
       info "Audio starts $n_gap ms after the video - if lips look late, run:"
       info "  vc --sync-shift -$n_gap $(basename -- "$out")"
@@ -1605,6 +1821,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   ok "${tag}Repaired: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  (${saved}, $(fmt_time $(( SECONDS - t0 ))))"
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "REPAIRED" "$src" "$out"
+  tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
   return 0
 }
@@ -1612,47 +1829,56 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
 quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 (seconds)
   local src=$(readlink -f -- "$1") tag=${2:-}
   local name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs
-  local -a fargs=()
+  local -a fargs=() fast=()
   name=$(basename -- "$src")
   if ! diag_probe "$src"; then err "${tag}Not a (supported) video file: $name"; return 1; fi
   diag_vfr_scan "$src"
   in_sz=$(fsize "$src"); dir=$(dirname -- "$src"); base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
     "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(fmt_time "$D_DUR")" "$(human "$in_sz")" "$C_0"
-  out=$(unique_file "$dir" "${base}_fixed" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  out=$(unique_file "$dir" "${base}_fixed" "mp4")
+  out_tmp "$out" "$(( in_sz + 65536 ))"; tmp=$OT_TMP; CUR_TMP=$tmp
+  fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
   EDUR=$D_DUR
   mkdir -p "$CONF_DIR" 2>/dev/null
   fargs=(-fflags +genpts -i "$src" -map 0:v:0)
   (( D_ANUM > 0 )) && fargs+=(-map 0:a:0)
-  fargs+=(-c copy -sn -map_metadata -1 -map_chapters -1 -muxdelay 0 \
-    -movflags +faststart -max_muxing_queue_size 4096 -f mp4 "$tmp")
+  fargs+=(-c copy -sn -map_metadata -1 -map_chapters -1 -muxdelay 0 -avoid_negative_ts make_zero \
+    "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
   run_ffmpeg "quickfix" 1 1 "${fargs[@]}"
   rc=$?; CUR_TMP=""
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     err "${tag}Quick fix failed (ffmpeg exit $rc). Last log lines:"
     tail -n 6 "$LOG" | sed 's/^/    /' >&2
     rm -f -- "$tmp"
+    tally fail
     return 1
   fi
-  mv -f -- "$tmp" "$out"
+  if ! commit_out "$tmp" "$out"; then
+    err "${tag}Could not move the fixed file into place."
+    tally fail
+    return 1
+  fi
   nsubs=$(count_subs "$src"); (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
   out_sz=$(fsize "$out")
   ok "${tag}Fixed: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  ($(fmt_time $(( SECONDS - t0 ))))"
-  (( D_VFR )) && warn "Video is still variable frame rate - run Auto-Repair to stop the drift."
+  (( D_ROUND )) && warn "Timestamps are still rounded (gradual TV drift) - run Auto-Repair to rebuild them."
+  (( D_VFR && ! D_ROUND )) && warn "Video is still variable frame rate - run Auto-Repair to stop the drift."
   [[ $D_VCODEC != h264 ]] && warn "Video codec kept as '$D_VCODEC' - run Auto-Repair to convert to H.264."
   if (( D_ANUM > 0 )); then
-    case $D_ACODEC in aac|mp3|ac3|eac3) ;; *) warn "Audio codec kept as '$D_ACODEC' - run Auto-Repair to convert to AAC.";; esac
-    case $D_ARATE in 44100|48000) ;; *) warn "Audio kept at ${D_ARATE} Hz - run Auto-Repair to resample to 48 kHz.";; esac
+    case $D_ACODEC in aac|ac3|eac3) ;; *) warn "Audio codec kept as '$D_ACODEC' - run Auto-Repair to convert to AAC.";; esac
+    [[ $D_ARATE == 48000 ]] || warn "Audio kept at ${D_ARATE:-?} Hz - run Auto-Repair to resample to 48 kHz."
   fi
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "QUICKFIXED" "$src" "$out"
+  tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
   return 0
 }
 
 sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
   local src=$(readlink -f -- "$1") ms=$2 off name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs
-  local -a aargs=()
+  local -a aargs=() fast=()
   [[ $ms =~ ^-?[0-9]+$ ]] || { err "Shift must be a number of milliseconds (e.g. 250 or -250)."; return 1; }
   (( ms == 0 )) && { err "A shift of 0 ms does nothing."; return 1; }
   (( ms > 10000 || ms < -10000 )) && { err "Use a shift between -10000 and 10000 ms."; return 1; }
@@ -1667,21 +1893,28 @@ sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
     *) aargs=(-c:a aac -b:a 192k -af "aresample=async=1")
        warn "Audio re-encoded to AAC ('$D_ACODEC' is not safe in MP4).";;
   esac
-  out=$(unique_file "$dir" "${base}_shifted" "mp4"); tmp="$out.part"; CUR_TMP=$tmp
+  out=$(unique_file "$dir" "${base}_shifted" "mp4")
+  out_tmp "$out" "$(( in_sz + 65536 ))"; tmp=$OT_TMP; CUR_TMP=$tmp
+  fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
   EDUR=$D_DUR
   mkdir -p "$CONF_DIR" 2>/dev/null
   run_ffmpeg "shift" 1 1 -i "$src" -itsoffset "$off" -i "$src" \
     -map 0:v:0 -map 1:a:0 -c:v copy "${aargs[@]}" -sn -map_metadata -1 \
-    -avoid_negative_ts make_zero -muxdelay 0 -movflags +faststart \
+    -avoid_negative_ts make_zero -muxdelay 0 "${fast[@]}" \
     -max_muxing_queue_size 4096 -f mp4 "$tmp"
   rc=$?; CUR_TMP=""
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     err "Audio shift failed (ffmpeg exit $rc). Last log lines:"
     tail -n 6 "$LOG" | sed 's/^/    /' >&2
     rm -f -- "$tmp"
+    tally fail
     return 1
   fi
-  mv -f -- "$tmp" "$out"
+  if ! commit_out "$tmp" "$out"; then
+    err "Could not move the shifted file into place."
+    tally fail
+    return 1
+  fi
   nsubs=$(count_subs "$src"); (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
   out_sz=$(fsize "$out")
   if diag_probe "$out"; then
@@ -1690,6 +1923,7 @@ sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
   ok "Shifted file: $(pretty "$out")  ($(human "$in_sz") -> $(human "$out_sz"))"
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "SHIFTED" "$src" "$out"
+  tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
   return 0
 }
@@ -1704,8 +1938,55 @@ shift_audio_dialog() {   # $1 video
   return 0
 }
 
+repair_batch() {   # repair every queued video (sequential or -j parallel)
+  (( ${#SELECTED[@]} )) || { err "No videos selected."; return 1; }
+  local prev_auto=$REPAIR_AUTO
+  REPAIR_AUTO=1
+  mkdir -p "$CONF_DIR"; : > "$LOG"
+  RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0
+  BATCH_TMP=$(mktemp -d) || { err "Cannot create temp dir."; REPAIR_AUTO=$prev_auto; return 1; }
+  wake_lock
+  [[ -z $VC_NOSTAGE ]] && stage_root   # one shared build area: parallel children inherit it
+  local i=0 n=${#SELECTED[@]} f st a b
+  if (( PARALLEL_JOBS > 1 && n > 1 )); then
+    info "Parallel repair: up to $PARALLEL_JOBS files at once ($n total)"
+    for f in "${SELECTED[@]}"; do
+      i=$(( i + 1 ))
+      while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do wait -n || true; done
+      printf '%s[%d/%d] %s%s\n' "$C_B" "$i" "$n" "$(trunc "$(basename -- "$f")")" "$C_0"
+      (
+        SIMPLE=1 LOGF="$BATCH_TMP/log_$i" STATS="$BATCH_TMP/stats" RESULT_FILE="$BATCH_TMP/results"
+        REPAIR_AUTO=1 repair_file "$f" "[$i/$n] "
+      ) &
+    done
+    wait
+    [[ -f $BATCH_TMP/results ]] && mapfile -t RESULTS < "$BATCH_TMP/results"
+    if [[ -f $BATCH_TMP/stats ]]; then
+      while read -r st a b; do
+        case $st in
+          ok)   N_OK=$(( N_OK + 1 )); TOTAL_IN=$(( TOTAL_IN + a )); TOTAL_OUT=$(( TOTAL_OUT + b ));;
+          fail) N_FAIL=$(( N_FAIL + 1 ));;
+        esac
+      done < "$BATCH_TMP/stats"
+    fi
+    cat "$BATCH_TMP"/log_* >> "$LOG" 2>/dev/null
+  else
+    for f in "${SELECTED[@]}"; do
+      i=$(( i + 1 ))
+      printf '\n%s== Repair [%d/%d]: %s ==%s\n' "$C_B" "$i" "$n" "$(basename -- "$f")" "$C_0"
+      repair_file "$f" "[$i/$n] " || true
+    done
+  fi
+  rm -rf "$BATCH_TMP"; BATCH_TMP=""
+  wake_unlock
+  print_summary
+  notify "Repair finished: $N_OK ok, $N_FAIL failed"
+  REPAIR_AUTO=$prev_auto
+  (( N_FAIL == 0 ))
+}
+
 repair_menu() {
-  local vid="" c f
+  local vid="" c
   while true; do
     clear_screen
     printf '%s== Repair & Sync ==%s\n\n' "$C_B" "$C_0"
@@ -1714,10 +1995,10 @@ repair_menu() {
     printf ' Fixes audio/video drift and playback problems on TVs & USB players.\n\n'
     echo " 1) Select target video"
     echo " 2) Diagnose (check sync & TV compatibility)"
-    echo " 3) Auto-Repair (fixes drift - re-encodes only what is broken)"
+    echo " 3) Auto-Repair (smart tiers + turbo - re-encodes only what is broken)"
     echo " 4) Quick fix (seconds - faststart + clean MP4, no re-encode)"
     echo " 5) Shift audio by +/- milliseconds (constant early/late audio)"
-    echo " 6) Repair all queued videos (batch)"
+    echo " 6) Repair all queued videos (batch, uses -j parallel jobs)"
     echo " b) back"
     read -r -p "> " c || return
     case $c in
@@ -1727,9 +2008,7 @@ repair_menu() {
       4) if [[ -n $vid ]]; then quickfix_file "$vid"; pause; fi;;
       5) if [[ -n $vid ]]; then shift_audio_dialog "$vid"; pause; fi;;
       6) if (( ${#SELECTED[@]} )); then
-           REPAIR_AUTO=1
-           for f in "${SELECTED[@]}"; do printf '\n'; repair_file "$f"; done
-           REPAIR_AUTO=0; pause
+           repair_batch; pause
          else warn "Queue is empty - choose videos from the main menu first."; fi;;
       b|B|"") return;;
     esac
@@ -2275,14 +2554,17 @@ Subtitle options:
 
 Repair & sync options:
   --repair FILE...       fix A/V drift and make the file play on any TV/USB
-                         player (constant frame rate, H.264, AAC 48 kHz,
-                         clean timestamps, faststart MP4)
-  --diagnose FILE        report sync / compatibility problems (no changes)
+                         player. Smart tiers: remux-only / audio-only /
+                         video-only / full rebuild - the fastest path that
+                         really fixes it (turbo x264 by default). Add -j N
+                         to repair several files in parallel.
+  --diagnose FILE        report sync / TV-compatibility problems (no changes)
   --quickfix FILE        remux only, no re-encode: faststart + clean timestamps
   --sync-shift MS FILE   shift the audio: +250 = delay 250 ms, -250 = advance
   --fps RATE             force the output frame rate for --repair (e.g. 25)
-  --repair-crf N         repair re-encode quality (default 18, lower = better)
-  --repair-preset NAME   repair encoder speed (default medium)
+  --repair-crf N         repair re-encode quality (default 16 = turbo: same
+                         quality as 18 @ medium, about 2x faster)
+  --repair-preset NAME   repair encoder speed (default veryfast)
   --oldtv                ultra compatibility: Main profile, no B-frames, <=30 fps
   --stereo               downmix surround audio to stereo
 
@@ -2301,6 +2583,7 @@ Examples:
   vc --diagnose movie.mkv                     # what is wrong with this file?
   vc --repair movie.mkv                       # fix drift, TV-ready output
   vc --repair --oldtv movie.mkv               # ancient TV / USB stick mode
+  vc --repair -j 4 *.mp4                      # repair 4 files at once
   vc --sync-shift -250 movie.mp4              # audio was 250 ms late
 EOF
 }
@@ -2316,6 +2599,8 @@ cleanup() {
     rm -rf -- "$BATCH_TMP"
   fi
   [[ -n $TMPD ]] && rm -rf -- "$TMPD"
+  # remove the local build area with anything left in it (crashed jobs etc.)
+  [[ -n $STAGE_ROOT && -d $STAGE_ROOT ]] && rm -rf -- "$STAGE_ROOT"
   wake_unlock
 }
 on_int() {
@@ -2453,14 +2738,8 @@ main() {
         exit $?;;
       repair)
         if (( ${#SELECTED[@]} )); then
-          REPAIR_AUTO=1
-          local ri=0 rn=${#SELECTED[@]}
-          for rf in "${SELECTED[@]}"; do
-            ri=$(( ri + 1 ))
-            printf '\n%s== Repair [%d/%d]: %s ==%s\n' "$C_B" "$ri" "$rn" "$(basename -- "$rf")" "$C_0"
-            repair_file "$rf" "[$ri/$rn] " || true
-          done
-          exit 0
+          repair_batch
+          exit $?
         elif [[ -t 0 ]]; then
           repair_menu
           exit 0
