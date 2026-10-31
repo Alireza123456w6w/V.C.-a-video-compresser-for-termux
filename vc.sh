@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.2 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v2.3 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -10,8 +10,34 @@
 #     vc                      # interactive menu
 #     vc --sub                # subtitle studio (SRT add/extract/remove)
 #     vc --repair movie.mp4   # fix A/V sync drift (TV & USB player ready)
+#     vc --frames movie.mp4 -S 1:30 -E 1:40   # EVERY frame 1:30 -> 1:40 into a new folder
+#     vc --race movie.mp4     # which preset is fastest / smallest on THIS phone?
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 2.3:
+#   + FRAME EXTRACTOR: choose a start and an end time, vc creates a new folder
+#     and writes EVERY frame between the two points as images (JPG / PNG / BMP /
+#     WebP). Frame-exact (never duplicates or drops frames, even on variable
+#     frame rate videos), checks free space first, builds on fast local storage
+#     and moves the finished folder in one pass. Menu: f   CLI: --frames
+#   + PRESET RACE: encodes a short sample with every preset and shows the real
+#     speed, estimated size and estimated time on YOUR device (vc --race).
+#   + Much less overhead: one ffprobe call instead of 3-5 per file, repair
+#     diagnosis scans its 3 sections in parallel, progress bar and menus no
+#     longer fork helper processes, file sizes are cached.
+#   + Parallel batches share the CPU properly (threads are split between jobs
+#     instead of every job fighting for all cores).
+#   + Audio that is already AAC at or below the target bitrate is copied
+#     instead of re-encoded: faster AND no generation loss.
+#   + The frame-rate filter now runs BEFORE scaling/denoise, so dropped frames
+#     are never processed. New option: sharper Lanczos downscaling (Settings 23
+#     or --lanczos; a bit bigger files, off by default).
+#   + --resume skips files whose finished output already exists; directories
+#     passed on the command line no longer re-compress earlier outputs.
+#   + Options may now come before or after the files (vc movie.mp4 -p turbo -y).
+#   + Fixed: with --nosubs (or bitmap subtitles) plus --srt, old subtitle tracks
+#     were still mapped; HDR sources now get a clear warning.
 #
 #  What's new in 2.2:
 #   + FIXED the Android error "Unable to re-open ... output file for
@@ -54,7 +80,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.2"
+VERSION="2.3"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -62,7 +88,7 @@ CONF="$CONF_DIR/settings.conf"
 PROF_DIR="$CONF_DIR/profiles"
 LOG="$CONF_DIR/last_run.log"
 VIDEO_EXT='mp4|mkv|mov|avi|webm|3gp|m4v|flv|ts|mpg|mpeg|wmv|mts|m2ts'
-SETTING_VARS="CODEC CRF VBR SPEED HEIGHT FPS ABR AUDIO TARGET_MB DENOISE STRIP_META OUTDIR SUFFIX PRESET_NAME PARALLEL_JOBS KEEP_SUBS SUB_MODE SUB_FILE SUB_LANG SUB_SIZE SUB_COLOR OUT_EXT FINISH_ACTION"
+SETTING_VARS="CODEC CRF VBR SPEED HEIGHT FPS ABR AUDIO TARGET_MB DENOISE STRIP_META OUTDIR SUFFIX PRESET_NAME PARALLEL_JOBS KEEP_SUBS SUB_MODE SUB_FILE SUB_LANG SUB_SIZE SUB_COLOR OUT_EXT FINISH_ACTION SKIP_DONE FRAME_FMT FRAME_Q FRAME_STEP FRAME_H SCALER"
 PRESET_LIST="balanced quality small tiny social compat fast turbo target hardware av1"
 
 # ------------------------------------------------------------------ colors ---
@@ -106,12 +132,23 @@ COMPARE_OUT=""
 REPAIR_ACTION=""; REPAIR_SHIFT_MS=""; REPAIR_FPS=""
 REPAIR_CRF=16; REPAIR_PRESET=veryfast; REPAIR_OLDTV=0; REPAIR_STEREO=0; REPAIR_AUTO=0
 STAGE_ROOT=""; STAGE_WARNED=0; OT_TMP=""; OT_DIRECT=0
+# --- speed internals (v2.3)
+declare -A SZC=()                 # cached sizes of source files (never of outputs)
+TERM_COLS=""                      # terminal width, refreshed on resize only
+THREADS_PER_JOB=0                 # 0 = encoder default; >0 = split CPU between parallel jobs
+STATS_OPT=(); FPSMODE_OPT=(-vsync 0); ENCTB_OPT=(); FF_VER=""; FF_CAPS_DONE=0
+AUD_COPY=0; BATCH_T0=0; CUR_TMPDIR=""; SEL_BYTES=0; FSZ=0; RATIO=0; SECS_US=0; FMT_TAG=""
+SRC_AFPS=0; SRC_PIX=""; SRC_TRC=""; SRC_ACH=0; SRC_NSUBS=0; SRC_SUBBAD=0
+FR_ARGS=(); FR_VF=(); FR_EXT=jpg
 
 # --------------------------------------------------------- small utilities ---
 fsize()     { stat -c %s -- "$1" 2>/dev/null || echo 0; }
-clear_screen() { [[ -t 1 ]] && clear; return 0; }
+fsize_v()    { local f=$1; if [[ -z ${SZC[$f]-} ]]; then SZC[$f]=$(stat -c %s -- "$f" 2>/dev/null || echo 0); fi; FSZ=${SZC[$f]}; }
+sum_sizes()  { local f; SEL_BYTES=0; for f in "${SELECTED[@]}"; do fsize_v "$f"; SEL_BYTES=$(( SEL_BYTES + FSZ )); done; }
+clear_screen() { [[ -t 1 ]] && printf '\033[H\033[2J\033[3J'; return 0; }
 pause()     { if [[ -t 0 && $NONINTERACTIVE -eq 0 ]]; then read -r -p "Press Enter to continue..." _ || true; fi; }
-term_cols() { local c; c=$(tput cols 2>/dev/null) || c=${COLUMNS:-44}; echo "${c:-44}"; }
+refresh_cols() { local c; c=$(tput cols 2>/dev/null) || c=${COLUMNS:-44}; [[ $c =~ ^[0-9]+$ ]] || c=44; TERM_COLS=$c; }
+term_cols() { [[ -n $TERM_COLS ]] || refresh_cols; echo "$TERM_COLS"; }
 fonts_dir() {   # best directory of ttf fonts for subtitle burn-in
   if [[ -d /system/fonts ]]; then printf '%s' /system/fonts
   elif [[ -d /usr/share/fonts ]]; then printf '%s' /usr/share/fonts
@@ -126,14 +163,17 @@ label_font() {  # a bold ttf for drawtext labels
   done
   return 1
 }
-human() {
-  awk -v b="$1" 'BEGIN{
-    if (b >= 1073741824) printf "%.2f GB", b/1073741824;
-    else if (b >= 1048576) printf "%.1f MB", b/1048576;
-    else printf "%.0f KB", b/1024 }'
+human() {   # bytes -> "1.5 GB" / "12.3 MB" / "800 KB" (pure bash, no forks)
+  local b=${1:-0} x
+  [[ $b =~ ^[0-9]+$ ]] || b=0
+  if   (( b >= 1073741824 )); then x=$(( (b * 100 + 536870912) / 1073741824 )); printf '%d.%02d GB' $(( x / 100 )) $(( x % 100 ))
+  elif (( b >= 1048576 ));    then x=$(( (b * 10 + 524288) / 1048576 ));        printf '%d.%d MB' $(( x / 10 )) $(( x % 10 ))
+  else printf '%d KB' $(( (b + 512) / 1024 )); fi
 }
-fmt_time() {
-  awk -v s="$1" 'BEGIN{ s=int(s); printf "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60 }'
+fmt_time() {   # seconds -> hh:mm:ss (pure bash)
+  local s=${1%%.*}
+  [[ $s =~ ^[0-9]+$ ]] || s=0
+  printf '%02d:%02d:%02d' $(( s / 3600 )) $(( s % 3600 / 60 )) $(( s % 60 ))
 }
 pretty() {
   local p=$1 sh="$HOME/storage/shared"
@@ -141,13 +181,31 @@ pretty() {
   printf '%s' "$p"
 }
 trunc() {
-  local m=$(( $(term_cols) - 15 ))
+  local m=$(( ${TERM_COLS:-44} - 15 ))
   (( m < 12 )) && m=12
   if (( ${#1} > m )); then printf '%s…' "${1:0:m-1}"; else printf '%s' "$1"; fi
 }
-to_sec() {   # "90" | "1:30" | "0:01:30.5"  ->  seconds
+to_sec() {   # "90" | "1:30" | "0:01:30.5"  ->  seconds (millisecond precision)
   [[ $1 =~ ^([0-9]+:){0,2}[0-9]+(\.[0-9]+)?$ ]] || return 1
-  awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else if (NF==2) print $1*60+$2; else print $1 }' <<<"$1"
+  awk -F: '{ if (NF==3) v=$1*3600+$2*60+$3; else if (NF==2) v=$1*60+$2; else v=$1
+             s=sprintf("%.3f", v); sub(/0+$/, "", s); sub(/\.$/, "", s); print s }' <<<"$1"
+}
+secs_us() {   # "12.345" -> SECS_US=12345000 (integer microseconds, no forks)
+  local s=${1:-0} i f
+  i=${s%%.*}; f=""; [[ $s == *.* ]] && f=${s#*.}
+  [[ $i =~ ^[0-9]+$ ]] || i=0
+  f=${f}000000; f=${f:0:6}
+  [[ $f =~ ^[0-9]+$ ]] || f=0
+  SECS_US=$(( 10#$i * 1000000 + 10#$f ))
+}
+ratio_dec() {   # "30000/1001" | "25" , decimals(2|3) -> RATIO="29.97" (no forks)
+  local r=$1 n d sc=${2:-2} pw=100
+  (( sc == 3 )) && pw=1000
+  if [[ $r == */* ]]; then n=${r%/*}; d=${r#*/}; else n=$r; d=1; fi
+  if ! [[ $n =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]]; then RATIO=0; return; fi
+  if (( d == 0 )); then RATIO=$n; return; fi
+  local x=$(( (n * pw + d / 2) / d ))
+  printf -v RATIO '%d.%0*d' $(( x / pw )) "$sc" $(( x % pw ))
 }
 ask() {
   local p=$1 d=${2:-} a
@@ -171,9 +229,31 @@ yesno() {     # prompt default(y|n)
   local a; a=$(ask "$1 (y/n)" "${2:-y}")
   [[ ${a,,} == y* ]]
 }
+detect_ff_caps() {   # once per run (call it in the parent so parallel jobs inherit it)
+  (( FF_CAPS_DONE )) && return 0
+  FF_CAPS_DONE=1; STATS_OPT=(); FPSMODE_OPT=(-vsync 0); ENCTB_OPT=(); FF_VER=""
+  local v maj min
+  v=$(ffmpeg -version 2>/dev/null | head -n1)
+  v=${v#ffmpeg version }; v=${v#[nN]}; FF_VER=${v%% *}
+  if [[ $v =~ ^([0-9]+)\.([0-9]+) ]]; then
+    maj=${BASH_REMATCH[1]}; min=${BASH_REMATCH[2]}
+    (( maj > 4 || (maj == 4 && min >= 4) )) && STATS_OPT=(-stats_period 1)
+    (( maj > 5 || (maj == 5 && min >= 1) )) && FPSMODE_OPT=(-fps_mode passthrough)
+    # microsecond encoder time base: without it, millisecond timestamps (MKV/WebM, odd
+    # frame rates) collide after rounding and the image muxer silently DROPS frames
+    (( maj > 4 || (maj == 4 && min >= 3) )) && ENCTB_OPT=(-enc_time_base 1:1000000)
+  else   # git / nightly build: assume modern
+    STATS_OPT=(-stats_period 1); FPSMODE_OPT=(-fps_mode passthrough); ENCTB_OPT=(-enc_time_base 1:1000000)
+  fi
+}
+calc_threads() {   # $1 = parallel jobs -> THREADS_PER_JOB (split the CPU, never oversubscribe)
+  local n=${1:-1} c
+  c=$(nproc 2>/dev/null || echo 4); [[ $c =~ ^[0-9]+$ ]] || c=4
+  if (( n > 1 )); then THREADS_PER_JOB=$(( (c + n - 1) / n )); else THREADS_PER_JOB=0; fi
+}
 have_enc() { ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw -- "$1"; }
 hw_encoder_name() { case $CODEC in hw265) echo hevc_mediacodec;; hw264) echo h264_mediacodec;; esac; }
-sel_size() { local t=0 f; for f in "${SELECTED[@]}"; do t=$(( t + $(fsize "$f") )); done; echo "$t"; }
+sel_size() { sum_sizes; echo "$SEL_BYTES"; }
 
 # ----------------------------------------------------------------- presets ---
 preset_desc() {
@@ -217,6 +297,7 @@ set_defaults() {
   PARALLEL_JOBS=1; KEEP_SUBS=1; SUB_MODE="soft"; SUB_FILE=""
   SUB_LANG="fa"; SUB_SIZE=24; SUB_COLOR="&H00FFFFFF"
   OUT_EXT="mp4"; FINISH_ACTION="menu"
+  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"
 }
 
 # ------------------------------------------------------ settings & profiles ---
@@ -292,28 +373,59 @@ plan_line() {
 }
 
 # --------------------------------------------------------------- probing -----
-probe() {
-  local f=$1 k v
-  SRC_VCODEC=""; SRC_W=""; SRC_H=""; SRC_FPS=0; SRC_VBR=""; SRC_ACODEC=""; SRC_ABR=""
+probe() {   # one ffprobe call -> DUR + SRC_* (video, audio, subtitle info)
+  local f=$1 line kv k v ctype codec w h rfr afr br pix trc ach dur
+  local vdone=0 adone=0
+  local -a P
+  DUR=""; SRC_VCODEC=""; SRC_W=""; SRC_H=""; SRC_FPS=0; SRC_AFPS=0; SRC_VBR=""; SRC_PIX=""; SRC_TRC=""
+  SRC_ACODEC=""; SRC_ABR=""; SRC_ACH=0; SRC_NSUBS=0; SRC_SUBBAD=0
   [[ -f $f ]] || { err "Not a file: $f"; return 1; }
-  DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null | head -n1)
+  while IFS= read -r line; do
+    ctype=""; codec=""; w=""; h=""; rfr=""; afr=""; br=""; pix=""; trc=""; ach=""; dur=""
+    IFS='|' read -ra P <<<"$line"
+    for kv in "${P[@]:1}"; do
+      k=${kv%%=*}; v=${kv#*=}
+      case $k in
+        codec_type)      ctype=$v;;
+        codec_name)      codec=$v;;
+        width)           w=$v;;
+        height)          h=$v;;
+        r_frame_rate)    rfr=$v;;
+        avg_frame_rate)  afr=$v;;
+        bit_rate)        br=$v;;
+        pix_fmt)         pix=$v;;
+        color_transfer)  trc=$v;;
+        channels)        ach=$v;;
+        duration)        dur=$v;;
+      esac
+    done
+    case ${P[0]} in
+      format) DUR=$dur;;
+      stream)
+        case $ctype in
+          video)
+            if (( ! vdone )); then
+              vdone=1; SRC_VCODEC=$codec; SRC_W=$w; SRC_H=$h; SRC_PIX=$pix; SRC_TRC=$trc
+              ratio_dec "$rfr" 2; SRC_FPS=$RATIO
+              ratio_dec "$afr" 3; SRC_AFPS=$RATIO
+              [[ $br =~ ^[0-9]+$ ]] && SRC_VBR=$(( br / 1000 ))
+            fi;;
+          audio)
+            if (( ! adone )); then
+              adone=1; SRC_ACODEC=$codec
+              [[ $br =~ ^[0-9]+$ ]] && SRC_ABR=$(( br / 1000 ))
+              [[ $ach =~ ^[0-9]+$ ]] && SRC_ACH=$ach
+            fi;;
+          subtitle)
+            SRC_NSUBS=$(( SRC_NSUBS + 1 ))
+            case $codec in subrip|srt|ass|ssa|mov_text|webvtt|text|stl) ;; *) SRC_SUBBAD=1;; esac;;
+        esac;;
+    esac
+  done < <(ffprobe -v error -show_entries \
+    'format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,pix_fmt,color_transfer,channels' \
+    -of compact -- "$f" 2>/dev/null)
   [[ $DUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || { err "Cannot read duration: $(basename -- "$f")"; return 1; }
-  while IFS='=' read -r k v; do
-    case $k in
-      codec_name)   SRC_VCODEC=$v;;
-      width)        SRC_W=$v;;
-      height)       SRC_H=$v;;
-      r_frame_rate) SRC_FPS=$(awk -F/ -v r="$v" 'BEGIN{ split(r,a,"/"); if (a[2]>0) printf "%.2f", a[1]/a[2]; else print a[1] }');;
-      bit_rate)     [[ $v =~ ^[0-9]+$ ]] && SRC_VBR=$(( v / 1000 ));;
-    esac
-  done < <(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate,bit_rate -of default=nw=1 "$f" 2>/dev/null)
   [[ -n $SRC_VCODEC ]] || { err "No video stream: $(basename -- "$f")"; return 1; }
-  while IFS='=' read -r k v; do
-    case $k in
-      codec_name) SRC_ACODEC=$v;;
-      bit_rate)   [[ $v =~ ^[0-9]+$ ]] && SRC_ABR=$(( v / 1000 ));;
-    esac
-  done < <(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,bit_rate -of default=nw=1 "$f" 2>/dev/null)
   return 0
 }
 
@@ -430,9 +542,22 @@ calc_edur() {   # sets EDUR + IN_OPTS from DUR and trim settings
 
 calc_bitrate() {   # video kbps needed to hit TARGET_MB (decimal MB, 3% safety margin)
   local a=0
-  case $AUDIO in aac) a=$ABR;; copy) a=${SRC_ABR:-128};; none) a=0;; esac
+  audio_plan
+  case $AUDIO in
+    aac)  if (( AUD_COPY )); then a=$SRC_ABR; else a=$ABR; fi;;
+    copy) a=${SRC_ABR:-128};;
+    none) a=0;;
+  esac
   awk -v mb="$TARGET_MB" -v d="$EDUR" -v a="$a" \
     'BEGIN{ v = mb*8000*0.97/d - a; if (v < 40) exit 1; printf "%d", v }'
+}
+audio_plan() {   # AUD_COPY=1 when the source audio is already AAC at/below the target (copy = faster, no generation loss)
+  AUD_COPY=0
+  [[ $AUDIO == aac && $SRC_ACODEC == aac ]] || return 0
+  [[ $SRC_ABR =~ ^[0-9]+$ ]] && (( SRC_ABR > 0 && SRC_ABR <= ABR )) || return 0
+  if (( ABR <= 48 )); then (( SRC_ACH == 1 )) || return 0
+  else (( SRC_ACH >= 1 && SRC_ACH <= 2 )) || return 0; fi
+  AUD_COPY=1
 }
 
 # ============================ repair diagnostics (v2.1) ======================
@@ -450,44 +575,61 @@ frac2dec() {   # "30000/1001" | "29.97" -> decimal number
     else print "0" }'
 }
 
-diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream
-  local f=$1 k v
+diag_probe() {   # $1 file -> D_* fields (one ffprobe call); fails when there is no video stream
+  local f=$1 line kv k v ctype codec w h pix rfr afr st tb sr ch dur fmt
+  local vdone=0 adone=0
+  local -a P
   D_VCODEC=""; D_W=0; D_H=0; D_PIX=""; D_RFPS=""; D_AFPS=""; D_VSTART=""; D_VTB=""
-  D_ACODEC=""; D_ARATE=0; D_ACH=0; D_ASTART=""; D_ANUM=0; D_DUR=0; D_FMT=""
+  D_ACODEC=""; D_ARATE=0; D_ACH=0; D_ASTART=""; D_ANUM=0; D_DUR=0; D_FMT=""; D_VTS=0
   [[ -f $f ]] || return 1
-  while IFS='=' read -r k v; do
-    case $k in
-      codec_name)     D_VCODEC=$v;;
-      width)          D_W=$v;;
-      height)         D_H=$v;;
-      pix_fmt)        D_PIX=$v;;
-      r_frame_rate)   D_RFPS=$v;;
-      avg_frame_rate) D_AFPS=$v;;
-      start_time)     D_VSTART=$v;;
-      time_base)      D_VTB=$v;;
+  while IFS= read -r line; do
+    ctype=""; codec=""; w=""; h=""; pix=""; rfr=""; afr=""; st=""; tb=""; sr=""; ch=""; dur=""; fmt=""
+    IFS='|' read -ra P <<<"$line"
+    for kv in "${P[@]:1}"; do
+      k=${kv%%=*}; v=${kv#*=}
+      case $k in
+        codec_type)     ctype=$v;;
+        codec_name)     codec=$v;;
+        width)          w=$v;;
+        height)         h=$v;;
+        pix_fmt)        pix=$v;;
+        r_frame_rate)   rfr=$v;;
+        avg_frame_rate) afr=$v;;
+        start_time)     st=$v;;
+        time_base)      tb=$v;;
+        sample_rate)    sr=$v;;
+        channels)       ch=$v;;
+        duration)       dur=$v;;
+        format_name)    fmt=$v;;
+      esac
+    done
+    case ${P[0]} in
+      format) D_DUR=$dur; D_FMT=$fmt;;
+      stream)
+        case $ctype in
+          video)
+            if (( ! vdone )); then
+              vdone=1; D_VCODEC=$codec; D_W=$w; D_H=$h; D_PIX=$pix; D_RFPS=$rfr; D_AFPS=$afr; D_VSTART=$st; D_VTB=$tb
+            fi;;
+          audio)
+            D_ANUM=$(( D_ANUM + 1 ))
+            if (( ! adone )); then
+              adone=1; D_ACODEC=$codec; D_ARATE=$sr; D_ACH=$ch; D_ASTART=$st
+            fi;;
+        esac;;
     esac
-  done < <(ffprobe -v error -select_streams v:0 \
-    -show_entries stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base \
-    -of default=nw=1 "$f" 2>/dev/null)
+  done < <(ffprobe -v error -show_entries \
+    'format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base,sample_rate,channels' \
+    -of compact -- "$f" 2>/dev/null)
   [[ -n $D_VCODEC ]] || return 1
   case $D_VCODEC in mjpeg|jpegls|png|bmp|tiff) return 1;; esac
-  D_VTS=$(awk -v tb="${D_VTB:-}" 'BEGIN{ n=split(tb,a,"/"); if (n==2 && a[2]+0>0) printf "%d", a[2]; else print 0 }')
-  D_DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null | head -n1)
+  [[ $D_W =~ ^[0-9]+$ ]] || D_W=0
+  [[ $D_H =~ ^[0-9]+$ ]] || D_H=0
+  [[ $D_ARATE =~ ^[0-9]+$ ]] || D_ARATE=0
+  [[ $D_ACH =~ ^[0-9]+$ ]] || D_ACH=0
+  if [[ $D_VTB == */* && ${D_VTB#*/} =~ ^[0-9]+$ ]]; then D_VTS=${D_VTB#*/}; fi
   [[ $D_DUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || D_DUR=0
-  D_FMT=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$f" 2>/dev/null | head -n1)
   D_FMT=${D_FMT%%,*}; D_FMT=${D_FMT//\"/}
-  D_ANUM=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$f" 2>/dev/null | awk 'END{print NR}')
-  if (( D_ANUM > 0 )); then
-    while IFS='=' read -r k v; do
-      case $k in
-        codec_name)  D_ACODEC=$v;;
-        sample_rate) D_ARATE=$v;;
-        channels)    D_ACH=$v;;
-        start_time)  D_ASTART=$v;;
-      esac
-    done < <(ffprobe -v error -select_streams a:0 \
-      -show_entries stream=codec_name,sample_rate,channels,start_time -of default=nw=1 "$f" 2>/dev/null)
-  fi
   return 0
 }
 
@@ -506,10 +648,19 @@ diag_vfr_scan() {   # $1 file -> D_VFR D_FPSMED D_VFRBAD D_VFRDUP D_VFRN D_ROUND
     ivs+=("$(awk -v d="${D_DUR:-0}" 'BEGIN{printf "%.0f%%+#300", d/2}')" \
           "$(awk -v d="${D_DUR:-0}" 'BEGIN{printf "%.0f%%+#300", d*0.9}')")
   fi
-  for iv in "${ivs[@]}"; do
-    all+=$'\n'$(ffprobe -v error -select_streams v:0 -read_intervals "$iv" \
-      -show_entries packet=pts_time,duration -of csv=p=0 "$f" 2>/dev/null)
-  done
+  # the sections are independent, so they are scanned at the same time
+  local td j=0 pid; local -a pids=()
+  td=$(mktemp -d) || td=""
+  if [[ -n $td ]]; then
+    for iv in "${ivs[@]}"; do
+      ffprobe -v error -select_streams v:0 -read_intervals "$iv" \
+        -show_entries packet=pts_time,duration -of csv=p=0 -- "$f" >"$td/$j" 2>/dev/null &
+      pids+=($!); j=$(( j + 1 ))
+    done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+    for (( iv = 0; iv < j; iv++ )); do all+=$'\n'$(<"$td/$iv"); done
+    rm -rf -- "$td"
+  fi
   out=$(printf '%s' "$all" | awk -F, '
     BEGIN { vfr=0; fps=0; bad=0; dup=0; n1=0; rnd=0; tsx=-1 }
     $1 ~ /^[0-9]+(\.[0-9]+)?$/ { p[np++] = $1 + 0 }
@@ -551,16 +702,20 @@ diag_vfr_scan() {   # $1 file -> D_VFR D_FPSMED D_VFRBAD D_VFRDUP D_VFRN D_ROUND
 
 diag_faststart() {   # $1 file -> D_FAST: 1 = faststart, 0 = moov at end, -1 = n/a
   D_FAST=-1
-  local f=$1 mo mdat
+  local f=$1 line off name mo="" mdat=""
   case ${f##*.} in
     mp4|MP4|m4v|M4V|mov|MOV|3gp|3GP|3g2|3G2) ;;
     *) return 0;;
   esac
-  # 'moov' before 'mdat' = faststart. Small files fit entirely into the
-  # sample window, so the ATOM ORDER must be compared - just searching for
-  # 'moov' gave false "faststart" results on files under 2 MB.
-  mo=$(LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -abo moov | head -n1 | cut -d: -f1)
-  mdat=$(LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -abo mdat | head -n1 | cut -d: -f1)
+  # 'moov' before 'mdat' = faststart. One pass over the first 2 MB finds both
+  # atoms in file order (small files: the ORDER matters, not just presence).
+  while IFS=: read -r off name; do
+    case $name in
+      moov) [[ -n $mo ]]   || mo=$off;;
+      mdat) [[ -n $mdat ]] || mdat=$off;;
+    esac
+    [[ -n $mo && -n $mdat ]] && break
+  done < <(LC_ALL=C head -c 2097152 -- "$f" 2>/dev/null | LC_ALL=C grep -abo -e moov -e mdat 2>/dev/null)
   if [[ -n $mo ]]; then
     if [[ -z $mdat ]] || (( mo < mdat )); then D_FAST=1; else D_FAST=0; fi
   else
@@ -635,23 +790,26 @@ diag_report() {   # $1 file -> human-readable sync / TV-compatibility report
 
 # ----------------------------------------------------- ffmpeg arg builders ---
 build_vf() {
-  local f=()
+  local f=() sf=""
+  [[ $SCALER == lanczos ]] && sf=":flags=lanczos"
+  # frame-rate limit FIRST: dropped frames are never scaled or denoised
+  if (( FPS > 0 )) && awk -v s="$SRC_FPS" -v t="$FPS" 'BEGIN{ exit !(s > t+0.5) }'; then
+    f+=("fps=$FPS")
+  fi
   if (( HEIGHT > 0 )); then
-    f+=("scale='if(gt(iw,ih),-2,min($HEIGHT,iw))':'if(gt(iw,ih),min($HEIGHT,ih),-2)'")
+    f+=("scale='if(gt(iw,ih),-2,min($HEIGHT,iw))':'if(gt(iw,ih),min($HEIGHT,ih),-2)'$sf")
   fi
   case $DENOISE in
     1) f+=("hqdn3d=1.5:1.5:6:6");;
     2) f+=("hqdn3d=3:2.5:8:7");;
     3) f+=("hqdn3d=4:3:10:8");;
   esac
-  if (( FPS > 0 )) && awk -v s="$SRC_FPS" -v t="$FPS" 'BEGIN{ exit !(s > t+0.5) }'; then
-    f+=("fps=$FPS")
-  fi
   (IFS=,; printf '%s' "${f[*]}")
 }
 build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
-  local pass=$1 br=$2 xp="log-level=error"
+  local pass=$1 br=$2 xp="log-level=error" th=""
   VENC=()
+  (( THREADS_PER_JOB > 0 )) && th=$THREADS_PER_JOB
   case $CODEC in
     x265)
       VENC+=(-c:v libx265 -preset "$SPEED" -pix_fmt yuv420p)
@@ -661,9 +819,11 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
         p1) xp+=":pass=1:stats=$TMPD/x265.stats";;
         p2) xp+=":pass=2:stats=$TMPD/x265.stats";;
       esac
+      [[ -n $th ]] && xp+=":pools=$th"
       VENC+=(-x265-params "$xp");;
     x264)
       VENC+=(-c:v libx264 -preset "$SPEED" -pix_fmt yuv420p)
+      [[ -n $th ]] && VENC+=(-threads "$th")
       if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi
       case $pass in
         p1) VENC+=(-pass 1 -passlogfile "$TMPD/x264");;
@@ -671,6 +831,7 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
       esac;;
     av1)
       VENC+=(-c:v libsvtav1 -preset "$(svt_preset_num)" -pix_fmt yuv420p)
+      [[ -n $th ]] && VENC+=(-threads "$th")
       if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi;;
     hw265) VENC+=(-c:v hevc_mediacodec -b:v "${br:-$VBR}k")
            [[ $OUT_EXT == mp4 ]] && VENC+=(-tag:v hvc1);;
@@ -678,42 +839,56 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
   esac
 }
 build_aenc() {
+  audio_plan
   case $AUDIO in
     none) AENC=(-an);;
     copy) AENC=(-c:a copy);;
-    *)    local ac=2; (( ABR <= 48 )) && ac=1
-          AENC=(-c:a aac -b:a "${ABR}k" -ac "$ac");;
+    *)    if (( AUD_COPY )); then
+            AENC=(-c:a copy)
+          else
+            local ac=2; (( ABR <= 48 )) && ac=1
+            AENC=(-c:a aac -b:a "${ABR}k" -ac "$ac")
+          fi;;
   esac
 }
 
 # --------------------------------------------------- progress-bar runner -----
 # run_ffmpeg LABEL PASS_INDEX PASS_TOTAL <ffmpeg args...>
-run_ffmpeg() {
-  local label=$1 pi=$2 pt=$3 rc cols w
+run_ffmpeg() {   # run_ffmpeg LABEL PASS_INDEX PASS_TOTAL <ffmpeg args...>
+  local label=$1 pi=$2 pt=$3 rc w edur_us
   shift 3
   mkdir -p "$CONF_DIR" 2>/dev/null
+  detect_ff_caps
   if (( SIMPLE )); then
     ffmpeg -nostdin -hide_banner -loglevel error -y "$@" 2>>"${LOGF:-$LOG}"
     return $?
   fi
-  cols=$(term_cols); w=$(( cols - 34 )); (( w < 8 )) && w=8; (( w > 28 )) && w=28
-  ffmpeg -nostdin -hide_banner -loglevel error -progress pipe:1 -nostats -y "$@" 2>>"${LOGF:-$LOG}" |
+  [[ -n $TERM_COLS ]] || refresh_cols
+  w=$(( TERM_COLS - 34 )); (( w < 8 )) && w=8; (( w > 28 )) && w=28
+  secs_us "${EDUR:-0}"; edur_us=$SECS_US; (( edur_us < 1 )) && edur_us=1
+  ffmpeg -nostdin -hide_banner -loglevel error -progress pipe:1 -nostats "${STATS_OPT[@]}" -y "$@" 2>>"${LOGF:-$LOG}" |
   {
-    cur=0; spd=""
+    # pure-bash progress: no awk / sub-shell is started for any update
+    local cur=0 spd=0 key val pct eta fr tot rem es sp="" filled b1 b2 f3
     while IFS='=' read -r key val; do
       case $key in
         out_time_us|out_time_ms) [[ $val =~ ^[0-9]+$ ]] && cur=$val;;
-        speed) spd=${val//[x ]/}; [[ $spd =~ ^[0-9.]+$ ]] || spd="";;
+        speed)
+          val=${val//[x ]/}
+          if [[ $val =~ ^([0-9]+)(\.([0-9]+))?$ ]]; then
+            f3=${BASH_REMATCH[3]}000; spd=$(( 10#${BASH_REMATCH[1]} * 1000 + 10#${f3:0:3} )); sp="${val}x"
+          else spd=0; sp=""; fi;;
         progress)
-          read -r pct eta < <(awk -v c="$cur" -v d="$EDUR" -v pi="$pi" -v pt="$pt" -v s="$spd" 'BEGIN{
-              p = c/1e6/d; if (p > 1) p = 1; if (p < 0) p = 0;
-              pct = int(((pi-1) + p) / pt * 100);
-              if (s+0 > 0) { r = ((1-p) + (pt-pi)) * d / s;
-                printf "%d %02d:%02d:%02d\n", pct, r/3600, (r%3600)/60, r%60 }
-              else printf "%d --:--:--\n", pct }')
+          (( cur > edur_us )) && cur=$edur_us
+          tot=$(( pt * edur_us ))
+          pct=$(( ((pi - 1) * edur_us + cur) * 100 / tot ))
+          if (( spd > 0 )); then
+            rem=$(( (pt - pi) * edur_us + edur_us - cur ))
+            es=$(( rem / (spd * 1000) ))
+            printf -v eta '%02d:%02d:%02d' $(( es / 3600 )) $(( es % 3600 / 60 )) $(( es % 60 ))
+          else eta='--:--:--'; fi
           filled=$(( pct * w / 100 ))
           printf -v b1 '%*s' "$filled" ''; printf -v b2 '%*s' "$(( w - filled ))" ''
-          sp=${spd:+${spd}x}
           printf '\r\033[K%s[%s%s] %3d%% %s ETA %s' "${label:+$label }" "${b1// /#}" "${b2// /.}" "$pct" "${sp:---}" "$eta"
           ;;
       esac
@@ -819,8 +994,8 @@ commit_out() {   # $1 built tmp, $2 final path -> 0 = the file is in place
   info "Moving $(human "$sz") to $(pretty "$(dirname -- "$dst")") ..."
   cp -f -- "$src" "$dst.vcmove" & copid=$!
   while kill -0 "$copid" 2>/dev/null; do
-    p=$(awk -v a="$(fsize "$dst.vcmove" 2>/dev/null || echo 0)" -v b="$sz" \
-      'BEGIN{ if (b+0>0) { x=int(a*100/b); if (x>100) x=100 } else x=0; printf "%d", x }')
+    p=$(fsize "$dst.vcmove"); (( sz > 0 )) && p=$(( p * 100 / sz )) || p=0
+    (( p > 100 )) && p=100
     printf '\r  %3d%%' "$p"
     sleep 0.4
   done
@@ -838,13 +1013,14 @@ commit_out() {   # $1 built tmp, $2 final path -> 0 = the file is in place
 compress_file() {
   local src=$1 fidx=${2:-0} fn=${3:-0} tag=""
   local name dst tmp in_sz out_sz saved passes=1 br="" vf rc=0 odur status t0=$SECONDS
-  local extarg=() maps=() scodec=() submeta=() fmt fast subfilter="" srt="" keepsubs subn
+  local extarg=() maps=() scodec=() submeta=() fmt fast subfilter="" srt="" keepsubs subn ex_nsubs ex_bad prev
   (( fidx > 0 )) && tag="[$fidx/$fn] "
   name=$(basename -- "$src")
   if ! probe "$src"; then
     add_result "$name" "-" "-" "-" "-" "FAILED (unreadable)" "$src" ""
     tally fail; return 1
   fi
+  ex_nsubs=$SRC_NSUBS; ex_bad=$SRC_SUBBAD     # one probe call gave us everything
   in_sz=$(fsize "$src")
   if ! calc_edur; then
     err "Trim range is outside the video."
@@ -853,6 +1029,16 @@ compress_file() {
   fi
   printf '  %s%s%dx%d %s %s fps | %s | %s%s\n' "$tag" "$C_D" "$SRC_W" "$SRC_H" "$SRC_VCODEC" "$SRC_FPS" \
     "$(fmt_time "$EDUR")" "$(human "$in_sz")" "$C_0"
+  case $SRC_TRC in
+    smpte2084|arib-std-b67)
+      [[ $CODEC == hw* ]] || warn "HDR video detected: 8-bit SDR output can look washed out. Keep the original if colours matter.";;
+  esac
+
+  if (( SKIP_DONE )) && prev=$(done_output "$src"); then
+    ok "${tag}Already done - skipped: $(basename -- "$prev")"
+    add_result "$name" "$(human "$in_sz")" "$(human "$(fsize "$prev")")" "-" "-" "SKIPPED (already done)" "$src" "$prev"
+    return 0
+  fi
 
   if (( TARGET_MB > 0 )); then
     if (( in_sz <= TARGET_MB * 1000000 )) && [[ -z $TRIM_START$TRIM_END ]]; then
@@ -871,6 +1057,8 @@ compress_file() {
   fi
   [[ $CODEC == av1 ]] && passes=1
   [[ -n $br && $CODEC == x* ]] && passes=2
+  audio_plan
+  (( AUD_COPY )) && printf '  %sAudio: AAC %s kbps is already at/below the target - copied, no re-encode%s\n' "$C_D" "$SRC_ABR" "$C_0"
 
   TMPD=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
   dst=$(unique_out "$src")
@@ -901,24 +1089,21 @@ compress_file() {
   setup_burn "$src" && subfilter=$SUBFILTER
 
   keepsubs=$KEEP_SUBS
-  if (( keepsubs )) && (( $(count_subs "$src") > 0 )) && ! sub_codecs_ok "$src"; then
+  if (( keepsubs )) && (( ex_nsubs > 0 )) && (( ex_bad )); then
     warn "Bitmap subtitles (PGS/DVD) cannot be copied to this container - dropping them."
     keepsubs=0
   fi
   [[ -n $subfilter ]] && keepsubs=0   # burned subtitles replace tracks
 
   maps=(-map 0:v:0 -map '0:a?')
+  (( keepsubs )) && maps+=(-map '0:s?')
   if [[ -n $srt ]]; then
     extarg=(-i "$srt")
-    maps+=(-map '0:s?' -map 1:0)
-  elif (( keepsubs )); then
-    maps+=(-map '0:s?')
+    maps+=(-map 1:0)
   fi
-  if (( ${#maps[@]} > 2 )); then
-    if [[ $OUT_EXT == mkv ]]; then scodec=(-c:s srt); else scodec=(-c:s mov_text); fi
-  fi
+  if [[ $OUT_EXT == mkv ]]; then scodec=(-c:s srt); else scodec=(-c:s mov_text); fi
   if [[ -n $srt ]]; then
-    subn=$(count_subs "$src")
+    subn=0; (( keepsubs )) && subn=$ex_nsubs      # index of the NEW track among kept subtitle tracks
     local sublang=$SUB_LANG
     [[ $OUT_EXT == mp4 ]] && sublang=$(lang3 "$sublang")
     submeta=(-metadata:s:s:$subn language="$sublang")
@@ -992,6 +1177,22 @@ compress_file() {
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "$status" "$src" "$dst"
   return 0
 }
+done_output() {   # $1 src -> echo the finished output of an earlier run (needs EDUR); 1 = none
+  local src=$1 dir base out od
+  dir=${OUTDIR:-$(dirname -- "$src")}
+  base=$(basename -- "$src"); base=${base%.*}
+  out="$dir/${base}${SUFFIX}.$OUT_EXT"
+  [[ -s $out ]] || return 1
+  od=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2>/dev/null | head -n1)
+  awk -v a="${od:-0}" -v b="$EDUR" 'BEGIN{ d=a-b; if (d<0) d=-d; exit !(d<=2.5) }' || return 1
+  printf '%s' "$out"
+}
+is_vc_output() {   # 0 = this file name looks like something vc itself produced
+  local b=${1##*/}; b=${b%.*}
+  [[ -n $SUFFIX && $b == *"$SUFFIX" ]] && return 0
+  case $b in *_repaired|*_fixed|*_shifted|*_subbed|*_burned|*_nosub|*_compare|*_compressed) return 0;; esac
+  return 1
+}
 
 # ---------------------------------------------------------------- batch run ---
 wake_lock()   { if command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock; WAKE=1; fi; }
@@ -1017,21 +1218,24 @@ run_batch() {
     PARALLEL_JOBS=2; info "Hardware encoder detected: using 2 parallel jobs automatically."
   fi
   mkdir -p "$CONF_DIR"; : > "$LOG"
-  RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0
+  RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0; BATCH_T0=$SECONDS
   BATCH_TMP=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
   wake_lock
   [[ -z $VC_NOSTAGE ]] && stage_root   # one shared build area: parallel children inherit it
-  local i=0 n=${#SELECTED[@]} f st a b
+  detect_ff_caps
+  calc_threads "$PARALLEL_JOBS"        # parallel jobs split the CPU instead of fighting for it
+  local i=0 n=${#SELECTED[@]} f st a b running=0
   if (( PARALLEL_JOBS > 1 )); then
-    info "Parallel mode: up to $PARALLEL_JOBS files at once ($n total)"
+    info "Parallel mode: up to $PARALLEL_JOBS files at once ($n total, $THREADS_PER_JOB threads each)"
     for f in "${SELECTED[@]}"; do
       i=$(( i + 1 ))
-      while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do wait -n || true; done
+      while (( running >= PARALLEL_JOBS )); do wait -n || true; running=$(( running - 1 )); done
       printf '%s[%d/%d] %s%s\n' "$C_B" "$i" "$n" "$(trunc "$(basename -- "$f")")" "$C_0"
       (
         SIMPLE=1 LOGF="$BATCH_TMP/log_$i" STATS="$BATCH_TMP/stats" RESULT_FILE="$BATCH_TMP/results"
         compress_file "$f" "$i" "$n"
       ) &
+      running=$(( running + 1 ))
     done
     wait
     [[ -f $BATCH_TMP/results ]] && mapfile -t RESULTS < "$BATCH_TMP/results"
@@ -1069,6 +1273,7 @@ print_summary() {
     printf '\n%sTotal:%s %s -> %s  (saved %s)\n' "$C_B" "$C_0" "$(human "$TOTAL_IN")" "$(human "$TOTAL_OUT")" \
       "$(human $(( TOTAL_IN - TOTAL_OUT )))"
   fi
+  (( BATCH_T0 > 0 )) && printf '%sTime :%s %s\n' "$C_B" "$C_0" "$(fmt_time $(( SECONDS - BATCH_T0 )))"
   printf 'Done: %d ok, %d failed.  Log: %s\n' "$N_OK" "$N_FAIL" "$(pretty "$LOG")"
 }
 
@@ -1108,6 +1313,10 @@ list_videos() {
   find "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
     -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-
 }
+list_videos_sz() {   # "size<TAB>path" lines, newest first (one find, no per-file stat)
+  find "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
+    -printf '%T@\t%s\t%p\n' 2>/dev/null | sort -rn | cut -f2-
+}
 add_sel() {
   local f x; f=$(readlink -f -- "$1")
   for x in "${SELECTED[@]}"; do [[ $x == "$f" ]] && return 0; done
@@ -1121,13 +1330,16 @@ add_path() {
   else err "Not found: $p"; fi
 }
 pick_from_dir() {
-  local dir=$1 files=() ans toks tok lo hi n added f i
-  mapfile -t files < <(list_videos "$dir" | head -n 60)
+  local dir=$1 files=() sizes=() ans toks tok lo hi n added f i line
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    sizes+=("${line%%$'\t'*}"); files+=("${line#*$'\t'}"); SZC[${line#*$'\t'}]=${line%%$'\t'*}
+  done < <(list_videos_sz "$dir" | head -n 60)
   if (( ${#files[@]} == 0 )); then warn "No videos in $(pretty "$dir")"; return 1; fi
   while true; do
     printf '\n%s%s%s  (newest first)\n' "$C_B" "$(pretty "$dir")" "$C_0"
     for i in "${!files[@]}"; do
-      printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "$(fsize "${files[i]}")")" "$(trunc "$(basename -- "${files[i]}")")"
+      printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "${sizes[i]}")" "$(trunc "${files[i]##*/}")"
     done
     echo "Numbers (e.g. 1 3 5-7), a = all, b = back"
     read -r -p "> " ans || return 1
@@ -1150,18 +1362,22 @@ pick_from_dir() {
 
 # --- v2.0: real folder browser -----------------------------------------------
 browse_folders() {
-  local cur="${HOME}/storage/shared" ans i rel v vids=() dirs=()
+  local cur="${HOME}/storage/shared" ans i rel v vids=() vsz=() dirs=() line
   [[ -d $cur ]] || cur="$HOME"
   while true; do
     clear_screen
     printf '%s== Browse folders ==%s\n\n' "$C_B" "$C_0"
     printf ' %s\n\n' "$(pretty "$cur")"
     mapfile -t dirs < <(find "$cur" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort | head -n 40)
-    mapfile -t vids < <(list_videos "$cur" | head -n 40)
+    vids=(); vsz=()
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      vsz+=("${line%%$'\t'*}"); vids+=("${line#*$'\t'}"); SZC[${line#*$'\t'}]=${line%%$'\t'*}
+    done < <(list_videos_sz "$cur" | head -n 40)
     for i in "${!dirs[@]}"; do printf ' d%-2d) %s/\n' $(( i + 1 )) "${dirs[i]}"; done
     (( ${#dirs[@]} > 0 )) && echo
     for i in "${!vids[@]}"; do
-      printf ' %3d) %8s  %s\n' $(( i + 1 )) "$(human "$(fsize "${vids[i]}")")" "$(trunc "$(basename -- "${vids[i]}")")"
+      printf ' %3d) %8s  %s\n' $(( i + 1 )) "$(human "${vsz[i]}")" "$(trunc "${vids[i]##*/}")"
     done
     (( ${#vids[@]} == 0 )) && echo "  (no videos in this folder)"
     echo
@@ -1237,12 +1453,14 @@ queue_menu() {
   while true; do
     clear_screen
     n=${#SELECTED[@]}
-    printf '%s== Queue ==%s  (%d file(s), %s)\n\n' "$C_B" "$C_0" "$n" "$(human "$(sel_size)")"
+    sum_sizes
+    printf '%s== Queue ==%s  (%d file(s), %s)\n\n' "$C_B" "$C_0" "$n" "$(human "$SEL_BYTES")"
     if (( n == 0 )); then
       echo "  (empty - choose videos first)"
     else
       for i in "${!SELECTED[@]}"; do
-        printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "$(fsize "${SELECTED[i]}")")" "$(trunc "$(pretty "${SELECTED[i]}")")"
+        fsize_v "${SELECTED[i]}"
+        printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "$FSZ")" "$(trunc "$(pretty "${SELECTED[i]}")")"
       done
     fi
     printf '\n  r) remove one   c) clear   b) back\n'
@@ -1286,13 +1504,13 @@ compare_info() {   # $1 original  $2 output -> side-by-side info table
   a_res="${SRC_W}x${SRC_H} ${SRC_VCODEC}"; a_fps=$SRC_FPS
   a_br=${SRC_VBR:-$(awk -v s="$a_sz" -v d="$DUR" 'BEGIN{ if (d+0>0) printf "%d", s*8/d/1000; else print "?" }')}
   a_ac="${SRC_ACODEC:-none}${SRC_ABR:+, ${SRC_ABR} kbps}"
-  a_sub=$(count_subs "$f1")
+  a_sub=$SRC_NSUBS
   probe "$f2" || return 1
   b_sz=$(fsize "$f2"); b_dur=$DUR
   b_res="${SRC_W}x${SRC_H} ${SRC_VCODEC}"; b_fps=$SRC_FPS
   b_br=${SRC_VBR:-$(awk -v s="$b_sz" -v d="$DUR" 'BEGIN{ if (d+0>0) printf "%d", s*8/d/1000; else print "?" }')}
   b_ac="${SRC_ACODEC:-none}${SRC_ABR:+, ${SRC_ABR} kbps}"
-  b_sub=$(count_subs "$f2")
+  b_sub=$SRC_NSUBS
   printf '\n%s== Comparison ==%s\n' "$C_B" "$C_0"
   printf ' %-11s %-28s %s\n' "" "ORIGINAL" "OUTPUT"
   printf ' %-11s %-28s %s\n' "Size"      "$(human "$a_sz")" "$(human "$b_sz")"
@@ -1754,6 +1972,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     else
       venc=(-c:v libx264 -preset "$REPAIR_PRESET" -crf "$REPAIR_CRF" -pix_fmt yuv420p -profile:v high)
     fi
+    (( THREADS_PER_JOB > 0 )) && venc+=(-threads "$THREADS_PER_JOB")
     fargs+=(-vf "$vf" "${venc[@]}")
   else
     fargs+=(-c:v copy)
@@ -1943,21 +2162,24 @@ repair_batch() {   # repair every queued video (sequential or -j parallel)
   local prev_auto=$REPAIR_AUTO
   REPAIR_AUTO=1
   mkdir -p "$CONF_DIR"; : > "$LOG"
-  RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0
+  RESULTS=(); N_OK=0; N_FAIL=0; TOTAL_IN=0; TOTAL_OUT=0; BATCH_T0=$SECONDS
   BATCH_TMP=$(mktemp -d) || { err "Cannot create temp dir."; REPAIR_AUTO=$prev_auto; return 1; }
   wake_lock
   [[ -z $VC_NOSTAGE ]] && stage_root   # one shared build area: parallel children inherit it
-  local i=0 n=${#SELECTED[@]} f st a b
+  detect_ff_caps
+  local i=0 n=${#SELECTED[@]} f st a b running=0
+  (( n > 1 )) && calc_threads "$PARALLEL_JOBS" || calc_threads 1
   if (( PARALLEL_JOBS > 1 && n > 1 )); then
-    info "Parallel repair: up to $PARALLEL_JOBS files at once ($n total)"
+    info "Parallel repair: up to $PARALLEL_JOBS files at once ($n total, $THREADS_PER_JOB threads each)"
     for f in "${SELECTED[@]}"; do
       i=$(( i + 1 ))
-      while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do wait -n || true; done
+      while (( running >= PARALLEL_JOBS )); do wait -n || true; running=$(( running - 1 )); done
       printf '%s[%d/%d] %s%s\n' "$C_B" "$i" "$n" "$(trunc "$(basename -- "$f")")" "$C_0"
       (
         SIMPLE=1 LOGF="$BATCH_TMP/log_$i" STATS="$BATCH_TMP/stats" RESULT_FILE="$BATCH_TMP/results"
         REPAIR_AUTO=1 repair_file "$f" "[$i/$n] "
       ) &
+      running=$(( running + 1 ))
     done
     wait
     [[ -f $BATCH_TMP/results ]] && mapfile -t RESULTS < "$BATCH_TMP/results"
@@ -2119,6 +2341,306 @@ make_thumb() {
 }
 
 # --------------------------------------------------------------- info tools ---
+
+# ====================================================== FRAME EXTRACTOR (v2.3)
+# Choose a start and an end time: vc creates a NEW folder and writes EVERY
+# frame in that range as an image.  Range = [start, end): the frame at the
+# start time is included, a frame sitting exactly on the end time is not.
+# Frame-exact on constant AND variable frame rate videos (no duplicated or
+# dropped frames), free space is checked first, the folder is built on fast
+# local storage and moved to its final place in one pass.
+frame_fmt_label()  { case $FRAME_FMT in png) echo "PNG (lossless)";; bmp) echo "BMP (raw, fastest, huge)";; webp) echo "WebP (quality $(( 101 - FRAME_Q * 3 )))";; *) echo "JPG (quality $FRAME_Q, 1 = best)";; esac; }
+frame_step_label() { case $FRAME_STEP in 0) echo "keyframes only (fastest)";; 1) echo "every frame";; *) echo "one frame in every ${FRAME_STEP}";; esac; }
+frame_h_label()    { if (( FRAME_H > 0 )); then echo "max ${FRAME_H}p"; else echo "original size"; fi; }
+
+fmt_tc() {   # seconds -> hh:mm:ss.mmm
+  secs_us "$1"
+  printf '%02d:%02d:%02d.%03d' $(( SECS_US / 3600000000 )) $(( SECS_US % 3600000000 / 60000000 )) \
+    $(( SECS_US % 60000000 / 1000000 )) $(( SECS_US % 1000000 / 1000 ))
+}
+fmt_tag() {   # seconds -> FMT_TAG like 00-01-30 or 00-01-30.5 (safe in folder names)
+  local s=$1 i f=""
+  i=${s%%.*}; [[ $s == *.* ]] && f=${s#*.}
+  [[ $i =~ ^[0-9]+$ ]] || i=0
+  printf -v FMT_TAG '%02d-%02d-%02d' $(( i / 3600 )) $(( i % 3600 / 60 )) $(( i % 60 ))
+  f=${f:0:3}; while [[ $f == *0 ]]; do f=${f%0}; done
+  [[ -n $f ]] && FMT_TAG+=".$f"
+  return 0
+}
+unique_dir() {   # parent base -> a folder path that does not exist yet (parent is created)
+  local parent=$1 base=$2 out n=0
+  mkdir -p -- "$parent" 2>/dev/null
+  out="$parent/$base"
+  while [[ -e $out ]]; do n=$(( n + 1 )); out="$parent/${base}_$n"; done
+  printf '%s' "$out"
+}
+free_bytes() { df -Pk -- "$1" 2>/dev/null | awk 'NR==2{printf "%d", $4*1024}'; }
+
+frames_prepare() {   # FRAME_* settings -> FR_EXT, FR_ARGS (encoder), FR_VF (filters)
+  local vf=""
+  FR_VF=()
+  if [[ $FRAME_FMT == webp ]] && ! have_enc libwebp; then
+    warn "This ffmpeg build has no libwebp - using JPG."; FRAME_FMT=jpg
+  fi
+  case $FRAME_FMT in
+    png)  FR_EXT=png;  FR_ARGS=(-c:v png -compression_level 3 -pix_fmt rgb24);;
+    bmp)  FR_EXT=bmp;  FR_ARGS=(-c:v bmp -pix_fmt bgr24);;
+    webp) FR_EXT=webp; FR_ARGS=(-c:v libwebp -quality $(( 101 - FRAME_Q * 3 )) -compression_level 2);;
+    *)    FR_EXT=jpg;  FR_ARGS=(-c:v mjpeg -q:v "$FRAME_Q");;
+  esac
+  (( FRAME_STEP > 1 )) && vf="framestep=$FRAME_STEP"           # drop frames BEFORE scaling
+  if (( FRAME_H > 0 )); then
+    vf="${vf:+$vf,}scale='if(gt(iw,ih),-2,min($FRAME_H,iw))':'if(gt(iw,ih),min($FRAME_H,ih),-2)':flags=lanczos"
+  fi
+  [[ -n $vf ]] && FR_VF=(-vf "$vf")
+  return 0
+}
+
+frames_options() {   # interactive: format / quality / which frames / size
+  local c
+  echo " 1) JPG (fast, small)   2) PNG (lossless)   3) BMP (raw, fastest)   4) WebP"
+  c=$(ask "Image format (blank = keep: $FRAME_FMT)" "")
+  case $c in 1) FRAME_FMT=jpg;; 2) FRAME_FMT=png;; 3) FRAME_FMT=bmp;; 4) FRAME_FMT=webp;; esac
+  if [[ $FRAME_FMT == jpg || $FRAME_FMT == webp ]]; then
+    FRAME_Q=$(ask_int "Quality (1 = best ... 31 = smallest)" 1 31 "$FRAME_Q")
+  fi
+  echo " 1) every frame   2) one frame in every N   3) keyframes only (very fast)"
+  c=$(ask "Which frames (blank = keep: $(frame_step_label))" "")
+  case $c in
+    1) FRAME_STEP=1;;
+    2) FRAME_STEP=$(ask_int "N" 2 1000 "$(( FRAME_STEP > 1 ? FRAME_STEP : 5 ))");;
+    3) FRAME_STEP=0;;
+  esac
+  FRAME_H=$(ask_int "Max picture height in pixels (0 = original size)" 0 4320 "$FRAME_H")
+}
+
+move_dir() {   # $1 staged folder  $2 final folder (must not exist) -> 0 = moved completely
+  local src=$1 dst=$2 total moved pid rc d1 d2 p
+  d1=$(stat -c %d -- "$src" 2>/dev/null); d2=$(stat -c %d -- "$(dirname -- "$dst")" 2>/dev/null)
+  if [[ -n $d1 && $d1 == "$d2" ]] && mv -- "$src" "$dst" 2>/dev/null; then return 0; fi   # same disk: instant
+  mkdir -p -- "$dst" 2>/dev/null || return 1
+  total=$(find "$src" -maxdepth 1 -type f | wc -l)
+  find "$src" -maxdepth 1 -type f -print0 | xargs -0 -r -n 400 mv -t "$dst" 2>>"$LOG" &
+  pid=$!
+  if (( ! SIMPLE )) && [[ -t 1 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      moved=$(find "$dst" -maxdepth 1 -type f | wc -l)
+      (( total > 0 )) && p=$(( moved * 100 / total )) || p=0
+      printf '\r\033[K  moving frames to their folder: %d/%d (%d%%)' "$moved" "$total" "$p"
+      sleep 1
+    done
+    printf '\r\033[K'
+  fi
+  wait "$pid"; rc=$?
+  moved=$(find "$dst" -maxdepth 1 -type f | wc -l)
+  if (( rc == 0 && moved == total )); then rm -rf -- "$src"; return 0; fi
+  return 1
+}
+
+extract_frames() {   # $1 video  $2 start  $3 end ("" = to the end, +N = N s after start)  $4 confirm 1|0  $5 parent folder
+  local src s_in=$2 e_in=$3 confirm=${4:-1} parent=${5:-}
+  local start end len fps est digits base fname out work stage="" n rc t0=$SECONDS d first
+  local smp mid est_b=0 need free_d free_s c what fname_x
+  local -a iopt=()
+  src=$(readlink -f -- "$1")
+  detect_ff_caps
+  probe "$src" || return 1
+  [[ -z $VC_NOSTAGE ]] && stage_root
+
+  # ---- times
+  if [[ -z $s_in ]]; then start=0
+  elif ! start=$(to_sec "$s_in"); then err "Bad start time: $s_in  (use 90, 1:30 or 0:01:30.5)"; return 1; fi
+  if [[ -z $e_in || ${e_in,,} == end ]]; then end=$DUR
+  elif [[ $e_in == +* ]]; then
+    d=$(to_sec "${e_in#+}") || { err "Bad end time: $e_in"; return 1; }
+    end=$(awk -v a="$start" -v b="$d" 'BEGIN{ printf "%.3f", a + b }')
+  else
+    end=$(to_sec "$e_in") || { err "Bad end time: $e_in  (use 90, 1:30 or 0:01:30.5)"; return 1; }
+  fi
+  if ! awk -v s="$start" -v d="$DUR" 'BEGIN{ exit !(s < d) }'; then
+    err "Start ($start s) is beyond the end of the video ($DUR s)."; return 1
+  fi
+  if awk -v e="$end" -v d="$DUR" 'BEGIN{ exit !(e > d) }'; then
+    warn "End is after the video's end - using the end of the video."; end=$DUR
+  fi
+  len=$(awk -v a="$start" -v b="$end" 'BEGIN{ printf "%.3f", b - a }')
+  if ! awk -v l="$len" 'BEGIN{ exit !(l > 0) }'; then err "End must be after start."; return 1; fi
+  fps=$SRC_AFPS; awk -v f="$fps" 'BEGIN{ exit !(f + 0 > 0) }' || fps=$SRC_FPS
+
+  base=$(basename -- "$src"); base=${base%.*}
+  fmt_tag "$start"; fname="${base}_frames_${FMT_TAG}"
+  fmt_tag "$end";   fname+="_to_${FMT_TAG}"
+  [[ -n $parent ]] || parent=${OUTDIR:-$(dirname -- "$src")}
+  mkdir -p -- "$parent" 2>/dev/null || { err "Cannot create/use folder: $parent"; return 1; }
+
+  while true; do
+    frames_prepare
+    case $FRAME_STEP in 0) what="keyframes only";; 1) what="every frame";; *) what="one frame in every ${FRAME_STEP}";; esac
+    if (( FRAME_STEP == 0 )); then
+      est=$(awk -v l="$len" 'BEGIN{ n = int(l / 2 + 0.5); if (n < 1) n = 1; print n }')      # ~1 keyframe / 2 s
+    else
+      est=$(awk -v l="$len" -v f="$fps" -v k="$FRAME_STEP" 'BEGIN{ n = int(l * f / k + 0.5); if (n < 1) n = 1; print n }')
+    fi
+    digits=$(( ${#est} + 1 )); (( digits < 5 )) && digits=5
+    case $FRAME_STEP in 1) fname_x="";; 0) fname_x="_keyframes";; *) fname_x="_every${FRAME_STEP}";; esac
+    out=$(unique_dir "$parent" "${fname}${fname_x}")
+
+    # ---- size estimate from ONE real sample frame (same format, size and quality)
+    mid=$(awk -v a="$start" -v l="$len" 'BEGIN{ printf "%.3f", a + l / 2 }')
+    smp="${STAGE_ROOT:-${TMPDIR:-/tmp}}/vcsample_$$_$RANDOM.$FR_EXT"
+    mkdir -p "$CONF_DIR" 2>/dev/null; : > "$LOG"
+    if ffmpeg -nostdin -hide_banner -loglevel error -y -ss "$mid" -i "$src" -map 0:v:0 -an -sn -dn \
+         "${FR_VF[@]}" "${FR_ARGS[@]}" -frames:v 1 -update 1 "$smp" 2>>"$LOG" && [[ -s $smp ]]; then
+      est_b=$(( $(fsize "$smp") * est ))
+    else
+      rm -f -- "$smp"; err "Cannot decode this video's picture. Last log lines:"; tail -n 4 "$LOG" >&2; return 1
+    fi
+    rm -f -- "$smp"
+    need=$(( est_b + est_b / 10 + 4194304 ))
+    free_d=$(free_bytes "$parent")
+
+    printf '\n%s== Frame extractor ==%s\n' "$C_B" "$C_0"
+    printf '  Video   : %s\n' "$(trunc "$(basename -- "$src")")"
+    printf '  Range   : %s -> %s   (%s s)\n' "$(fmt_tc "$start")" "$(fmt_tc "$end")" "$len"
+    printf '  Frames  : %s, about %s  (%s fps)\n' "$what" "$est" "$fps"
+    printf '  Format  : %s, %s\n' "$(frame_fmt_label)" "$(frame_h_label)"
+    printf '  Size    : about %s   (free space here: %s)\n' "$(human "$est_b")" "$(human "$free_d")"
+    printf '  Folder  : %s\n' "$(pretty "$out")"
+    if (( free_d > 0 && need > free_d )); then
+      err "Not enough free space for these frames (need ~$(human "$need"))."
+      (( confirm )) || return 1
+    fi
+    (( confirm )) || break
+    printf '  y) start    o) options    l) change location    b) cancel\n'
+    read -r -p "> " c || return 1
+    case ${c,,} in
+      y|"") break;;
+      o) frames_options;;
+      l) parent=$(ask "Create the folder inside" "$parent"); parent=${parent/#\~/$HOME}
+         mkdir -p -- "$parent" 2>/dev/null || { warn "Cannot use that folder."; parent=${OUTDIR:-$(dirname -- "$src")}; };;
+      b) return 1;;
+    esac
+  done
+
+  # ---- build locally when there is room, otherwise write straight into place
+  if [[ -n $STAGE_ROOT ]] && free_s=$(stage_free) && (( free_s > need + 104857600 )); then
+    stage=$(mktemp -d "$STAGE_ROOT/frames.XXXXXX") || stage=""
+  fi
+  if [[ -n $stage ]]; then work=$stage; else mkdir -- "$out" || { err "Cannot create $out"; return 1; }; work=$out; fi
+  CUR_TMPDIR=$work
+
+  (( FRAME_STEP == 0 )) && iopt=(-skip_frame nokey)
+  EDUR=$len
+  run_ffmpeg "frames" 1 1 "${iopt[@]}" -ss "$start" -i "$src" -t "$len" -map 0:v:0 -an -sn -dn \
+    "${FR_VF[@]}" "${FPSMODE_OPT[@]}" "${ENCTB_OPT[@]}" "${FR_ARGS[@]}" -start_number 1 "$work/frame_%0${digits}d.$FR_EXT"
+  rc=$?
+  n=$(find "$work" -maxdepth 1 -type f -name "frame_*.$FR_EXT" | wc -l)
+  if (( rc != 0 || n == 0 )); then
+    if (( rc == 255 )); then warn "Cancelled - nothing was saved."
+    elif (( rc != 0 )); then err "Frame extraction failed (ffmpeg exit $rc). Last log lines:"; tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    else err "No frames found between those two times."; fi
+    rm -rf -- "$work"; CUR_TMPDIR=""
+    return 1
+  fi
+  if [[ -n $stage ]]; then
+    if ! move_dir "$stage" "$out"; then
+      err "Could not move the frames into $(pretty "$out") (destination full / not writable?)."
+      CUR_TMPDIR=""; return 1
+    fi
+  fi
+  CUR_TMPDIR=""
+  printf -v first "frame_%0${digits}d.%s" 1 "$FR_EXT"
+  ok "$n frames -> $(pretty "$out")"
+  info "  $(human "$(du -sk -- "$out" 2>/dev/null | awk '{printf "%d", $1 * 1024}')") in $(fmt_time $(( SECONDS - t0 )))  |  first: $first"
+  FRAMES_OUT=$out
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 60 termux-media-scan -r "$out" >/dev/null 2>&1 & }
+  if (( confirm )) && [[ -t 0 ]]; then yesno "Open the first frame?" n && open_file "$out/$first"; fi
+  return 0
+}
+
+frames_flow() {   # $1 optional video - interactive front end
+  local src=${1:-} s e
+  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
+  probe "$src" || return 1
+  printf '\n%s== Frame extractor ==%s\n' "$C_B" "$C_0"
+  printf '  %s\n  length %s (%s s)  |  %s fps  |  %sx%s\n\n' "$(trunc "$(basename -- "$src")")" \
+    "$(fmt_time "$DUR")" "$DUR" "$SRC_AFPS" "$SRC_W" "$SRC_H"
+  info "Times: 90 | 1:30 | 0:01:30.5      End: blank = to the end,  +5 = 5 s after start"
+  s=$(ask "Start" "0")
+  e=$(ask "End  " "")
+  extract_frames "$src" "$s" "$e" 1
+}
+
+# ======================================================== PRESET RACE (v2.3)
+# Encodes the same short sample with every preset and prints the real speed,
+# estimated size and estimated time on THIS device - so you pick the right
+# preset from facts, not guesses.
+now_us() { if [[ -n ${EPOCHREALTIME-} ]]; then NOW_US=${EPOCHREALTIME/[.,]/}; else NOW_US=$(( SECONDS * 1000000 )); fi; }
+preset_race() {   # $1 optional video
+  local src=${1:-} p full slen sstart snap tmp br vf sz t0 t1 el rc i bi=-1 bs=-1 sec
+  local slen_us full_us est_sz est_t spd
+  local -a names=() spds=() szs=() tms=()
+  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
+  probe "$src" || return 1
+  full=$DUR
+  slen=$(awk -v d="$full" 'BEGIN{ printf "%.3f", (d > 10) ? 8 : d }')
+  sstart=$(awk -v d="$full" -v l="$slen" 'BEGIN{ s = (d - l) / 2; if (s < 0) s = 0; printf "%.3f", s }')
+  secs_us "$slen"; slen_us=$SECS_US; (( slen_us < 1 )) && slen_us=1
+  secs_us "$full"; full_us=$SECS_US
+  detect_ff_caps
+  snap=$(mktemp) || return 1; write_settings "$snap"
+  TMPD=$(mktemp -d) || { rm -f "$snap"; return 1; }
+  mkdir -p "$CONF_DIR"; : > "$LOG"
+  printf '\n%s== Preset race ==%s\n' "$C_B" "$C_0"
+  info "${slen}s sample of $(trunc "$(basename -- "$src")") - measured on THIS device"
+  printf '  %s%-9s %8s  %10s  %9s%s\n' "$C_D" "preset" "speed" "est. size" "est. time" "$C_0"
+  for p in turbo fast balanced quality small tiny social compat av1 hardware; do
+    apply_preset "$p" || continue
+    TARGET_MB=0
+    case $CODEC in
+      hw*) have_enc "$(hw_encoder_name)" || continue;;
+      av1) have_enc libsvtav1 || continue;;
+    esac
+    br=""; [[ $CODEC == hw* ]] && br=$VBR
+    EDUR=$slen
+    vf=$(build_vf); VFARG=(); [[ -n $vf ]] && VFARG=(-vf "$vf")
+    build_aenc; build_venc single "$br"
+    tmp="$TMPD/race_$p.mp4"; rm -f -- "$tmp"
+    printf '  %-9s %srunning...%s' "$p" "$C_D" "$C_0"
+    now_us; t0=$NOW_US
+    ( cd "$TMPD" && SIMPLE=1 LOGF="$LOG" run_ffmpeg "" 1 1 -ss "$sstart" -t "$slen" -i "$src" \
+        -map 0:v:0 -map '0:a?' "${VFARG[@]}" "${VENC[@]}" "${AENC[@]}" -f mp4 "$tmp" )
+    rc=$?
+    now_us; t1=$NOW_US
+    el=$(( t1 - t0 )); (( el < 1 )) && el=1
+    printf '\r\033[K'
+    if (( rc == 0 )) && [[ -s $tmp ]]; then
+      sz=$(fsize "$tmp")
+      spd=$(( slen_us * 100 / el ))
+      est_sz=$(( sz * full_us / slen_us ))
+      est_t=$(( full_us * el / slen_us / 1000000 ))
+      names+=("$p"); spds+=("$spd"); szs+=("$est_sz"); tms+=("$est_t")
+      printf '  %-9s %5d.%02dx  %10s  %9s\n' "$p" $(( spd / 100 )) $(( spd % 100 )) "$(human "$est_sz")" "$(fmt_time "$est_t")"
+    else
+      printf '  %-9s %sfailed (see log)%s\n' "$p" "$C_R" "$C_0"
+    fi
+    rm -f -- "$tmp"
+  done
+  rm -rf -- "$TMPD"; TMPD=""
+  load_conf "$snap"; rm -f -- "$snap"
+  if (( ${#names[@]} )); then
+    for i in "${!names[@]}"; do
+      (( bi < 0 || spds[i] > spds[bi] )) && bi=$i
+      (( bs < 0 || szs[i] < szs[bs] )) && bs=$i
+    done
+    printf '\n  %sFastest :%s %s (%d.%02dx real time)\n' "$C_G" "$C_0" "${names[bi]}" $(( spds[bi] / 100 )) $(( spds[bi] % 100 ))
+    printf '  %sSmallest:%s %s (~%s)\n' "$C_G" "$C_0" "${names[bs]}" "$(human "${szs[bs]}")"
+    info "  Estimates are rough (+/-20%). Use one:  vc -y -p <preset> FILE"
+  else
+    err "No preset could be encoded - see the log: $(pretty "$LOG")"; return 1
+  fi
+  return 0
+}
 show_info() {
   (( ${#SELECTED[@]} )) || { warn "No videos selected."; return; }
   local f kb
@@ -2129,7 +2651,7 @@ show_info() {
     printf '  Size      : %s   Duration: %s   Avg: %s kbps\n' "$(human "$(fsize "$f")")" "$(fmt_time "$DUR")" "$kb"
     printf '  Video     : %s %sx%s @ %s fps%s\n' "$SRC_VCODEC" "$SRC_W" "$SRC_H" "$SRC_FPS" "${SRC_VBR:+, ${SRC_VBR} kbps}"
     printf '  Audio     : %s%s\n' "${SRC_ACODEC:-none}" "${SRC_ABR:+, ${SRC_ABR} kbps}"
-    printf '  Subtitles : %s track(s)\n' "$(count_subs "$f")"
+    printf '  Subtitles : %s track(s)\n' "$SRC_NSUBS"
   done
 }
 check_deps() {
@@ -2348,6 +2870,9 @@ settings_menu() {
     printf ' 18) Subtitle style   %s  (burn-in)\n' "$(sub_style_label)"
     printf ' 19) Subtitle lang    %s\n'  "$SUB_LANG"
     printf ' 20) After finishing  %s\n'  "$(finish_label)"
+    printf ' 21) Resume mode      %s  (skip files that already have a finished output)\n' "$(yn_label "$SKIP_DONE")"
+    printf ' 22) Frame extractor  %s, %s, %s\n' "$(frame_fmt_label)" "$(frame_step_label)" "$(frame_h_label)"
+    printf ' 23) Downscaler       %s\n' "$( [[ $SCALER == lanczos ]] && echo "Lanczos (sharper, files ~5% bigger)" || echo "bicubic (default)" )"
     printf '\n  s) save as default     b) back\n'
     read -r -p "Edit: " c || exit 0
     case $c in
@@ -2365,6 +2890,9 @@ settings_menu() {
       18) set_substyle;;
       19) set_sublang;;
       20) set_finish;;
+      21) SKIP_DONE=$(( 1 - SKIP_DONE ));;
+      22) frames_options;;
+      23) if [[ $SCALER == lanczos ]]; then SCALER=bicubic; else SCALER=lanczos; fi; PRESET_NAME=custom;;
       s|S) save_settings; ok "Saved as default."; sleep 1;;
       b|B|"") return;;
     esac
@@ -2428,6 +2956,8 @@ tools_menu() {
     echo " 8) Setup (install ffmpeg, storage access)"
     echo " 9) Install 'vc' command"
     echo "10) Show last log"
+    echo "11) Extract frames (time range -> new folder)"
+    echo "12) Preset race (fastest / smallest on this phone)"
     echo " b) back"
     read -r -p "> " c || exit 0
     case $c in
@@ -2441,6 +2971,8 @@ tools_menu() {
       8) do_setup; pause;;
       9) do_install; pause;;
       10) if [[ -s $LOG ]]; then tail -n 40 "$LOG"; else echo "(log is empty)"; fi; pause;;
+      11) frames_flow; pause;;
+      12) preset_race; pause;;
       b|B|"") return;;
     esac
   done
@@ -2448,8 +2980,8 @@ tools_menu() {
 
 # ------------------------------------------------------------- main menu ----
 print_plan() {
-  local tot=0 f
-  for f in "${SELECTED[@]}"; do tot=$(( tot + $(fsize "$f") )); done
+  local tot
+  sum_sizes; tot=$SEL_BYTES
   printf '\n%s== Plan ==%s\n' "$C_B" "$C_0"
   printf '  Files      : %d (%s)\n' "${#SELECTED[@]}" "$(human "$tot")"
   printf '  Codec      : %s\n' "$(codec_label)"
@@ -2476,10 +3008,10 @@ main_menu() {
   local c n tot f
   while true; do
     clear_screen
-    n=${#SELECTED[@]}; tot=0
-    for f in "${SELECTED[@]}"; do tot=$(( tot + $(fsize "$f") )); done
+    n=${#SELECTED[@]}
+    sum_sizes; tot=$SEL_BYTES
     printf '%sVidCompress v%s%s  -  by %s\n' "$C_B" "$VERSION" "$C_0" "$CREATOR"
-    printf '%s%s%s\n' "$C_D" "$WEBSITE" "$C_0"
+    printf '%s%s  |  %s cores  |  ffmpeg %s%s\n' "$C_D" "$WEBSITE" "${NCPU:-?}" "${FF_VER:-?}" "$C_0"
     printf '%s------------------------------------------%s\n' "$C_D" "$C_0"
     printf ' Selected : %d file(s), %s\n' "$n" "$(human "$tot")"
     printf ' Preset   : %s\n' "$PRESET_NAME"
@@ -2493,6 +3025,7 @@ main_menu() {
     echo " 7) Repair & sync (fix A/V drift for TVs)"
     echo " 8) Tools (info, estimate, GIF, audio, thumbs)"
     echo " 9) START compression"
+    echo " f) Extract frames (time range -> new folder)"
     echo " r) Results & compare (last batch)"
     echo " c) Clear selection"
     echo " 0) Quit"
@@ -2507,6 +3040,7 @@ main_menu() {
       7) repair_menu;;
       8) tools_menu;;
       9) start_flow;;
+      f|F) frames_flow; pause;;
       r|R) results_menu;;
       c|C) SELECTED=();;
       0|q|Q) exit 0;;
@@ -2552,6 +3086,21 @@ Subtitle options:
   --mkv            output as .mkv instead of .mp4
   (FILE='auto' finds a .srt with the same name next to the video)
 
+Frame extractor (every frame between two times -> a NEW folder):
+  --frames FILE          with -S START -E END (end: 1:40 | 100 | +10 = 10 s after start)
+                         range = [start, end): start frame in, end frame out
+  --frame-format FMT     jpg (default) | png | bmp | webp
+  --frame-quality N      jpg/webp quality 1-31 (1 = best, default 2)
+  --frame-step N|key     every Nth frame, or "key" = keyframes only (very fast)
+  --frame-height PX      scale pictures to at most PX high (default: original)
+  -o DIR                 create the frames folder inside DIR (default: next to video)
+  (no -S/-E in a terminal: an interactive question-and-answer flow starts)
+
+Speed tools:
+  --race FILE            encode a sample with every preset: real speed, size, time
+  --resume               skip files whose finished output already exists
+  --lanczos              sharper downscaling (files ~5% bigger); --bicubic = default
+
 Repair & sync options:
   --repair FILE...       fix A/V drift and make the file play on any TV/USB
                          player. Smart tiers: remux-only / audio-only /
@@ -2585,6 +3134,11 @@ Examples:
   vc --repair --oldtv movie.mkv               # ancient TV / USB stick mode
   vc --repair -j 4 *.mp4                      # repair 4 files at once
   vc --sync-shift -250 movie.mp4              # audio was 250 ms late
+  vc --frames movie.mp4 -S 1:30 -E 1:40       # all frames 1:30 -> 1:40, new folder
+  vc --frames movie.mp4 -S 90 -E +5 --frame-format png
+  vc --frames movie.mp4 -S 0 -E 60 --frame-step key --frame-height 480
+  vc --race movie.mp4                         # which preset suits this phone?
+  vc movie.mp4 -p turbo -y                    # options may follow the file
 EOF
 }
 
@@ -2606,11 +3160,13 @@ cleanup() {
 on_int() {
   printf '\n'; warn "Interrupted - cleaning up."
   [[ -n $CUR_TMP ]] && rm -f -- "$CUR_TMP"
+  [[ -n $CUR_TMPDIR && -d $CUR_TMPDIR ]] && rm -rf -- "$CUR_TMPDIR"
   exit 130
 }
 
 main() {
-  local STUDIO=0
+  local STUDIO=0 FRAMES_MODE=0 RACE_MODE=0
+  refresh_cols; trap refresh_cols WINCH
   case ${1:-} in
     --setup)   do_setup; exit;;
     --install) do_install; exit;;
@@ -2630,6 +3186,12 @@ main() {
   [[ $PARALLEL_JOBS =~ ^[1-8]$ ]] || PARALLEL_JOBS=1
   [[ $SUB_SIZE =~ ^[0-9]+$ ]] || SUB_SIZE=24
   [[ -n $SUB_LANG ]] || SUB_LANG=fa
+  [[ $SKIP_DONE =~ ^[01]$ ]] || SKIP_DONE=0
+  case $FRAME_FMT in jpg|png|bmp|webp) ;; *) FRAME_FMT=jpg;; esac
+  [[ $FRAME_Q =~ ^[0-9]+$ ]] && (( FRAME_Q >= 1 && FRAME_Q <= 31 )) || FRAME_Q=2
+  [[ $FRAME_STEP =~ ^[0-9]+$ ]] || FRAME_STEP=1
+  [[ $FRAME_H =~ ^[0-9]+$ ]] || FRAME_H=0
+  [[ $SCALER == lanczos ]] || SCALER=bicubic
 
   # --- long options (override config)
   local newargs=() a
@@ -2654,6 +3216,18 @@ main() {
         if (( $# >= 2 )); then REPAIR_PRESET=$2; shift 2; else err "--repair-preset needs a value"; exit 1; fi;;
       --oldtv)    REPAIR_OLDTV=1; shift;;
       --stereo)   REPAIR_STEREO=1; shift;;
+      --frames)   FRAMES_MODE=1; shift;;
+      --race)     RACE_MODE=1; shift;;
+      --resume)   SKIP_DONE=1; shift;;
+      --lanczos)  SCALER=lanczos; shift;;
+      --bicubic)  SCALER=bicubic; shift;;
+      --frame-format)  if (( $# >= 2 )); then FRAME_FMT=${2,,}; shift 2; else err "--frame-format needs jpg|png|bmp|webp"; exit 1; fi;;
+      --frame-quality) if (( $# >= 2 )); then FRAME_Q=$2; shift 2; else err "--frame-quality needs 1-31"; exit 1; fi;;
+      --frame-height)  if (( $# >= 2 )); then FRAME_H=$2; shift 2; else err "--frame-height needs a number"; exit 1; fi;;
+      --frame-step)    if (( $# >= 2 )); then
+                         case ${2,,} in key|keys|keyframes|i) FRAME_STEP=0;; *) FRAME_STEP=$2;; esac
+                         shift 2
+                       else err "--frame-step needs N or 'key'"; exit 1; fi;;
       *) newargs+=("$1"); shift;;
     esac
   done
@@ -2668,18 +3242,44 @@ main() {
     ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow) ;;
     *) err "Bad --repair-preset value."; exit 1;;
   esac
+  case $FRAME_FMT in jpg|jpeg|png|bmp|webp) [[ $FRAME_FMT == jpeg ]] && FRAME_FMT=jpg;; *) err "Bad --frame-format (jpg | png | bmp | webp)."; exit 1;; esac
+  [[ $FRAME_Q =~ ^[0-9]+$ ]] && (( FRAME_Q >= 1 && FRAME_Q <= 31 )) || { err "--frame-quality must be 1-31."; exit 1; }
+  [[ $FRAME_STEP =~ ^[0-9]+$ ]] || { err "--frame-step must be a number or 'key'."; exit 1; }
+  [[ $FRAME_H =~ ^[0-9]+$ ]] || { err "--frame-height must be a number."; exit 1; }
 
   local OPT PRESET_ARG="" OV_T="" OV_C="" OV_R="" OV_F="" OV_S="" OV_K="" OV_A="" OV_O="" OV_J="" OV_TS="" OV_TE="" OV_D=0 AUTO=0
-  while getopts "p:t:c:r:f:s:k:a:S:E:o:j:dyh" OPT; do
-    case $OPT in
-      p) PRESET_ARG=$OPTARG;; t) OV_T=$OPTARG;; c) OV_C=$OPTARG;; r) OV_R=$OPTARG;;
-      f) OV_F=$OPTARG;; s) OV_S=$OPTARG;; k) OV_K=$OPTARG;; a) OV_A=$OPTARG;;
-      S) OV_TS=$OPTARG;; E) OV_TE=$OPTARG;; o) OV_O=$OPTARG;; j) OV_J=$OPTARG;;
-      d) OV_D=1;; y) AUTO=1;;
-      h) usage; exit 0;; *) usage; exit 1;;
+  # short options may come before OR after the files:  vc movie.mp4 -p turbo -y
+  local rest=() ch ov i
+  while (( $# )); do
+    a=$1; shift
+    case $a in
+      --) rest+=("$@"); break;;
+      -[!-]*)
+        i=1
+        while (( i < ${#a} )); do
+          ch=${a:i:1}
+          case $ch in
+            p|t|c|r|f|s|k|a|S|E|o|j)
+              if (( i + 1 < ${#a} )); then ov=${a:i+1}
+              elif (( $# )); then ov=$1; shift
+              else err "Option -$ch needs a value."; exit 1; fi
+              case $ch in
+                p) PRESET_ARG=$ov;; t) OV_T=$ov;; c) OV_C=$ov;; r) OV_R=$ov;;
+                f) OV_F=$ov;; s) OV_S=$ov;; k) OV_K=$ov;; a) OV_A=$ov;;
+                S) OV_TS=$ov;; E) OV_TE=$ov;; o) OV_O=$ov;; j) OV_J=$ov;;
+              esac
+              break;;
+            d) OV_D=1;;
+            y) AUTO=1;;
+            h) usage; exit 0;;
+            *) err "Unknown option: -$ch"; usage; exit 1;;
+          esac
+          i=$(( i + 1 ))
+        done;;
+      *) rest+=("$a");;
     esac
   done
-  shift $(( OPTIND - 1 ))
+  set -- "${rest[@]}"
 
   if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
     err "ffmpeg/ffprobe not found."
@@ -2687,6 +3287,8 @@ main() {
     command -v ffmpeg >/dev/null 2>&1 || exit 1
   fi
 
+  detect_ff_caps
+  NCPU=$(nproc 2>/dev/null || echo 4)
   if [[ -n $PRESET_ARG ]]; then apply_preset "$PRESET_ARG" || { err "Unknown preset: $PRESET_ARG"; exit 1; }; fi
   [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
   [[ -n $OV_C ]] && { CRF=$OV_C; TARGET_MB=0; PRESET_NAME=custom; }
@@ -2701,24 +3303,48 @@ main() {
   fi
   [[ -n $OV_O ]] && OUTDIR=${OV_O/#\~/$HOME}
   if [[ -n $OV_TS ]]; then TRIM_START=$(to_sec "$OV_TS") || { err "Bad -S time"; exit 1; }; fi
-  if [[ -n $OV_TE ]]; then TRIM_END=$(to_sec "$OV_TE")   || { err "Bad -E time"; exit 1; }; fi
+  if [[ -n $OV_TE ]]; then
+    if [[ $OV_TE == +* ]]; then      # +N = N seconds after the start
+      ov=$(to_sec "${OV_TE#+}") || { err "Bad -E time"; exit 1; }
+      TRIM_END=$(awk -v a="${TRIM_START:-0}" -v b="$ov" 'BEGIN{ printf "%.3f", a + b }')
+    else TRIM_END=$(to_sec "$OV_TE") || { err "Bad -E time"; exit 1; }; fi
+  fi
   (( OV_D )) && DELETE_ORIG=1
   for OPT in CRF TARGET_MB HEIGHT FPS ABR PARALLEL_JOBS; do
     [[ ${!OPT} =~ ^[0-9]+$ ]] || { err "Invalid numeric value for $OPT: ${!OPT}"; exit 1; }
   done
   (( PARALLEL_JOBS >= 1 && PARALLEL_JOBS <= 8 )) || { err "-j must be 1-8"; exit 1; }
 
-  local f
+  local f skipped_out=0
   for a in "$@"; do
     if [[ -d $a ]]; then
-      while IFS= read -r f; do add_sel "$f"; done < <(list_videos "$a")
+      while IFS= read -r f; do
+        if (( FRAMES_MODE || RACE_MODE )) || ! is_vc_output "$f"; then add_sel "$f"; else skipped_out=$(( skipped_out + 1 )); fi
+      done < <(list_videos "$a")
     elif [[ -f $a ]]; then add_sel "$a"
     else err "Not found: $a"; fi
   done
+  (( skipped_out )) && info "Skipped $skipped_out file(s) that look like earlier vc outputs (add them by name to include them)."
 
   trap on_int INT TERM
   trap cleanup EXIT
 
+  if (( RACE_MODE )); then
+    if (( ${#SELECTED[@]} )); then preset_race "${SELECTED[0]}"; exit $?
+    elif [[ -t 0 ]]; then preset_race; exit $?
+    else err "Usage: vc --race FILE"; exit 1; fi
+  fi
+  if (( FRAMES_MODE )); then
+    if (( ${#SELECTED[@]} == 0 )); then
+      [[ -t 0 ]] || { err "Usage: vc --frames FILE -S START -E END"; exit 1; }
+      frames_flow; exit $?
+    fi
+    (( ${#SELECTED[@]} == 1 )) || { err "--frames works on exactly one video."; exit 1; }
+    if [[ -z $TRIM_START && -z $TRIM_END ]] && [[ -t 0 ]]; then frames_flow "${SELECTED[0]}"; exit $?; fi
+    NONINTERACTIVE=1
+    extract_frames "${SELECTED[0]}" "$TRIM_START" "$TRIM_END" 0 "$OUTDIR"
+    exit $?
+  fi
   if [[ -n $REPAIR_ACTION ]]; then
     local rf
     case $REPAIR_ACTION in
