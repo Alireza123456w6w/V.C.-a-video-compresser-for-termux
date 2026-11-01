@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.3 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v2.4 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -11,9 +11,23 @@
 #     vc --sub                # subtitle studio (SRT add/extract/remove)
 #     vc --repair movie.mp4   # fix A/V sync drift (TV & USB player ready)
 #     vc --frames movie.mp4 -S 1:30 -E 1:40   # EVERY frame 1:30 -> 1:40 into a new folder
-#     vc --race movie.mp4     # which preset is fastest / smallest on THIS phone?
+#     vc --race movie.mp4     # which preset is fastest / smallest / best quality on THIS phone?
+#     vc --race-all movie.mp4 # + CPU-core test + heat test (does speed drop while it runs?)
+#     vc --cpu                # CPU layout (big/little cores), pinning, sensors
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 2.4:
+#   + BIG-CORE PINNING: on phones with big + little cores (e.g. 4 fast + 4 slow)
+#     vc finds the fast cores and runs ffmpeg only on them, with the encoder
+#     thread count matched to those cores, so slow cores no longer hold the
+#     encode back. Default "auto"; change with --cores all|auto|4-7 or Settings 24.
+#   + SPEED LAB (vc --race-all, Tools 12): preset race now also scores quality
+#     (SSIM); a CPU test compares all cores / fewer threads / big cores only;
+#     a HEAT TEST repeats the same encode and shows speed, temperature and CPU
+#     clock per round so you can SEE thermal throttling. It can save the best
+#     CPU setup as your default.
+#   + --threads N / Settings 25: fixed encoder thread budget.
 #
 #  What's new in 2.3:
 #   + FRAME EXTRACTOR: choose a start and an end time, vc creates a new folder
@@ -80,7 +94,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.3"
+VERSION="2.4"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -88,7 +102,7 @@ CONF="$CONF_DIR/settings.conf"
 PROF_DIR="$CONF_DIR/profiles"
 LOG="$CONF_DIR/last_run.log"
 VIDEO_EXT='mp4|mkv|mov|avi|webm|3gp|m4v|flv|ts|mpg|mpeg|wmv|mts|m2ts'
-SETTING_VARS="CODEC CRF VBR SPEED HEIGHT FPS ABR AUDIO TARGET_MB DENOISE STRIP_META OUTDIR SUFFIX PRESET_NAME PARALLEL_JOBS KEEP_SUBS SUB_MODE SUB_FILE SUB_LANG SUB_SIZE SUB_COLOR OUT_EXT FINISH_ACTION SKIP_DONE FRAME_FMT FRAME_Q FRAME_STEP FRAME_H SCALER"
+SETTING_VARS="CODEC CRF VBR SPEED HEIGHT FPS ABR AUDIO TARGET_MB DENOISE STRIP_META OUTDIR SUFFIX PRESET_NAME PARALLEL_JOBS KEEP_SUBS SUB_MODE SUB_FILE SUB_LANG SUB_SIZE SUB_COLOR OUT_EXT FINISH_ACTION SKIP_DONE FRAME_FMT FRAME_Q FRAME_STEP FRAME_H SCALER CORES THREADS"
 PRESET_LIST="balanced quality small tiny social compat fast turbo target hardware av1"
 
 # ------------------------------------------------------------------ colors ---
@@ -140,6 +154,15 @@ STATS_OPT=(); FPSMODE_OPT=(-vsync 0); ENCTB_OPT=(); FF_VER=""; FF_CAPS_DONE=0
 AUD_COPY=0; BATCH_T0=0; CUR_TMPDIR=""; SEL_BYTES=0; FSZ=0; RATIO=0; SECS_US=0; FMT_TAG=""
 SRC_AFPS=0; SRC_PIX=""; SRC_TRC=""; SRC_ACH=0; SRC_NSUBS=0; SRC_SUBBAD=0
 FR_ARGS=(); FR_VF=(); FR_EXT=jpg
+# --- CPU layout / pinning / sensors (v2.4). VC_* paths can be overridden for tests.
+VC_SYSFS=${VC_SYSFS:-/sys/devices/system/cpu}
+VC_CPUINFO=${VC_CPUINFO:-/proc/cpuinfo}
+VC_THERMAL=${VC_THERMAL:-/sys/class/thermal}
+CPU_DONE=0; CPU_N=0; CPU_HETERO=0; CPU_TOPO=""; CPU_SRC="none"; BIG_LIST=""; BIG_MASK=""; BIG_N=0
+ORIG_MASK=""; PIN_MASK=""; PIN_N=0; PIN_LIST=""; PIN_NOTE=""; TASKSET=""; MASK_HEX=""; MASK_N=0
+TEMP_C=""; TEMP_NOTE=""; FREQ_FILE=""; FREQ_PID=""; FREQ_CPUS=""; FREQ_AVG=""; FREQ_MIN=""
+NOQUALITY=0; SSIM_VAL=""; NOW_US=0; CPU_MODE=0
+declare -a CPU_CAP=() CPU_FREQ=() CPU_PART=() CPU_BIGIDX=()
 
 # --------------------------------------------------------- small utilities ---
 fsize()     { stat -c %s -- "$1" 2>/dev/null || echo 0; }
@@ -229,6 +252,284 @@ yesno() {     # prompt default(y|n)
   local a; a=$(ask "$1 (y/n)" "${2:-y}")
   [[ ${a,,} == y* ]]
 }
+
+# ============================================ CPU LAYOUT & PINNING (v2.4)
+# Phones mix fast and slow cores. The encoder splits its work evenly, so one slow
+# core can hold every other thread back. vc finds the fast cores and (when Android
+# allows it) restricts ffmpeg to them. Everything is best-effort: if a sysfs file
+# or taskset is not available, vc simply runs on all cores like before.
+idx_ranges() {   # sorted indexes -> "0-3,5"
+  local out="" start="" prev="" cur
+  for cur in "$@"; do
+    if [[ -z $start ]]; then start=$cur; prev=$cur; continue; fi
+    if (( cur == prev + 1 )); then prev=$cur; continue; fi
+    if (( start == prev )); then out+="${out:+,}$start"; else out+="${out:+,}$start-$prev"; fi
+    start=$cur; prev=$cur
+  done
+  if [[ -n $start ]]; then if (( start == prev )); then out+="${out:+,}$start"; else out+="${out:+,}$start-$prev"; fi; fi
+  printf '%s' "$out"
+}
+mask_of_list() {   # "4-7,2" -> MASK_HEX / MASK_N
+  local part a b i m=0 n=0
+  local -a parts
+  IFS=',' read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+    elif [[ $part =~ ^[0-9]+$ ]]; then a=$part; b=$part
+    else return 1; fi
+    (( a <= b && b < 62 )) || return 1
+    for (( i = a; i <= b; i++ )); do
+      if (( ! (m & (1 << i)) )); then m=$(( m | (1 << i) )); n=$(( n + 1 )); fi
+    done
+  done
+  (( n > 0 )) || return 1
+  printf -v MASK_HEX '%x' "$m"; MASK_N=$n
+}
+find_taskset() {
+  [[ -n $TASKSET ]] && return 0
+  TASKSET=$(command -v taskset 2>/dev/null)
+  [[ -z $TASKSET && -x /system/bin/taskset ]] && TASKSET=/system/bin/taskset
+  [[ -n $TASKSET ]]
+}
+get_affinity() {   # hex mask of THIS shell (children inherit it), "" if unknown
+  local out
+  find_taskset || return 1
+  out=$("$TASKSET" -p $$ 2>/dev/null) || return 1
+  out=${out##*[: ]}; out=${out#0x}
+  [[ $out =~ ^[0-9a-fA-F]+$ ]] || return 1
+  printf '%x' "$(( 16#$out ))"
+}
+set_affinity() {   # hex mask -> 0 = applied and confirmed
+  local want got
+  find_taskset || return 1
+  "$TASKSET" -p "$1" $$ >/dev/null 2>&1 || return 1
+  want=$(( 16#$1 )); got=$(get_affinity) || return 1
+  (( 16#$got == want ))
+}
+
+detect_cpu() {   # CPU_N, CPU_TOPO, CPU_HETERO, BIG_LIST/BIG_MASK/BIG_N, CPU_SRC
+  (( CPU_DONE )) && return 0
+  CPU_DONE=1
+  local d i on cap fq maxi=-1 n=0 mx=0 thr j line cur a b ok_cap=1 ok_fq=1 metric="none" run_a run_b run_m tag
+  local -a seen=() M=() isbig=()
+  CPU_CAP=(); CPU_FREQ=(); CPU_PART=(); CPU_BIGIDX=()
+  BIG_LIST=""; BIG_MASK=""; BIG_N=0; CPU_HETERO=0; CPU_TOPO=""; CPU_SRC="none"
+  for d in "$VC_SYSFS"/cpu[0-9]*; do
+    [[ -d $d ]] || continue
+    i=${d##*/cpu}; [[ $i =~ ^[0-9]+$ ]] || continue
+    on=1; [[ -r $d/online ]] && { read -r on < "$d/online"; } 2>/dev/null
+    [[ $on == 0 ]] && continue
+    cap=""; fq=""
+    [[ -r $d/cpu_capacity ]] && { read -r cap < "$d/cpu_capacity"; } 2>/dev/null
+    [[ -r $d/cpufreq/cpuinfo_max_freq ]] && { read -r fq < "$d/cpufreq/cpuinfo_max_freq"; } 2>/dev/null
+    if [[ -z $fq && -r $d/cpufreq/scaling_max_freq ]]; then { read -r fq < "$d/cpufreq/scaling_max_freq"; } 2>/dev/null; fi
+    [[ $cap =~ ^[0-9]+$ ]] || { cap=""; ok_cap=0; }
+    [[ $fq  =~ ^[0-9]+$ ]] || { fq="";  ok_fq=0; }
+    CPU_CAP[i]=$cap; CPU_FREQ[i]=$fq; seen[i]=1; n=$(( n + 1 )); (( i > maxi )) && maxi=$i
+  done
+  CPU_N=$n
+  if (( n == 0 )); then
+    CPU_N=$(nproc --all 2>/dev/null || nproc 2>/dev/null || echo 0); [[ $CPU_N =~ ^[0-9]+$ ]] || CPU_N=0
+    return 0
+  fi
+  # which number tells fast from slow? capacity (best) > max frequency > CPU part
+  if   (( ok_cap )); then metric=cap;  thr=60; CPU_SRC="cpu_capacity"
+  elif (( ok_fq  )); then metric=freq; thr=80; CPU_SRC="max frequency"
+  fi
+  if [[ $metric != none ]]; then
+    for (( i = 0; i <= maxi; i++ )); do
+      [[ -n ${seen[i]-} ]] || continue
+      if [[ $metric == cap ]]; then M[i]=${CPU_CAP[i]}; else M[i]=${CPU_FREQ[i]}; fi
+      (( M[i] > mx )) && mx=${M[i]}
+    done
+    for (( i = 0; i <= maxi; i++ )); do
+      [[ -n ${seen[i]-} ]] || continue
+      if (( M[i] * 100 >= mx * thr )); then isbig[i]=1; else isbig[i]=0; fi
+    done
+  elif [[ -r $VC_CPUINFO ]]; then
+    cur=""
+    while IFS= read -r line; do
+      case $line in
+        processor*) cur=${line##*: };;
+        "CPU part"*) [[ $cur =~ ^[0-9]+$ ]] && CPU_PART[cur]=${line##*: };;
+      esac
+    done < "$VC_CPUINFO"
+    local littles=0 bigs=0 unk=0 prt
+    for (( i = 0; i <= maxi; i++ )); do
+      [[ -n ${seen[i]-} ]] || continue
+      prt=${CPU_PART[i]-}
+      [[ -n $prt ]] || { unk=1; continue; }
+      case ${prt,,} in
+        0xd01|0xd02|0xd03|0xd04|0xd05|0xd46|0xd80|0xc05|0xc07) isbig[i]=0; littles=$(( littles + 1 ));;
+        *) isbig[i]=1; bigs=$(( bigs + 1 ));;
+      esac
+    done
+    if (( unk )); then return 0; fi
+    CPU_SRC="CPU part"; metric=part
+  else
+    return 0
+  fi
+  for (( i = 0; i <= maxi; i++ )); do
+    [[ -n ${seen[i]-} ]] || continue
+    if [[ ${isbig[i]} == 1 ]]; then CPU_BIGIDX+=("$i"); else CPU_HETERO=1; fi
+  done
+  (( ${#CPU_BIGIDX[@]} == 0 )) && { CPU_HETERO=0; return 0; }
+  BIG_N=${#CPU_BIGIDX[@]}; BIG_LIST=$(idx_ranges "${CPU_BIGIDX[@]}")
+  mask_of_list "$BIG_LIST" && BIG_MASK=$MASK_HEX
+  # topology text: runs of identical cores
+  run_a=""; run_m=""
+  for (( i = 0; i <= maxi + 1; i++ )); do
+    if (( i <= maxi )) && [[ -z ${seen[i]-} ]]; then continue; fi
+    if (( i <= maxi )); then
+      if [[ $metric == cap ]]; then cur="${CPU_CAP[i]}|${CPU_FREQ[i]}"; elif [[ $metric == freq ]]; then cur="${CPU_FREQ[i]}"; else cur="${CPU_PART[i]}"; fi
+    else cur="<end>"; fi
+    if [[ -n $run_a && $cur != "$run_m" ]]; then
+      tag=""
+      if [[ -n ${CPU_FREQ[run_b]} ]]; then local f10=$(( (CPU_FREQ[run_b] + 5000) / 10000 )); printf -v tag '%d.%02d GHz' $(( f10 / 100 )) $(( f10 % 100 ))
+      elif [[ -n ${CPU_CAP[run_b]} ]]; then tag="cap ${CPU_CAP[run_b]}"
+      else tag="part ${CPU_PART[run_b]-?}"; fi
+      if (( CPU_HETERO )); then if [[ ${isbig[run_b]} == 1 ]]; then tag+=" big"; else tag+=" little"; fi; fi
+      if (( run_a == run_b )); then CPU_TOPO+="${CPU_TOPO:+ | }cpu$run_a $tag"; else CPU_TOPO+="${CPU_TOPO:+ | }cpu$run_a-$run_b $tag"; fi
+      run_a=""
+    fi
+    if (( i <= maxi )); then
+      if [[ -z $run_a ]]; then run_a=$i; run_m=$cur; fi
+      run_b=$i
+    fi
+  done
+  return 0
+}
+
+apply_cores() {   # CORES setting -> pin this process (children inherit). Sets PIN_* ; never fatal
+  local list=""
+  PIN_MASK=""; PIN_N=0; PIN_LIST=""; PIN_NOTE=""
+  [[ -z $ORIG_MASK ]] && ORIG_MASK=$(get_affinity 2>/dev/null)
+  case $CORES in
+    all) PIN_NOTE="all cores (CORES=all)"; return 0;;
+    auto)
+      detect_cpu
+      if (( ! CPU_HETERO )) || [[ -z $BIG_LIST ]]; then
+        if (( CPU_N > 0 )) && [[ $CPU_SRC != none ]]; then PIN_NOTE="all cores (all cores are equally fast)"
+        else PIN_NOTE="all cores (could not tell big from little cores)"; fi
+        return 0
+      fi
+      list=$BIG_LIST;;
+    *) list=$CORES;;
+  esac
+  if ! find_taskset; then PIN_NOTE="all cores (taskset not found - pkg install util-linux)"; return 1; fi
+  if ! mask_of_list "$list"; then PIN_NOTE="all cores (bad core list '$list')"; return 1; fi
+  if set_affinity "$MASK_HEX"; then
+    PIN_MASK=$MASK_HEX; PIN_N=$MASK_N; PIN_LIST=$list
+    PIN_NOTE="pinned to cores $list"
+    return 0
+  fi
+  PIN_NOTE="all cores (Android refused pinning to $list)"
+  return 1
+}
+reapply_cores() {   # after a settings change: undo the old pin, apply the new one
+  [[ -n $ORIG_MASK ]] && set_affinity "$ORIG_MASK" >/dev/null 2>&1
+  apply_cores >/dev/null 2>&1
+  calc_threads 1
+}
+
+read_temp() {   # TEMP_C = hottest CPU/SoC thermal sensor in C (or battery temp via Termux:API), "" if unreadable
+  local z v ty cpu_best=-1 all_best=-1
+  TEMP_C=""; TEMP_NOTE=""
+  for z in "$VC_THERMAL"/thermal_zone*; do
+    [[ -r $z/temp ]] || continue
+    v=""; { read -r v < "$z/temp"; } 2>/dev/null
+    [[ $v =~ ^-?[0-9]+$ ]] || continue
+    if (( v > 1000 || v < -1000 )); then v=$(( v / 1000 )); fi
+    (( v < 10 || v > 150 )) && continue
+    ty=""; { read -r ty < "$z/type"; } 2>/dev/null; ty=${ty,,}
+    case $ty in
+      *bat*|*chg*|*charg*|*usb*|*modem*|*wifi*|*nand*|*flash*|*xo*|*camera*|*display*|*quiet*|*case*) continue;;
+    esac
+    (( v > all_best )) && all_best=$v
+    case $ty in *cpu*|*soc*|*cluster*|*tsens*|*big*|*mid*|*little*|*apss*|*mtk*) (( v > cpu_best )) && cpu_best=$v;; esac
+  done
+  if   (( cpu_best >= 0 )); then TEMP_C=$cpu_best
+  elif (( all_best >= 0 )); then TEMP_C=$all_best
+  elif command -v termux-battery-status >/dev/null 2>&1; then
+    v=$(timeout 3 termux-battery-status 2>/dev/null | sed -n 's/.*"temperature": *\(-\{0,1\}[0-9]*\).*/\1/p' | head -n1)
+    if [[ $v =~ ^[0-9]+$ ]]; then TEMP_C=$v; TEMP_NOTE=" (battery)"; fi
+  fi
+}
+freq_sample_start() {   # samples the clock of FREQ_CPUS once a second in the background
+  local i any=0
+  FREQ_FILE=""; FREQ_PID=""
+  [[ -n $FREQ_CPUS ]] || return 0
+  for i in $FREQ_CPUS; do [[ -r $VC_SYSFS/cpu$i/cpufreq/scaling_cur_freq ]] && any=1; done
+  (( any )) || return 0
+  FREQ_FILE=$(mktemp) || { FREQ_FILE=""; return 0; }
+  (
+    local s c m f k
+    while :; do
+      s=0; c=0; m=0
+      for k in $FREQ_CPUS; do
+        f=""; { read -r f < "$VC_SYSFS/cpu$k/cpufreq/scaling_cur_freq"; } 2>/dev/null
+        [[ $f =~ ^[0-9]+$ ]] || continue
+        s=$(( s + f )); c=$(( c + 1 )); if (( m == 0 || f < m )); then m=$f; fi
+      done
+      (( c > 0 )) && echo "$(( s / c )) $m" >> "$FREQ_FILE"
+      sleep 1
+    done
+  ) >/dev/null 2>&1 &
+  FREQ_PID=$!
+}
+freq_sample_stop() {   # FREQ_AVG / FREQ_MIN in MHz ("" = could not read)
+  local a m n=0 sa=0 mm=0
+  FREQ_AVG=""; FREQ_MIN=""
+  if [[ -n $FREQ_PID ]]; then kill "$FREQ_PID" 2>/dev/null; wait "$FREQ_PID" 2>/dev/null; fi
+  FREQ_PID=""
+  if [[ -n $FREQ_FILE && -s $FREQ_FILE ]]; then
+    while read -r a m; do
+      sa=$(( sa + a )); n=$(( n + 1 )); if (( mm == 0 || m < mm )); then mm=$m; fi
+    done < "$FREQ_FILE"
+    if (( n > 0 )); then FREQ_AVG=$(( sa / n / 1000 )); FREQ_MIN=$(( mm / 1000 )); fi
+  fi
+  [[ -n $FREQ_FILE ]] && rm -f -- "$FREQ_FILE"
+  FREQ_FILE=""
+}
+race_cpus() {   # which CPUs to watch: the pinned ones, else all
+  local i
+  FREQ_CPUS=""
+  detect_cpu
+  if [[ -n $PIN_LIST ]]; then
+    local part a b; local -a parts
+    IFS=',' read -ra parts <<<"$PIN_LIST"
+    for part in "${parts[@]}"; do
+      if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; else a=$part; b=$part; fi
+      for (( i = a; i <= b; i++ )); do FREQ_CPUS+="$i "; done
+    done
+  else
+    for d in "$VC_SYSFS"/cpu[0-9]*; do i=${d##*/cpu}; [[ $i =~ ^[0-9]+$ ]] && FREQ_CPUS+="$i "; done
+  fi
+}
+device_report() {
+  local sensors="" tmp
+  detect_cpu
+  printf '\n%s== CPU & sensors ==%s\n' "$C_B" "$C_0"
+  if [[ -n $CPU_TOPO ]]; then
+    printf '  Cores   : %s total\n' "$CPU_N"
+    printf '            %s\n' "$CPU_TOPO"
+    printf '            %s(told apart by: %s)%s\n' "$C_D" "$CPU_SRC" "$C_0"
+  else
+    printf '  Cores   : %s (layout could not be read - Android hides it)\n' "$CPU_N"
+  fi
+  if (( CPU_HETERO )); then printf '  Fast    : cores %s (%s of %s)\n' "$BIG_LIST" "$BIG_N" "$CPU_N"; fi
+  printf '  Pinning : %s  [setting: %s]\n' "${PIN_NOTE:-not applied}" "$CORES"
+  if (( THREADS > 0 )); then printf '  Threads : fixed at %s\n' "$THREADS"
+  elif (( PIN_N > 0 )); then printf '  Threads : auto (%s = number of pinned cores)\n' "$PIN_N"
+  else printf '  Threads : auto (encoder decides)\n'; fi
+  read_temp
+  if [[ -n $TEMP_C ]]; then sensors="temperature ${TEMP_C}°C${TEMP_NOTE}"; else sensors="temperature NOT readable"; fi
+  race_cpus
+  freq_sample_start
+  if [[ -n $FREQ_FILE ]]; then sensors+=", CPU clock readable"; else sensors+=", CPU clock NOT readable"; fi
+  freq_sample_stop
+  printf '  Sensors : %s\n' "$sensors"
+}
 detect_ff_caps() {   # once per run (call it in the parent so parallel jobs inherit it)
   (( FF_CAPS_DONE )) && return 0
   FF_CAPS_DONE=1; STATS_OPT=(); FPSMODE_OPT=(-vsync 0); ENCTB_OPT=(); FF_VER=""
@@ -246,10 +547,14 @@ detect_ff_caps() {   # once per run (call it in the parent so parallel jobs inhe
     STATS_OPT=(-stats_period 1); FPSMODE_OPT=(-fps_mode passthrough); ENCTB_OPT=(-enc_time_base 1:1000000)
   fi
 }
-calc_threads() {   # $1 = parallel jobs -> THREADS_PER_JOB (split the CPU, never oversubscribe)
-  local n=${1:-1} c
-  c=$(nproc 2>/dev/null || echo 4); [[ $c =~ ^[0-9]+$ ]] || c=4
-  if (( n > 1 )); then THREADS_PER_JOB=$(( (c + n - 1) / n )); else THREADS_PER_JOB=0; fi
+calc_threads() {   # $1 = parallel jobs -> THREADS_PER_JOB (0 = encoder default)
+  local n=${1:-1} c=0
+  if (( THREADS > 0 )); then c=$THREADS                    # fixed budget from --threads / Settings 25
+  elif (( PIN_N > 0 )); then c=$PIN_N                      # one thread per pinned core
+  elif (( n > 1 )); then                                    # parallel jobs: split the CPU
+    c=$(nproc 2>/dev/null || echo 4); [[ $c =~ ^[0-9]+$ ]] || c=4
+  fi
+  if (( c > 0 )); then THREADS_PER_JOB=$(( (c + n - 1) / n )); else THREADS_PER_JOB=0; fi
 }
 have_enc() { ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw -- "$1"; }
 hw_encoder_name() { case $CODEC in hw265) echo hevc_mediacodec;; hw264) echo h264_mediacodec;; esac; }
@@ -297,7 +602,7 @@ set_defaults() {
   PARALLEL_JOBS=1; KEEP_SUBS=1; SUB_MODE="soft"; SUB_FILE=""
   SUB_LANG="fa"; SUB_SIZE=24; SUB_COLOR="&H00FFFFFF"
   OUT_EXT="mp4"; FINISH_ACTION="menu"
-  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"
+  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"; CORES="auto"; THREADS=0
 }
 
 # ------------------------------------------------------ settings & profiles ---
@@ -1224,6 +1529,7 @@ run_batch() {
   [[ -z $VC_NOSTAGE ]] && stage_root   # one shared build area: parallel children inherit it
   detect_ff_caps
   calc_threads "$PARALLEL_JOBS"        # parallel jobs split the CPU instead of fighting for it
+  (( PIN_N > 0 )) && info "CPU: $PIN_NOTE, ${THREADS_PER_JOB} thread(s) per job"
   local i=0 n=${#SELECTED[@]} f st a b running=0
   if (( PARALLEL_JOBS > 1 )); then
     info "Parallel mode: up to $PARALLEL_JOBS files at once ($n total, $THREADS_PER_JOB threads each)"
@@ -2575,25 +2881,81 @@ frames_flow() {   # $1 optional video - interactive front end
 # Encodes the same short sample with every preset and prints the real speed,
 # estimated size and estimated time on THIS device - so you pick the right
 # preset from facts, not guesses.
+
+quality_ssim() {   # $1 encoded sample -> SSIM_VAL (0..1, vs the SAME seconds of the source scaled to the same size)
+  local f=$1 dim w h rf="" line
+  SSIM_VAL=""
+  dim=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x -- "$f" 2>/dev/null | head -n1)
+  [[ $dim =~ ^([0-9]+)x([0-9]+)$ ]] || return 1
+  w=${BASH_REMATCH[1]}; h=${BASH_REMATCH[2]}
+  if (( FPS > 0 )) && awk -v s="$SRC_FPS" -v t="$FPS" 'BEGIN{ exit !(s > t+0.5) }'; then rf="fps=$FPS,"; fi
+  line=$(ffmpeg -nostdin -hide_banner -ss "$RACE_SSTART" -t "$RACE_SLEN" -i "$RACE_SRC" -i "$f" \
+    -filter_complex "[0:v]${rf}scale=${w}:${h}:flags=bicubic,format=yuv420p[r];[1:v]format=yuv420p[d];[d][r]ssim" \
+    -f null - 2>&1 | grep -o 'All:[0-9.]*' | tail -n1)
+  SSIM_VAL=${line#All:}
+  [[ $SSIM_VAL =~ ^[01](\.[0-9]+)?$ ]] || { SSIM_VAL=""; return 1; }
+}
+ssim_label() {   # rough human label for an SSIM value
+  local v=$1 t
+  [[ $v =~ ^0\.([0-9]{3,4}) ]] || { [[ $v == 1* ]] && echo "identical"; return 0; }
+  t=${BASH_REMATCH[1]}; t=${t}0000; t=$(( 10#${t:0:4} ))
+  if   (( t >= 9900 )); then echo "excellent"
+  elif (( t >= 9700 )); then echo "very good"
+  elif (( t >= 9400 )); then echo "good"
+  elif (( t >= 9000 )); then echo "fair"
+  else echo "visible loss"; fi
+}
 now_us() { if [[ -n ${EPOCHREALTIME-} ]]; then NOW_US=${EPOCHREALTIME/[.,]/}; else NOW_US=$(( SECONDS * 1000000 )); fi; }
-preset_race() {   # $1 optional video
-  local src=${1:-} p full slen sstart snap tmp br vf sz t0 t1 el rc i bi=-1 bs=-1 sec
-  local slen_us full_us est_sz est_t spd
-  local -a names=() spds=() szs=() tms=()
-  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
-  probe "$src" || return 1
-  full=$DUR
-  slen=$(awk -v d="$full" 'BEGIN{ printf "%.3f", (d > 10) ? 8 : d }')
-  sstart=$(awk -v d="$full" -v l="$slen" 'BEGIN{ s = (d - l) / 2; if (s < 0) s = 0; printf "%.3f", s }')
-  secs_us "$slen"; slen_us=$SECS_US; (( slen_us < 1 )) && slen_us=1
-  secs_us "$full"; full_us=$SECS_US
+race_setup() {   # $1 video -> RACE_* globals, settings snapshot, temp dir
+  RACE_SRC=$1
+  probe "$RACE_SRC" || return 1
   detect_ff_caps
-  snap=$(mktemp) || return 1; write_settings "$snap"
-  TMPD=$(mktemp -d) || { rm -f "$snap"; return 1; }
+  RACE_SLEN=$(awk -v d="$DUR" 'BEGIN{ printf "%.3f", (d > 10) ? 8 : d }')
+  RACE_SSTART=$(awk -v d="$DUR" -v l="$RACE_SLEN" 'BEGIN{ s = (d - l) / 2; if (s < 0) s = 0; printf "%.3f", s }')
+  secs_us "$RACE_SLEN"; RACE_SLEN_US=$SECS_US; (( RACE_SLEN_US < 1 )) && RACE_SLEN_US=1
+  secs_us "$DUR"; RACE_FULL_US=$SECS_US
+  RACE_SNAP=$(mktemp) || return 1
+  write_settings "$RACE_SNAP"
+  TMPD=$(mktemp -d) || { rm -f -- "$RACE_SNAP"; return 1; }
   mkdir -p "$CONF_DIR"; : > "$LOG"
+  TARGET_MB=0
+  calc_threads 1
+  return 0
+}
+race_teardown() {   # restore settings, CPU pinning and thread budget
+  freq_sample_stop
+  rm -rf -- "$TMPD"; TMPD=""
+  load_conf "$RACE_SNAP"; rm -f -- "$RACE_SNAP"
+  if [[ -n $PIN_MASK ]]; then set_affinity "$PIN_MASK" >/dev/null 2>&1
+  elif [[ -n $ORIG_MASK ]]; then set_affinity "$ORIG_MASK" >/dev/null 2>&1; fi
+  calc_threads 1
+}
+race_encode() {   # one sample encode with the CURRENT settings -> R_RC, R_US (microseconds), R_SZ, file $R_TMP
+  local br="" vf t0
+  [[ $CODEC == hw* ]] && br=$VBR
+  EDUR=$RACE_SLEN
+  vf=$(build_vf); VFARG=(); [[ -n $vf ]] && VFARG=(-vf "$vf")
+  build_aenc; build_venc single "$br"
+  R_TMP="$TMPD/race_sample.mp4"; rm -f -- "$R_TMP"
+  now_us; t0=$NOW_US
+  ( cd "$TMPD" && SIMPLE=1 LOGF="$LOG" run_ffmpeg "" 1 1 -ss "$RACE_SSTART" -t "$RACE_SLEN" -i "$RACE_SRC" \
+      -map 0:v:0 -map '0:a?' "${VFARG[@]}" "${VENC[@]}" "${AENC[@]}" -f mp4 "$R_TMP" )
+  R_RC=$?
+  now_us; R_US=$(( NOW_US - t0 )); (( R_US < 1 )) && R_US=1
+  R_SZ=0
+  if (( R_RC == 0 )) && [[ -s $R_TMP ]]; then R_SZ=$(fsize "$R_TMP"); else R_RC=1; fi
+}
+fmt_x100() { printf '%d.%02d' $(( $1 / 100 )) $(( $1 % 100 )); }
+
+preset_race() {   # $1 optional video: every preset -> speed, size, time, quality
+  local src=${1:-} p i bi=-1 bs=-1 bq=-1 spd est_sz est_t lab
+  local -a names=() spds=() szs=() qs=()
+  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
+  race_setup "$src" || return 1
   printf '\n%s== Preset race ==%s\n' "$C_B" "$C_0"
-  info "${slen}s sample of $(trunc "$(basename -- "$src")") - measured on THIS device"
-  printf '  %s%-9s %8s  %10s  %9s%s\n' "$C_D" "preset" "speed" "est. size" "est. time" "$C_0"
+  info "${RACE_SLEN}s sample of $(trunc "$(basename -- "$src")") - measured on THIS device"
+  info "CPU: ${PIN_NOTE:-all cores}$( (( THREADS_PER_JOB > 0 )) && echo ", $THREADS_PER_JOB thread(s)" )"
+  printf '  %s%-9s %8s  %10s  %9s  %s%s\n' "$C_D" "preset" "speed" "est. size" "est. time" "quality (SSIM)" "$C_0"
   for p in turbo fast balanced quality small tiny social compat av1 hardware; do
     apply_preset "$p" || continue
     TARGET_MB=0
@@ -2601,45 +2963,180 @@ preset_race() {   # $1 optional video
       hw*) have_enc "$(hw_encoder_name)" || continue;;
       av1) have_enc libsvtav1 || continue;;
     esac
-    br=""; [[ $CODEC == hw* ]] && br=$VBR
-    EDUR=$slen
-    vf=$(build_vf); VFARG=(); [[ -n $vf ]] && VFARG=(-vf "$vf")
-    build_aenc; build_venc single "$br"
-    tmp="$TMPD/race_$p.mp4"; rm -f -- "$tmp"
     printf '  %-9s %srunning...%s' "$p" "$C_D" "$C_0"
-    now_us; t0=$NOW_US
-    ( cd "$TMPD" && SIMPLE=1 LOGF="$LOG" run_ffmpeg "" 1 1 -ss "$sstart" -t "$slen" -i "$src" \
-        -map 0:v:0 -map '0:a?' "${VFARG[@]}" "${VENC[@]}" "${AENC[@]}" -f mp4 "$tmp" )
-    rc=$?
-    now_us; t1=$NOW_US
-    el=$(( t1 - t0 )); (( el < 1 )) && el=1
-    printf '\r\033[K'
-    if (( rc == 0 )) && [[ -s $tmp ]]; then
-      sz=$(fsize "$tmp")
-      spd=$(( slen_us * 100 / el ))
-      est_sz=$(( sz * full_us / slen_us ))
-      est_t=$(( full_us * el / slen_us / 1000000 ))
-      names+=("$p"); spds+=("$spd"); szs+=("$est_sz"); tms+=("$est_t")
-      printf '  %-9s %5d.%02dx  %10s  %9s\n' "$p" $(( spd / 100 )) $(( spd % 100 )) "$(human "$est_sz")" "$(fmt_time "$est_t")"
+    race_encode
+    if (( R_RC == 0 )); then
+      spd=$(( RACE_SLEN_US * 100 / R_US ))
+      est_sz=$(( R_SZ * RACE_FULL_US / RACE_SLEN_US ))
+      est_t=$(( RACE_FULL_US * R_US / RACE_SLEN_US / 1000000 ))
+      SSIM_VAL=""
+      if (( ! NOQUALITY )); then printf '\r\033[K  %-9s %smeasuring quality...%s' "$p" "$C_D" "$C_0"; quality_ssim "$R_TMP"; fi
+      lab=""; [[ -n $SSIM_VAL ]] && lab="${SSIM_VAL:0:6} $(ssim_label "$SSIM_VAL")"
+      printf '\r\033[K  %-9s %5s x  %10s  %9s  %s\n' "$p" "$(fmt_x100 "$spd")" "$(human "$est_sz")" "$(fmt_time "$est_t")" "${lab:--}"
+      names+=("$p"); spds+=("$spd"); szs+=("$est_sz"); qs+=("${SSIM_VAL:-0}")
     else
-      printf '  %-9s %sfailed (see log)%s\n' "$p" "$C_R" "$C_0"
+      printf '\r\033[K  %-9s %sfailed (see log)%s\n' "$p" "$C_R" "$C_0"
     fi
-    rm -f -- "$tmp"
+    rm -f -- "$R_TMP"
   done
-  rm -rf -- "$TMPD"; TMPD=""
-  load_conf "$snap"; rm -f -- "$snap"
+  race_teardown
   if (( ${#names[@]} )); then
     for i in "${!names[@]}"; do
       (( bi < 0 || spds[i] > spds[bi] )) && bi=$i
       (( bs < 0 || szs[i] < szs[bs] )) && bs=$i
+      if (( NOQUALITY == 0 )) && [[ ${qs[i]} != 0 ]]; then
+        if (( bq < 0 )) || awk -v a="${qs[i]}" -v b="${qs[bq]}" 'BEGIN{ exit !(a > b) }'; then bq=$i; fi
+      fi
     done
-    printf '\n  %sFastest :%s %s (%d.%02dx real time)\n' "$C_G" "$C_0" "${names[bi]}" $(( spds[bi] / 100 )) $(( spds[bi] % 100 ))
-    printf '  %sSmallest:%s %s (~%s)\n' "$C_G" "$C_0" "${names[bs]}" "$(human "${szs[bs]}")"
-    info "  Estimates are rough (+/-20%). Use one:  vc -y -p <preset> FILE"
+    printf '\n  %sFastest      :%s %s (%s x real time)\n' "$C_G" "$C_0" "${names[bi]}" "$(fmt_x100 "${spds[bi]}")"
+    printf '  %sSmallest     :%s %s (~%s)\n' "$C_G" "$C_0" "${names[bs]}" "$(human "${szs[bs]}")"
+    (( bq >= 0 )) && printf '  %sBest quality :%s %s (SSIM %s)\n' "$C_G" "$C_0" "${names[bq]}" "${qs[bq]:0:6}"
+    info "  Speed/size are rough (+/-20%). Quality = how close the result is to the source scaled to the SAME size,"
+    info "  so a small picture is not penalised for being small. Pick:  vc -y -p <preset> FILE"
   else
     err "No preset could be encoded - see the log: $(pretty "$LOG")"; return 1
   fi
   return 0
+}
+
+cores_race() {   # $1 optional video: same encode on different CPU setups
+  local src=${1:-} nb i r k best=0 avg gain n_all
+  local -a cn=() cm=() ct=() cs=() sp=() sum=()
+  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
+  race_setup "$src" || return 1
+  detect_cpu
+  n_all=$CPU_N; (( n_all < 1 )) && n_all=$(nproc --all 2>/dev/null || echo 4)
+  nb=$BIG_N; (( nb < 1 )) && nb=$(( n_all / 2 )); (( nb < 1 )) && nb=1
+  # setups: name | affinity mask ("" = leave) | threads | settings to save (CORES) | (THREADS)
+  cn+=("all cores, auto threads");  cm+=("${ORIG_MASK}"); ct+=(0);     cs+=("all|0")
+  cn+=("all cores, $nb threads");   cm+=("${ORIG_MASK}"); ct+=("$nb"); cs+=("all|$nb")
+  if (( CPU_HETERO )) && [[ -n $BIG_MASK ]] && find_taskset && [[ -n $ORIG_MASK ]]; then
+    cn+=("big cores only ($BIG_LIST)"); cm+=("$BIG_MASK"); ct+=(0); cs+=("auto|0")
+  fi
+  printf '\n%s== CPU test ==%s\n' "$C_B" "$C_0"
+  info "Same ${RACE_SLEN}s encode ($PRESET_NAME), each setup twice, interleaved so heat affects all equally"
+  (( ${#cn[@]} < 3 )) && info "(no big/little split found or pinning unavailable: testing thread counts only)"
+  for (( r = 1; r <= 2; r++ )); do
+    for i in "${!cn[@]}"; do
+      printf '\r\033[K  run %d/2: %s ...' "$r" "${cn[i]}"
+      if [[ -n ${cm[i]} ]]; then set_affinity "${cm[i]}" >/dev/null 2>&1; fi
+      if [[ ${cs[i]%%|*} == auto ]]; then THREADS_PER_JOB=$BIG_N; else THREADS_PER_JOB=${ct[i]}; fi
+      race_encode
+      if (( R_RC == 0 )); then sp[i*2+r-1]=$(( RACE_SLEN_US * 100 / R_US )); else sp[i*2+r-1]=0; fi
+      rm -f -- "$R_TMP"
+    done
+  done
+  printf '\r\033[K'
+  printf '  %s%-26s %8s %8s %9s%s\n' "$C_D" "setup" "run 1" "run 2" "average" "$C_0"
+  for i in "${!cn[@]}"; do
+    sum[i]=$(( (sp[i*2] + sp[i*2+1]) / 2 ))
+    printf '  %-26s %7sx %7sx %8sx\n' "${cn[i]}" "$(fmt_x100 "${sp[i*2]}")" "$(fmt_x100 "${sp[i*2+1]}")" "$(fmt_x100 "${sum[i]}")"
+    (( sum[i] > sum[best] )) && best=$i
+  done
+  race_teardown
+  if (( sum[0] > 0 )); then gain=$(( (sum[best] - sum[0]) * 100 / sum[0] )); else gain=0; fi
+  if (( best == 0 || gain < 5 )); then
+    printf '\n  %sResult:%s no setup beats "all cores, auto threads" by 5%% or more - keep the default.\n' "$C_G" "$C_0"
+  else
+    printf '\n  %sBest:%s %s  (+%d%% vs all cores)\n' "$C_G" "$C_0" "${cn[best]}" "$gain"
+    if [[ -t 0 ]] && yesno "Make this your default CPU setup?" n; then
+      CORES=${cs[best]%%|*}; THREADS=${cs[best]##*|}
+      save_settings; reapply_cores; ok "Saved (CORES=$CORES, THREADS=$THREADS)."
+    fi
+  fi
+  info "  Differences under ~5% are noise. A phone may behave differently once it is hot - see the heat test."
+  return 0
+}
+
+stamina_test() {   # $1 optional video: repeat one encode and watch speed, temperature, clock
+  local src=${1:-} r=0 spd first=0 last=0 prev=0 t_start t0 el limit drop tmp0="" tmpN="" f0="" fN="" shown
+  local -a all=()
+  limit=${VC_STAMINA_SEC:-90}
+  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
+  race_setup "$src" || return 1
+  race_cpus
+  printf '\n%s== Heat test ==%s\n' "$C_B" "$C_0"
+  info "Repeats the same ${RACE_SLEN}s encode ($PRESET_NAME) for about ${limit}s. If speed keeps falling, the phone is throttling."
+  info "CPU: ${PIN_NOTE:-all cores}$( (( THREADS_PER_JOB > 0 )) && echo ", $THREADS_PER_JOB thread(s)" )"
+  read_temp; tmp0=$TEMP_C
+  now_us; t_start=$NOW_US
+  printf '  %s%-6s %6s %8s %7s  %s%s\n' "$C_D" "round" "time" "speed" "temp" "CPU clock (avg / lowest)" "$C_0"
+  while true; do
+    r=$(( r + 1 ))
+    printf '  round %-3d %srunning...%s' "$r" "$C_D" "$C_0"
+    freq_sample_start
+    race_encode
+    freq_sample_stop
+    read_temp
+    now_us; el=$(( (NOW_US - t_start) / 1000000 ))
+    if (( R_RC != 0 )); then printf '\r\033[K  %sencode failed - see %s%s\n' "$C_R" "$(pretty "$LOG")" "$C_0"; break; fi
+    spd=$(( RACE_SLEN_US * 100 / R_US )); all+=("$spd")
+    (( r == 1 )) && { first=$spd; f0=$FREQ_AVG; }
+    fN=$FREQ_AVG; tmpN=$TEMP_C
+    printf '\r\033[K  %-6s %5ss %7sx %7s  %s\n' "$r" "$el" "$(fmt_x100 "$spd")" "${TEMP_C:+${TEMP_C}°C}" \
+      "${FREQ_AVG:+${FREQ_AVG} MHz / ${FREQ_MIN} MHz}"
+    rm -f -- "$R_TMP"
+    (( r >= 15 )) && break
+    (( el >= limit && r >= 3 )) && break
+  done
+  race_teardown
+  if [[ -z $tmp0 && -z $f0 ]]; then
+    info "  (Android does not let Termux read temperature or CPU clock here - only the speed trend can be shown.)"
+  fi
+  (( ${#all[@]} >= 2 )) || return 0
+  # compare the first round with the average of the last two (or last one)
+  if (( ${#all[@]} >= 4 )); then last=$(( (all[-1] + all[-2]) / 2 )); else last=${all[-1]}; fi
+  (( first > 0 )) && drop=$(( (first - last) * 100 / first )) || drop=0
+  printf '\n'
+  local proof=0
+  if [[ -n $f0 && -n $fN ]] && (( fN * 100 < f0 * 90 )); then proof=1; fi          # clock fell >10%
+  if [[ -n $tmp0 && -n $tmpN ]] && (( tmpN - tmp0 >= 5 )); then proof=1; fi          # got 5C hotter
+  if   (( drop >= 20 && proof )); then printf '  %sThrottling:%s speed fell %d%% (%sx -> %sx) in %ss, and the clock/temperature confirm heat.\n' "$C_R" "$C_0" "$drop" "$(fmt_x100 "$first")" "$(fmt_x100 "$last")" "$el"
+  elif (( drop >= 20 )); then printf '  %sBig slowdown:%s speed fell %d%% (%sx -> %sx) in %ss. Usually heat, but without a clock/temperature reading (or with another app busy) this cannot be proven.\n' "$C_R" "$C_0" "$drop" "$(fmt_x100 "$first")" "$(fmt_x100 "$last")" "$el"
+  elif (( drop >= 8 ));  then printf '  %sMild slowdown:%s speed fell %d%% (%sx -> %sx) in %ss.\n' "$C_Y" "$C_0" "$drop" "$(fmt_x100 "$first")" "$(fmt_x100 "$last")" "$el"
+  else printf '  %sStable:%s speed stayed within %d%% over %ss (%sx -> %sx).\n' "$C_G" "$C_0" "$(( drop < 0 ? -drop : drop ))" "$el" "$(fmt_x100 "$first")" "$(fmt_x100 "$last")"; fi
+  if [[ -n $tmp0 && -n $tmpN ]]; then printf '  Temperature: %s°C -> %s°C\n' "$tmp0" "$tmpN"; fi
+  if [[ -n $f0 && -n $fN ]]; then printf '  CPU clock  : %s MHz -> %s MHz\n' "$f0" "$fN"; fi
+  if (( drop >= 8 )); then
+    info "  What helps: take the case off, unplug the charger, keep Termux battery use on 'unrestricted',"
+    info "  try the 'hardware' preset (it uses the video chip, not the CPU), or compress in smaller batches."
+    if [[ -z $f0 ]]; then info "  (This phone hides the CPU clock, so heat vs. other causes cannot be separated here.)"; fi
+  fi
+  (( el < 60 )) && info "  Short test (${el}s): a long compress can heat the phone more. Run again right after for a hot-start comparison."
+  return 0
+}
+
+race_all() {   # $1 optional video
+  local src=${1:-}
+  if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
+  device_report
+  preset_race "$src"
+  cores_race "$src"
+  stamina_test "$src"
+}
+
+race_menu() {   # interactive "speed lab"
+  local c src=""
+  while true; do
+    clear_screen
+    printf '%s== Speed lab ==%s\n' "$C_B" "$C_0"
+    printf '  %sCPU: %s%s\n\n' "$C_D" "${PIN_NOTE:-all cores}" "$C_0"
+    echo " 1) Preset race    (speed, size and quality of every preset)"
+    echo " 2) CPU test       (all cores vs fewer threads vs big cores only)"
+    echo " 3) Heat test      (does speed drop while it runs?)"
+    echo " 4) Everything     (1 + 2 + 3, takes a few minutes)"
+    echo " 5) CPU info       (core layout, pinning, sensors)"
+    echo " b) Back"
+    read -r -p "> " c || return
+    case $c in
+      1|2|3|4)
+        if [[ -z $src ]]; then pick_target || continue; src=$PICK_RESULT; fi
+        case $c in 1) preset_race "$src";; 2) cores_race "$src";; 3) stamina_test "$src";; 4) race_all "$src";; esac
+        pause;;
+      5) device_report; pause;;
+      b|B|"") return;;
+    esac
+  done
 }
 show_info() {
   (( ${#SELECTED[@]} )) || { warn "No videos selected."; return; }
@@ -2873,6 +3370,8 @@ settings_menu() {
     printf ' 21) Resume mode      %s  (skip files that already have a finished output)\n' "$(yn_label "$SKIP_DONE")"
     printf ' 22) Frame extractor  %s, %s, %s\n' "$(frame_fmt_label)" "$(frame_step_label)" "$(frame_h_label)"
     printf ' 23) Downscaler       %s\n' "$( [[ $SCALER == lanczos ]] && echo "Lanczos (sharper, files ~5% bigger)" || echo "bicubic (default)" )"
+    printf ' 24) CPU cores        %s  [now: %s]\n' "$CORES" "${PIN_NOTE:-all cores}"
+    printf ' 25) Encoder threads  %s\n' "$( (( THREADS > 0 )) && echo "$THREADS (fixed)" || echo "auto" )"
     printf '\n  s) save as default     b) back\n'
     read -r -p "Edit: " c || exit 0
     case $c in
@@ -2893,6 +3392,20 @@ settings_menu() {
       21) SKIP_DONE=$(( 1 - SKIP_DONE ));;
       22) frames_options;;
       23) if [[ $SCALER == lanczos ]]; then SCALER=bicubic; else SCALER=lanczos; fi; PRESET_NAME=custom;;
+      24) detect_cpu
+          [[ -n $CPU_TOPO ]] && info "Layout: $CPU_TOPO"
+          echo " 1) auto  (use the fast cores when the phone has big + little cores)"
+          echo " 2) all cores"
+          echo " 3) custom list, e.g. 4-7"
+          c=$(ask "Choose" "1")
+          case $c in
+            1) CORES=auto;;
+            2) CORES=all;;
+            3) c=$(ask "Core list" "${BIG_LIST:-4-7}")
+               if mask_of_list "$c"; then CORES=$c; else err "Use numbers like 4-7 or 0,2,4."; sleep 1; fi;;
+          esac
+          reapply_cores; info "CPU: $PIN_NOTE"; sleep 1;;
+      25) THREADS=$(ask_int "Encoder threads in total (0 = auto)" 0 128 "$THREADS"); calc_threads 1;;
       s|S) save_settings; ok "Saved as default."; sleep 1;;
       b|B|"") return;;
     esac
@@ -2957,7 +3470,7 @@ tools_menu() {
     echo " 9) Install 'vc' command"
     echo "10) Show last log"
     echo "11) Extract frames (time range -> new folder)"
-    echo "12) Preset race (fastest / smallest on this phone)"
+    echo "12) Speed lab (preset race, CPU test, heat test)"
     echo " b) back"
     read -r -p "> " c || exit 0
     case $c in
@@ -2972,7 +3485,7 @@ tools_menu() {
       9) do_install; pause;;
       10) if [[ -s $LOG ]]; then tail -n 40 "$LOG"; else echo "(log is empty)"; fi; pause;;
       11) frames_flow; pause;;
-      12) preset_race; pause;;
+      12) race_menu;;
       b|B|"") return;;
     esac
   done
@@ -3012,6 +3525,7 @@ main_menu() {
     sum_sizes; tot=$SEL_BYTES
     printf '%sVidCompress v%s%s  -  by %s\n' "$C_B" "$VERSION" "$C_0" "$CREATOR"
     printf '%s%s  |  %s cores  |  ffmpeg %s%s\n' "$C_D" "$WEBSITE" "${NCPU:-?}" "${FF_VER:-?}" "$C_0"
+    (( PIN_N > 0 )) && printf '%sCPU: %s%s\n' "$C_D" "$PIN_NOTE" "$C_0"
     printf '%s------------------------------------------%s\n' "$C_D" "$C_0"
     printf ' Selected : %d file(s), %s\n' "$n" "$(human "$tot")"
     printf ' Preset   : %s\n' "$PRESET_NAME"
@@ -3097,7 +3611,13 @@ Frame extractor (every frame between two times -> a NEW folder):
   (no -S/-E in a terminal: an interactive question-and-answer flow starts)
 
 Speed tools:
-  --race FILE            encode a sample with every preset: real speed, size, time
+  --race FILE            encode a sample with every preset: real speed, size, time, quality
+  --race-cores FILE      same encode on all cores / fewer threads / big cores only
+  --stamina FILE         heat test: repeat an encode, watch speed + temperature + clock
+  --race-all FILE        all three (a few minutes); --no-quality skips the SSIM scoring
+  --cpu                  show CPU layout (big/little), pinning and readable sensors
+  --cores auto|all|LIST  run on the fast cores (auto, default), all cores, or e.g. 4-7
+  --threads N            fixed encoder thread budget (0 = auto)
   --resume               skip files whose finished output already exists
   --lanczos              sharper downscaling (files ~5% bigger); --bicubic = default
 
@@ -3153,6 +3673,8 @@ cleanup() {
     rm -rf -- "$BATCH_TMP"
   fi
   [[ -n $TMPD ]] && rm -rf -- "$TMPD"
+  [[ -n $FREQ_PID ]] && kill "$FREQ_PID" 2>/dev/null
+  [[ -n $FREQ_FILE ]] && rm -f -- "$FREQ_FILE"
   # remove the local build area with anything left in it (crashed jobs etc.)
   [[ -n $STAGE_ROOT && -d $STAGE_ROOT ]] && rm -rf -- "$STAGE_ROOT"
   wake_unlock
@@ -3161,11 +3683,12 @@ on_int() {
   printf '\n'; warn "Interrupted - cleaning up."
   [[ -n $CUR_TMP ]] && rm -f -- "$CUR_TMP"
   [[ -n $CUR_TMPDIR && -d $CUR_TMPDIR ]] && rm -rf -- "$CUR_TMPDIR"
+  [[ -n $FREQ_PID ]] && kill "$FREQ_PID" 2>/dev/null
   exit 130
 }
 
 main() {
-  local STUDIO=0 FRAMES_MODE=0 RACE_MODE=0
+  local STUDIO=0 FRAMES_MODE=0 RACE_MODE=""
   refresh_cols; trap refresh_cols WINCH
   case ${1:-} in
     --setup)   do_setup; exit;;
@@ -3192,6 +3715,8 @@ main() {
   [[ $FRAME_STEP =~ ^[0-9]+$ ]] || FRAME_STEP=1
   [[ $FRAME_H =~ ^[0-9]+$ ]] || FRAME_H=0
   [[ $SCALER == lanczos ]] || SCALER=bicubic
+  [[ $CORES == auto || $CORES == all || $CORES =~ ^[0-9]+([-,][0-9]+)*$ ]] || CORES=auto
+  [[ $THREADS =~ ^[0-9]+$ ]] && (( THREADS <= 128 )) || THREADS=0
 
   # --- long options (override config)
   local newargs=() a
@@ -3217,7 +3742,14 @@ main() {
       --oldtv)    REPAIR_OLDTV=1; shift;;
       --stereo)   REPAIR_STEREO=1; shift;;
       --frames)   FRAMES_MODE=1; shift;;
-      --race)     RACE_MODE=1; shift;;
+      --race)        RACE_MODE=presets; shift;;
+      --race-cores)  RACE_MODE=cores; shift;;
+      --stamina|--heat) RACE_MODE=stamina; shift;;
+      --race-all)    RACE_MODE=all; shift;;
+      --no-quality)  NOQUALITY=1; shift;;
+      --cpu)         CPU_MODE=1; shift;;
+      --cores)    if (( $# >= 2 )); then CORES=${2,,}; shift 2; else err "--cores needs auto | all | a list like 4-7"; exit 1; fi;;
+      --threads)  if (( $# >= 2 )); then THREADS=$2; shift 2; else err "--threads needs a number (0 = auto)"; exit 1; fi;;
       --resume)   SKIP_DONE=1; shift;;
       --lanczos)  SCALER=lanczos; shift;;
       --bicubic)  SCALER=bicubic; shift;;
@@ -3242,6 +3774,8 @@ main() {
     ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow) ;;
     *) err "Bad --repair-preset value."; exit 1;;
   esac
+  [[ $CORES == auto || $CORES == all || $CORES =~ ^[0-9]+([-,][0-9]+)*$ ]] || { err "--cores must be auto, all or a list like 4-7."; exit 1; }
+  [[ $THREADS =~ ^[0-9]+$ ]] && (( THREADS <= 128 )) || { err "--threads must be 0-128."; exit 1; }
   case $FRAME_FMT in jpg|jpeg|png|bmp|webp) [[ $FRAME_FMT == jpeg ]] && FRAME_FMT=jpg;; *) err "Bad --frame-format (jpg | png | bmp | webp)."; exit 1;; esac
   [[ $FRAME_Q =~ ^[0-9]+$ ]] && (( FRAME_Q >= 1 && FRAME_Q <= 31 )) || { err "--frame-quality must be 1-31."; exit 1; }
   [[ $FRAME_STEP =~ ^[0-9]+$ ]] || { err "--frame-step must be a number or 'key'."; exit 1; }
@@ -3288,7 +3822,9 @@ main() {
   fi
 
   detect_ff_caps
-  NCPU=$(nproc 2>/dev/null || echo 4)
+  NCPU=$(nproc --all 2>/dev/null || nproc 2>/dev/null || echo 4)
+  apply_cores; calc_threads 1
+  if (( CPU_MODE )); then device_report; exit 0; fi
   if [[ -n $PRESET_ARG ]]; then apply_preset "$PRESET_ARG" || { err "Unknown preset: $PRESET_ARG"; exit 1; }; fi
   [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
   [[ -n $OV_C ]] && { CRF=$OV_C; TARGET_MB=0; PRESET_NAME=custom; }
@@ -3319,7 +3855,7 @@ main() {
   for a in "$@"; do
     if [[ -d $a ]]; then
       while IFS= read -r f; do
-        if (( FRAMES_MODE || RACE_MODE )) || ! is_vc_output "$f"; then add_sel "$f"; else skipped_out=$(( skipped_out + 1 )); fi
+        if (( FRAMES_MODE )) || [[ -n $RACE_MODE ]] || ! is_vc_output "$f"; then add_sel "$f"; else skipped_out=$(( skipped_out + 1 )); fi
       done < <(list_videos "$a")
     elif [[ -f $a ]]; then add_sel "$a"
     else err "Not found: $a"; fi
@@ -3329,10 +3865,17 @@ main() {
   trap on_int INT TERM
   trap cleanup EXIT
 
-  if (( RACE_MODE )); then
-    if (( ${#SELECTED[@]} )); then preset_race "${SELECTED[0]}"; exit $?
-    elif [[ -t 0 ]]; then preset_race; exit $?
-    else err "Usage: vc --race FILE"; exit 1; fi
+  if [[ -n $RACE_MODE ]]; then
+    local race_f=""
+    if (( ${#SELECTED[@]} )); then race_f=${SELECTED[0]}
+    elif [[ ! -t 0 ]]; then err "Usage: vc --race | --race-cores | --stamina | --race-all FILE"; exit 1; fi
+    case $RACE_MODE in
+      presets) preset_race "$race_f";;
+      cores)   cores_race "$race_f";;
+      stamina) stamina_test "$race_f";;
+      all)     race_all "$race_f";;
+    esac
+    exit $?
   fi
   if (( FRAMES_MODE )); then
     if (( ${#SELECTED[@]} == 0 )); then
