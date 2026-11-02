@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.4 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v2.5 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -14,14 +14,26 @@
 #     vc --race movie.mp4     # which preset is fastest / smallest / best quality on THIS phone?
 #     vc --race-all movie.mp4 # + CPU-core test + heat test (does speed drop while it runs?)
 #     vc --cpu                # CPU layout (big/little cores), pinning, sensors
+#     vc --tune               # AUTO-TUNE: test this phone, pick + save the fastest settings
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 2.5:
+#   + EASY VIDEO FINDER: menu 1 now shows your NEWEST videos from the whole phone
+#     (Camera, Download, Telegram, WhatsApp...) as a short list. Pick by number,
+#     or just TYPE PART OF A NAME to search. Nothing to browse, nothing to paste.
+#   + AUTO-TUNE (menu t, first launch, or vc --tune): you say what matters
+#     (speed / balanced / small / quality); vc races every preset on one of your
+#     videos, scores the quality (SSIM), tests the CPU setup, then picks and SAVES
+#     the best preset and CPU settings for this phone. Offered once at first start.
+#   + Speed lab is now on the main menu (t).
 #
 #  What's new in 2.4:
 #   + BIG-CORE PINNING: on phones with big + little cores (e.g. 4 fast + 4 slow)
 #     vc finds the fast cores and runs ffmpeg only on them, with the encoder
 #     thread count matched to those cores, so slow cores no longer hold the
-#     encode back. Default "auto"; change with --cores all|auto|4-7 or Settings 24.
+#     encode back. OFF by default (all cores) because it only helps on some phones:
+#     test it with vc --race-cores, then enable with --cores auto or Settings 24.
 #   + SPEED LAB (vc --race-all, Tools 12): preset race now also scores quality
 #     (SSIM); a CPU test compares all cores / fewer threads / big cores only;
 #     a HEAT TEST repeats the same encode and shows speed, temperature and CPU
@@ -94,7 +106,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.4"
+VERSION="2.5"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -163,6 +175,8 @@ ORIG_MASK=""; PIN_MASK=""; PIN_N=0; PIN_LIST=""; PIN_NOTE=""; TASKSET=""; MASK_H
 TEMP_C=""; TEMP_NOTE=""; FREQ_FILE=""; FREQ_PID=""; FREQ_CPUS=""; FREQ_AVG=""; FREQ_MIN=""
 NOQUALITY=0; SSIM_VAL=""; NOW_US=0; CPU_MODE=0
 declare -a CPU_CAP=() CPU_FREQ=() CPU_PART=() CPU_BIGIDX=()
+RACE_LEN=8; TUNE_GOAL=""; TUNE_PICK=""; TUNE_WHY=""; AGE_TXT=""; TUNE_MODE=0
+declare -a RACE_R_NAMES=() RACE_R_SPD=() RACE_R_SZ=() RACE_R_Q=() RACE_R_TM=() FV_ALL=()
 
 # --------------------------------------------------------- small utilities ---
 fsize()     { stat -c %s -- "$1" 2>/dev/null || echo 0; }
@@ -602,7 +616,7 @@ set_defaults() {
   PARALLEL_JOBS=1; KEEP_SUBS=1; SUB_MODE="soft"; SUB_FILE=""
   SUB_LANG="fa"; SUB_SIZE=24; SUB_COLOR="&H00FFFFFF"
   OUT_EXT="mp4"; FINISH_ACTION="menu"
-  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"; CORES="auto"; THREADS=0
+  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"; CORES="all"; THREADS=0
 }
 
 # ------------------------------------------------------ settings & profiles ---
@@ -1713,6 +1727,123 @@ browse_folders() {
     esac
   done
 }
+
+# ================================================== EASY VIDEO FINDER (v2.5)
+fv_scan() {   # one pass over the phone's shared storage -> FV_ALL ("epoch<TAB>size<TAB>path", newest first)
+  local -a roots=()
+  local line
+  [[ -d $HOME/storage/shared ]] && roots+=("$HOME/storage/shared")
+  if (( ${#roots[@]} == 0 )) && [[ -d /sdcard ]]; then roots+=(/sdcard); fi
+  (( ${#roots[@]} )) || roots+=("$HOME")
+  FV_ALL=()
+  printf '  %sLooking for videos on your phone...%s' "$C_D" "$C_0"
+  while IFS= read -r line; do
+    [[ -n $line ]] && FV_ALL+=("$line")
+  done < <(timeout 120 find -H "${roots[@]}" -maxdepth 9 \
+      \( -name '.*' -o -iname cache -o -iname thumbnails -o -path '*/Android/data' -o -path '*/Android/obb' \) -prune -o \
+      -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" -size +100k -printf '%T@\t%s\t%p\n' 2>/dev/null | sort -rn)
+  printf '\r\033[K'
+}
+fv_age() {   # epoch -> AGE_TXT
+  local t=${1%%.*} now=${EPOCHSECONDS:-0} d
+  if (( now == 0 )); then printf -v AGE_TXT '%(%Y-%m-%d)T' "$t"; return 0; fi
+  d=$(( (now - t) / 86400 ))
+  if   (( d <= 0 )); then AGE_TXT="today"
+  elif (( d == 1 )); then AGE_TXT="yesterday"
+  elif (( d < 7 ));  then AGE_TXT="$d days ago"
+  else printf -v AGE_TXT '%(%Y-%m-%d)T' "$t"; fi
+}
+find_videos() {   # $1 = multi (default: add to the queue) | one (sets PICK_RESULT)
+  local mode=${1:-multi} page=0 per=8 q="" ans i n tot line path size mt rest dir lbl mark hidden tok lo hi added sel first last
+  local -a view=() toks=()
+  PICK_RESULT=""
+  (( ${#FV_ALL[@]} )) || fv_scan
+  while true; do
+    view=(); hidden=0
+    for line in "${FV_ALL[@]}"; do
+      rest=${line#*$'\t'}; path=${rest#*$'\t'}
+      if [[ -n $q ]]; then
+        [[ ${path,,} == *"${q,,}"* ]] || continue
+      elif is_vc_output "$path"; then hidden=$(( hidden + 1 )); continue; fi
+      view+=("$line")
+    done
+    tot=${#view[@]}
+    (( page * per >= tot )) && page=0
+    first=$(( page * per )); last=$(( first + per )); (( last > tot )) && last=$tot
+    clear_screen
+    if [[ $mode == one ]]; then printf '%sPick ONE video%s' "$C_B" "$C_0"; else printf '%sYour videos%s  (newest first)' "$C_B" "$C_0"; fi
+    printf '\n %d found%s' "$tot" "${q:+ for \"$q\"}"
+    (( ${#SELECTED[@]} )) && [[ $mode != one ]] && printf '   |   in queue: %d' "${#SELECTED[@]}"
+    printf '\n'
+    (( hidden )) && printf ' %s%d already-compressed file(s) hidden%s\n' "$C_D" "$hidden" "$C_0"
+    echo
+    if (( tot == 0 )); then
+      echo "  Nothing found. Try another word, or: r = scan again,"
+      echo "  f = browse folders, p = type a path."
+    fi
+    for (( i = first; i < last; i++ )); do
+      line=${view[i]}; mt=${line%%$'\t'*}; rest=${line#*$'\t'}; size=${rest%%$'\t'*}; path=${rest#*$'\t'}
+      SZC[$path]=$size
+      fv_age "$mt"
+      dir=${path%/*}; lbl=${dir##*/}; dir=${dir%/*}
+      case ${dir##*/} in shared|0|emulated|storage|sdcard|"") ;; *) lbl="${dir##*/}/$lbl";; esac
+      mark=" "; for sel in "${SELECTED[@]}"; do [[ $sel == "$path" ]] && mark="✔"; done
+      printf ' %s%2d) %8s  %s  %s\n' "$mark" $(( i + 1 )) "$(human "$size")" "$AGE_TXT" "$(trunc "$lbl")"
+      printf '        %s\n' "$(trunc "${path##*/}")"
+    done
+    (( tot > last )) && printf '\n  %s...%d more: type m%s\n' "$C_D" $(( tot - last )) "$C_0"
+    echo
+    if [[ $mode == one ]]; then
+      echo " number = pick     word = search     m = more"
+      echo " f = folders   p = type a path   b = cancel"
+    else
+      echo " numbers = pick (1 3 5-7)   word = search"
+      echo " m = more   a = pick this page   s = START now"
+      echo " f = folders   p = type a path   d = done"
+    fi
+    read -r -p "> " ans || return 1
+    case ${ans,,} in
+      b|d|"") if [[ $mode == one ]]; then return 1; else return 0; fi;;
+      m) page=$(( page + 1 ));;
+      r) fv_scan; q=""; page=0;;
+      f) if [[ $mode == one ]]; then warn "Use p to type a path, or pick a number."; sleep 1
+         else browse_folders; fi;;
+      p) ans=$(ask "Path (file or folder)" "")
+         ans=${ans#[\'\"]}; ans=${ans%[\'\"]}; ans=${ans/#\~/$HOME}
+         if [[ $mode == one ]]; then
+           if [[ -f $ans ]]; then PICK_RESULT=$(readlink -f -- "$ans"); return 0; fi
+           [[ -n $ans ]] && { warn "Not found: $ans"; sleep 1; }
+         else [[ -n $ans ]] && add_path "$ans"; fi;;
+      a) if [[ $mode != one ]]; then
+           for (( i = first; i < last; i++ )); do line=${view[i]}; add_sel "${line#*$'\t'*$'\t'}"; done
+           ok "Added $(( last - first )) video(s)."; sleep 1
+         fi;;
+      s) if [[ $mode != one ]]; then
+           if (( ${#SELECTED[@]} )); then start_flow; return 0; else warn "Pick at least one video first."; sleep 1; fi
+         fi;;
+      /*) q=${ans#/}; page=0;;
+      *)
+        if [[ $ans =~ ^[0-9][0-9\ ,-]*$ ]]; then
+          read -ra toks <<<"${ans//,/ }"; added=0
+          for tok in "${toks[@]}"; do
+            if [[ $tok =~ ^[0-9]+$ ]]; then lo=$tok; hi=$tok
+            elif [[ $tok =~ ^([0-9]+)-([0-9]+)$ ]]; then lo=${BASH_REMATCH[1]}; hi=${BASH_REMATCH[2]}
+            else continue; fi
+            for (( n = lo; n <= hi; n++ )); do
+              if (( n >= 1 && n <= tot )); then
+                line=${view[n-1]}; path=${line#*$'\t'*$'\t'}
+                if [[ $mode == one ]]; then PICK_RESULT=$path; return 0; fi
+                add_sel "$path"; added=$(( added + 1 ))
+              fi
+            done
+          done
+          (( added > 0 )) && { ok "Added $added video(s) - ${#SELECTED[@]} in the queue."; sleep 1; }
+        else
+          q=$ans; page=0
+        fi;;
+    esac
+  done
+}
 quick_locations() {
   local cands=() d ans s="$HOME/storage/shared"
   if [[ ! -d $HOME/storage ]]; then warn "No storage access yet. Run: termux-setup-storage  (or: vc --setup)"; fi
@@ -1736,21 +1867,7 @@ quick_locations() {
   done
 }
 choose_videos() {
-  local c
-  while true; do
-    printf '\n%sChoose videos%s\n' "$C_B" "$C_0"
-    echo " 1) Browse folders (full file browser)"
-    echo " 2) Quick locations (Camera, Download, Telegram, ...)"
-    echo " 3) Type/paste a path (file or folder)"
-    echo " b) back"
-    read -r -p "> " c || return
-    case $c in
-      1) browse_folders; return;;
-      2) quick_locations && return;;
-      3) c=$(ask "Path" ""); [[ -n $c ]] && { add_path "$c"; return; };;
-      b|B|"") return;;
-    esac
-  done
+  find_videos multi
 }
 
 # --- v2.0: queue management ---------------------------------------------------
@@ -1928,6 +2045,10 @@ pick_target() {   # sets PICK_RESULT (prints prompts to stdout, not the result)
     if [[ $c =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SELECTED[@]} )); then
       PICK_RESULT=${SELECTED[c-1]}; return 0
     fi
+    return 1
+  fi
+  if [[ -t 0 && -t 1 ]]; then
+    find_videos one && [[ -n $PICK_RESULT ]] && return 0
     return 1
   fi
   p=$(ask "Path to video" "")
@@ -2910,7 +3031,7 @@ race_setup() {   # $1 video -> RACE_* globals, settings snapshot, temp dir
   RACE_SRC=$1
   probe "$RACE_SRC" || return 1
   detect_ff_caps
-  RACE_SLEN=$(awk -v d="$DUR" 'BEGIN{ printf "%.3f", (d > 10) ? 8 : d }')
+  RACE_SLEN=$(awk -v d="$DUR" -v L="$RACE_LEN" 'BEGIN{ printf "%.3f", (d > L + 2) ? L : d }')
   RACE_SSTART=$(awk -v d="$DUR" -v l="$RACE_SLEN" 'BEGIN{ s = (d - l) / 2; if (s < 0) s = 0; printf "%.3f", s }')
   secs_us "$RACE_SLEN"; RACE_SLEN_US=$SECS_US; (( RACE_SLEN_US < 1 )) && RACE_SLEN_US=1
   secs_us "$DUR"; RACE_FULL_US=$SECS_US
@@ -2949,7 +3070,7 @@ fmt_x100() { printf '%d.%02d' $(( $1 / 100 )) $(( $1 % 100 )); }
 
 preset_race() {   # $1 optional video: every preset -> speed, size, time, quality
   local src=${1:-} p i bi=-1 bs=-1 bq=-1 spd est_sz est_t lab
-  local -a names=() spds=() szs=() qs=()
+  local -a names=() spds=() szs=() qs=() tms=()
   if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
   race_setup "$src" || return 1
   printf '\n%s== Preset race ==%s\n' "$C_B" "$C_0"
@@ -2973,13 +3094,14 @@ preset_race() {   # $1 optional video: every preset -> speed, size, time, qualit
       if (( ! NOQUALITY )); then printf '\r\033[K  %-9s %smeasuring quality...%s' "$p" "$C_D" "$C_0"; quality_ssim "$R_TMP"; fi
       lab=""; [[ -n $SSIM_VAL ]] && lab="${SSIM_VAL:0:6} $(ssim_label "$SSIM_VAL")"
       printf '\r\033[K  %-9s %5s x  %10s  %9s  %s\n' "$p" "$(fmt_x100 "$spd")" "$(human "$est_sz")" "$(fmt_time "$est_t")" "${lab:--}"
-      names+=("$p"); spds+=("$spd"); szs+=("$est_sz"); qs+=("${SSIM_VAL:-0}")
+      names+=("$p"); spds+=("$spd"); szs+=("$est_sz"); qs+=("${SSIM_VAL:-0}"); tms+=("$est_t")
     else
       printf '\r\033[K  %-9s %sfailed (see log)%s\n' "$p" "$C_R" "$C_0"
     fi
     rm -f -- "$R_TMP"
   done
   race_teardown
+  RACE_R_NAMES=("${names[@]}"); RACE_R_SPD=("${spds[@]}"); RACE_R_SZ=("${szs[@]}"); RACE_R_Q=("${qs[@]}"); RACE_R_TM=("${tms[@]}")
   if (( ${#names[@]} )); then
     for i in "${!names[@]}"; do
       (( bi < 0 || spds[i] > spds[bi] )) && bi=$i
@@ -2999,52 +3121,62 @@ preset_race() {   # $1 optional video: every preset -> speed, size, time, qualit
   return 0
 }
 
-cores_race() {   # $1 optional video: same encode on different CPU setups
-  local src=${1:-} nb i r k best=0 avg gain n_all
+cores_race() {   # $1 optional video, $2 = "apply" -> switch to a clearly better setup without asking
+  local src=${1:-} mode=${2:-} nb i r k best=0 cur=-1 gain n_all key runs=3 s
   local -a cn=() cm=() ct=() cs=() sp=() sum=()
   if [[ -z $src ]]; then pick_target || return 1; src=$PICK_RESULT; fi
   race_setup "$src" || return 1
   detect_cpu
   n_all=$CPU_N; (( n_all < 1 )) && n_all=$(nproc --all 2>/dev/null || echo 4)
   nb=$BIG_N; (( nb < 1 )) && nb=$(( n_all / 2 )); (( nb < 1 )) && nb=1
-  # setups: name | affinity mask ("" = leave) | threads | settings to save (CORES) | (THREADS)
+  # setups: name | affinity mask ("" = leave) | threads | settings to save "CORES|THREADS"
   cn+=("all cores, auto threads");  cm+=("${ORIG_MASK}"); ct+=(0);     cs+=("all|0")
   cn+=("all cores, $nb threads");   cm+=("${ORIG_MASK}"); ct+=("$nb"); cs+=("all|$nb")
   if (( CPU_HETERO )) && [[ -n $BIG_MASK ]] && find_taskset && [[ -n $ORIG_MASK ]]; then
     cn+=("big cores only ($BIG_LIST)"); cm+=("$BIG_MASK"); ct+=(0); cs+=("auto|0")
   fi
+  # which setup is in use RIGHT NOW? (CORES/THREADS were snapshotted by race_setup)
+  key="$CORES|$THREADS"
+  for i in "${!cs[@]}"; do [[ ${cs[i]} == "$key" ]] && cur=$i; done
+  if (( cur < 0 )) && [[ $key == "auto|0" ]]; then cur=0; fi     # auto on a phone without a big/little split = all cores
   printf '\n%s== CPU test ==%s\n' "$C_B" "$C_0"
-  info "Same ${RACE_SLEN}s encode ($PRESET_NAME), each setup twice, interleaved so heat affects all equally"
+  info "Same ${RACE_SLEN}s encode ($PRESET_NAME), each setup $runs times, interleaved so heat affects all equally"
   (( ${#cn[@]} < 3 )) && info "(no big/little split found or pinning unavailable: testing thread counts only)"
-  for (( r = 1; r <= 2; r++ )); do
+  for (( r = 1; r <= runs; r++ )); do
     for i in "${!cn[@]}"; do
-      printf '\r\033[K  run %d/2: %s ...' "$r" "${cn[i]}"
+      printf '\r\033[K  run %d/%d: %s ...' "$r" "$runs" "${cn[i]}"
       if [[ -n ${cm[i]} ]]; then set_affinity "${cm[i]}" >/dev/null 2>&1; fi
       if [[ ${cs[i]%%|*} == auto ]]; then THREADS_PER_JOB=$BIG_N; else THREADS_PER_JOB=${ct[i]}; fi
       race_encode
-      if (( R_RC == 0 )); then sp[i*2+r-1]=$(( RACE_SLEN_US * 100 / R_US )); else sp[i*2+r-1]=0; fi
+      if (( R_RC == 0 )); then sp[i*runs+r-1]=$(( RACE_SLEN_US * 100 / R_US )); else sp[i*runs+r-1]=0; fi
       rm -f -- "$R_TMP"
     done
   done
   printf '\r\033[K'
-  printf '  %s%-26s %8s %8s %9s%s\n' "$C_D" "setup" "run 1" "run 2" "average" "$C_0"
+  printf '  %s%-26s' "$C_D" "setup"; for (( r = 1; r <= runs; r++ )); do printf ' %7s' "run $r"; done; printf ' %9s%s\n' "average" "$C_0"
   for i in "${!cn[@]}"; do
-    sum[i]=$(( (sp[i*2] + sp[i*2+1]) / 2 ))
-    printf '  %-26s %7sx %7sx %8sx\n' "${cn[i]}" "$(fmt_x100 "${sp[i*2]}")" "$(fmt_x100 "${sp[i*2+1]}")" "$(fmt_x100 "${sum[i]}")"
+    s=0; for (( r = 0; r < runs; r++ )); do s=$(( s + sp[i*runs+r] )); done
+    sum[i]=$(( s / runs ))
+    printf '  %-26s' "${cn[i]}"; for (( r = 0; r < runs; r++ )); do printf ' %6sx' "$(fmt_x100 "${sp[i*runs+r]}")"; done
+    printf ' %8sx' "$(fmt_x100 "${sum[i]}")"; (( i == cur )) && printf '  <- in use now'; printf '\n'
     (( sum[i] > sum[best] )) && best=$i
   done
   race_teardown
-  if (( sum[0] > 0 )); then gain=$(( (sum[best] - sum[0]) * 100 / sum[0] )); else gain=0; fi
-  if (( best == 0 || gain < 5 )); then
-    printf '\n  %sResult:%s no setup beats "all cores, auto threads" by 5%% or more - keep the default.\n' "$C_G" "$C_0"
+  (( cur < 0 )) && cur=0
+  if (( sum[cur] > 0 )); then gain=$(( (sum[best] - sum[cur]) * 100 / sum[cur] )); else gain=0; fi
+  if (( best == cur || gain < 8 )); then
+    printf '\n  %sResult:%s the setup in use ("%s") is as good as any here: gaps under 8%% are noise.\n' "$C_G" "$C_0" "${cn[cur]}"
   else
-    printf '\n  %sBest:%s %s  (+%d%% vs all cores)\n' "$C_G" "$C_0" "${cn[best]}" "$gain"
-    if [[ -t 0 ]] && yesno "Make this your default CPU setup?" n; then
+    printf '\n  %sBest:%s %s  (+%d%% vs the setup in use)\n' "$C_G" "$C_0" "${cn[best]}" "$gain"
+    if [[ $mode == apply ]]; then
+      CORES=${cs[best]%%|*}; THREADS=${cs[best]##*|}
+      reapply_cores; ok "CPU setup switched to: ${cn[best]}"
+    elif [[ -t 0 ]] && yesno "Make this your default CPU setup?" n; then
       CORES=${cs[best]%%|*}; THREADS=${cs[best]##*|}
       save_settings; reapply_cores; ok "Saved (CORES=$CORES, THREADS=$THREADS)."
     fi
   fi
-  info "  Differences under ~5% are noise. A phone may behave differently once it is hot - see the heat test."
+  info "  A phone may behave differently once it is hot - see the heat test (vc --stamina)."
   return 0
 }
 
@@ -3060,7 +3192,7 @@ stamina_test() {   # $1 optional video: repeat one encode and watch speed, tempe
   info "CPU: ${PIN_NOTE:-all cores}$( (( THREADS_PER_JOB > 0 )) && echo ", $THREADS_PER_JOB thread(s)" )"
   read_temp; tmp0=$TEMP_C
   now_us; t_start=$NOW_US
-  printf '  %s%-6s %6s %8s %7s  %s%s\n' "$C_D" "round" "time" "speed" "temp" "CPU clock (avg / lowest)" "$C_0"
+  printf '  %s%-6s %6s %8s %7s  %s%s\n' "$C_D" "round" "time" "speed" "temp" "CPU clock (average)" "$C_0"
   while true; do
     r=$(( r + 1 ))
     printf '  round %-3d %srunning...%s' "$r" "$C_D" "$C_0"
@@ -3074,7 +3206,7 @@ stamina_test() {   # $1 optional video: repeat one encode and watch speed, tempe
     (( r == 1 )) && { first=$spd; f0=$FREQ_AVG; }
     fN=$FREQ_AVG; tmpN=$TEMP_C
     printf '\r\033[K  %-6s %5ss %7sx %7s  %s\n' "$r" "$el" "$(fmt_x100 "$spd")" "${TEMP_C:+${TEMP_C}°C}" \
-      "${FREQ_AVG:+${FREQ_AVG} MHz / ${FREQ_MIN} MHz}"
+      "${FREQ_AVG:+${FREQ_AVG} MHz}"
     rm -f -- "$R_TMP"
     (( r >= 15 )) && break
     (( el >= limit && r >= 3 )) && break
@@ -3115,25 +3247,145 @@ race_all() {   # $1 optional video
   stamina_test "$src"
 }
 
+
+# ================================================================ AUTO-TUNE (v2.5)
+# One question ("what matters most?"), one test video. vc races every preset on
+# it (speed, size, SSIM quality), tests the CPU setup, then picks and saves the
+# best settings for THIS phone. Quality floors (SSIM): good 0.95, very good 0.97.
+ssim_t10k() {   # "0.9712" -> 9712 ; unknown -> 0
+  local v=$1 f
+  if [[ $v =~ ^0\.([0-9]+)$ ]]; then f=${BASH_REMATCH[1]}0000; echo $(( 10#${f:0:4} ))
+  elif [[ $v =~ ^1(\.0+)?$ ]]; then echo 10000
+  else echo 0; fi
+}
+tune_pick() {   # $1 goal: speed | balanced | size | quality  -> TUNE_PICK, TUNE_WHY (uses RACE_R_* from preset_race)
+  local g=$1 i n=${#RACE_R_NAMES[@]} best=-1 q floor=0 better note=""
+  local -a Q=()
+  TUNE_PICK=""; TUNE_WHY=""
+  (( n > 0 )) || return 1
+  case $g in speed|size) floor=9500;; balanced) floor=9700;; esac
+  for (( i = 0; i < n; i++ )); do Q[i]=$(ssim_t10k "${RACE_R_Q[i]}"); done
+  for (( i = 0; i < n; i++ )); do
+    q=${Q[i]}
+    if [[ $g != quality ]] && (( q < floor )); then continue; fi
+    better=0
+    if (( best < 0 )); then better=1
+    else
+      case $g in
+        speed)    (( RACE_R_SPD[i] > RACE_R_SPD[best] )) && better=1;;
+        size)     (( RACE_R_SZ[i] < RACE_R_SZ[best] )) && better=1;;
+        balanced) (( RACE_R_TM[i] * RACE_R_SZ[i] < RACE_R_TM[best] * RACE_R_SZ[best] )) && better=1;;
+        quality)  if (( q > Q[best] + 20 )); then better=1
+                  elif (( q >= Q[best] - 20 && RACE_R_SPD[i] > RACE_R_SPD[best] )); then better=1; fi;;
+      esac
+    fi
+    (( better )) && best=$i
+  done
+  if (( best < 0 )); then   # nothing reached the quality floor: take the best quality available
+    for (( i = 0; i < n; i++ )); do (( best < 0 || Q[i] > Q[best] )) && best=$i; done
+    note=" (no preset reached the quality target on this video, so this is the best available)"
+  fi
+  TUNE_PICK=${RACE_R_NAMES[best]}
+  local sx; printf -v sx '%d.%02d' $(( RACE_R_SPD[best] / 100 )) $(( RACE_R_SPD[best] % 100 ))
+  local sq="${RACE_R_Q[best]:0:6}"
+  case $g in
+    speed)    TUNE_WHY="the fastest preset that still reaches good quality (SSIM $sq)";;
+    size)     TUNE_WHY="the smallest files that still reach good quality (SSIM $sq)";;
+    balanced) TUNE_WHY="very good quality (SSIM $sq) for the least time x size";;
+    quality)  TUNE_WHY="the highest quality measured (SSIM $sq)";;
+  esac
+  TUNE_WHY+="$note; ${sx}x real time, about $(human "${RACE_R_SZ[best]}") for this video"
+  return 0
+}
+
+auto_tune() {   # $1 optional video
+  local src=${1:-} goal=${TUNE_GOAL:-} c snap sv_noq=$NOQUALITY sv_len=$RACE_LEN interactive=0
+  [[ -t 0 && -t 1 ]] && interactive=1
+  if [[ -z $src ]]; then
+    if (( ${#SELECTED[@]} == 1 )); then src=${SELECTED[0]}
+    else pick_target || return 1; src=$PICK_RESULT; fi
+  fi
+  if [[ -z $goal ]]; then
+    printf '\n%s== Auto-tune ==%s\n' "$C_B" "$C_0"
+    echo "What matters most to you?"
+    echo " 1) Speed       fastest, still good quality"
+    echo " 2) Balanced    very good quality, as quick as possible  (recommended)"
+    echo " 3) Small files smallest size, still good quality"
+    echo " 4) Quality     best picture, slower"
+    c=$(ask "Choose" "2")
+    case $c in 1) goal=speed;; 3) goal=size;; 4) goal=quality;; *) goal=balanced;; esac
+  fi
+  snap=$(mktemp) || return 1; write_settings "$snap"
+  info "vc will now test your phone with this video: $(trunc "$(basename -- "$src")")"
+  info "About 3-5 minutes. Keep the screen on and do not use other heavy apps."
+  wake_lock
+  NOQUALITY=0; RACE_LEN=6
+  if ! preset_race "$src"; then NOQUALITY=$sv_noq; RACE_LEN=$sv_len; wake_unlock; rm -f -- "$snap"; return 1; fi
+  if ! tune_pick "$goal"; then err "No result to choose from."; NOQUALITY=$sv_noq; RACE_LEN=$sv_len; wake_unlock; rm -f -- "$snap"; return 1; fi
+  printf '\n%s== Result ==%s\n' "$C_B" "$C_0"
+  printf '  Goal   : %s\n  Preset : %s%s%s - %s\n' "$goal" "$C_G" "$TUNE_PICK" "$C_0" "$TUNE_WHY"
+  apply_preset "$TUNE_PICK"
+  detect_cpu
+  if (( CPU_HETERO )) && [[ -n $BIG_MASK ]] && find_taskset; then
+    info "Now testing the CPU setup (big cores vs all cores) with that preset..."
+    cores_race "$src" apply
+  fi
+  NOQUALITY=$sv_noq; RACE_LEN=$sv_len
+  wake_unlock
+  printf '  CPU    : %s\n\n' "${PIN_NOTE:-all cores}"
+  if (( interactive )) && ! yesno "Use these settings from now on?" y; then
+    load_conf "$snap"; reapply_cores; rm -f -- "$snap"
+    info "Nothing changed."
+    return 0
+  fi
+  rm -f -- "$snap"
+  save_settings
+  mkdir -p "$CONF_DIR"; printf '%s goal=%s preset=%s cores=%s threads=%s\n' "$(date +%F)" "$goal" "$TUNE_PICK" "$CORES" "$THREADS" > "$CONF_DIR/autotune"
+  ok "Saved. Preset: $TUNE_PICK   CPU: ${PIN_NOTE:-all cores}"
+  info "Change any time: menu 3 (preset), 4 then 24 (CPU). Run auto-tune again with menu t."
+  return 0
+}
+first_run_offer() {   # once: offer the automatic speed setup
+  [[ -t 0 && -t 1 ]] || return 0
+  [[ -f $CONF_DIR/autotune || -f $CONF_DIR/autotune_skip ]] && return 0
+  local c
+  clear_screen
+  printf '%s== First-time speed setup ==%s\n\n' "$C_B" "$C_0"
+  echo "vc can test YOUR phone now and choose the"
+  echo "fastest settings automatically."
+  echo "It needs one video to test with and takes"
+  echo "about 3-5 minutes. Only done once."
+  echo
+  echo " y) Run it now (recommended)"
+  echo " l) Later (ask again next time)"
+  echo " n) Never ask again"
+  c=$(ask "Choose" "y")
+  case ${c,,} in
+    y|"") auto_tune ""; pause;;
+    n)    mkdir -p "$CONF_DIR"; : > "$CONF_DIR/autotune_skip";;
+  esac
+}
 race_menu() {   # interactive "speed lab"
   local c src=""
   while true; do
     clear_screen
     printf '%s== Speed lab ==%s\n' "$C_B" "$C_0"
     printf '  %sCPU: %s%s\n\n' "$C_D" "${PIN_NOTE:-all cores}" "$C_0"
-    echo " 1) Preset race    (speed, size and quality of every preset)"
-    echo " 2) CPU test       (all cores vs fewer threads vs big cores only)"
-    echo " 3) Heat test      (does speed drop while it runs?)"
-    echo " 4) Everything     (1 + 2 + 3, takes a few minutes)"
-    echo " 5) CPU info       (core layout, pinning, sensors)"
+    echo " 1) AUTO-TUNE      (finds and saves the best settings for you)"
+    echo " 2) Preset race    (speed, size and quality of every preset)"
+    echo " 3) CPU test       (all cores vs fewer threads vs big cores only)"
+    echo " 4) Heat test      (does speed drop while it runs?)"
+    echo " 5) Everything     (2 + 3 + 4, takes a few minutes)"
+    echo " 6) CPU info       (core layout, pinning, sensors)"
     echo " b) Back"
     read -r -p "> " c || return
     case $c in
-      1|2|3|4)
+      1) auto_tune "${src}"; pause;;
+      2|3|4|5)
         if [[ -z $src ]]; then pick_target || continue; src=$PICK_RESULT; fi
-        case $c in 1) preset_race "$src";; 2) cores_race "$src";; 3) stamina_test "$src";; 4) race_all "$src";; esac
+        case $c in 2) preset_race "$src";; 3) cores_race "$src";; 4) stamina_test "$src";; 5) race_all "$src";; esac
         pause;;
-      5) device_report; pause;;
+      6) device_report; pause;;
       b|B|"") return;;
     esac
   done
@@ -3394,10 +3646,10 @@ settings_menu() {
       23) if [[ $SCALER == lanczos ]]; then SCALER=bicubic; else SCALER=lanczos; fi; PRESET_NAME=custom;;
       24) detect_cpu
           [[ -n $CPU_TOPO ]] && info "Layout: $CPU_TOPO"
-          echo " 1) auto  (use the fast cores when the phone has big + little cores)"
-          echo " 2) all cores"
+          echo " 1) auto  (only the fast cores - test with the CPU test first)"
+          echo " 2) all cores (default)"
           echo " 3) custom list, e.g. 4-7"
-          c=$(ask "Choose" "1")
+          c=$(ask "Choose" "2")
           case $c in
             1) CORES=auto;;
             2) CORES=all;;
@@ -3527,10 +3779,11 @@ main_menu() {
     printf '%s%s  |  %s cores  |  ffmpeg %s%s\n' "$C_D" "$WEBSITE" "${NCPU:-?}" "${FF_VER:-?}" "$C_0"
     (( PIN_N > 0 )) && printf '%sCPU: %s%s\n' "$C_D" "$PIN_NOTE" "$C_0"
     printf '%s------------------------------------------%s\n' "$C_D" "$C_0"
-    printf ' Selected : %d file(s), %s\n' "$n" "$(human "$tot")"
+    if (( n == 0 )); then printf ' Selected : nothing yet - press 1 to see your videos\n'
+    else printf ' Selected : %d file(s), %s\n' "$n" "$(human "$tot")"; fi
     printf ' Preset   : %s\n' "$PRESET_NAME"
     printf ' Plan     : %s\n\n' "$(trunc "$(plan_line)")"
-    echo " 1) Choose videos (browser / quick locations)"
+    echo " 1) Choose videos (newest first, or search a name)"
     echo " 2) Queue (view / remove)"
     echo " 3) Choose preset"
     echo " 4) Advanced settings"
@@ -3540,6 +3793,7 @@ main_menu() {
     echo " 8) Tools (info, estimate, GIF, audio, thumbs)"
     echo " 9) START compression"
     echo " f) Extract frames (time range -> new folder)"
+    echo " t) Speed lab & AUTO-TUNE (fastest settings for this phone)"
     echo " r) Results & compare (last batch)"
     echo " c) Clear selection"
     echo " 0) Quit"
@@ -3555,6 +3809,7 @@ main_menu() {
       8) tools_menu;;
       9) start_flow;;
       f|F) frames_flow; pause;;
+      t|T) race_menu;;
       r|R) results_menu;;
       c|C) SELECTED=();;
       0|q|Q) exit 0;;
@@ -3616,7 +3871,9 @@ Speed tools:
   --stamina FILE         heat test: repeat an encode, watch speed + temperature + clock
   --race-all FILE        all three (a few minutes); --no-quality skips the SSIM scoring
   --cpu                  show CPU layout (big/little), pinning and readable sensors
-  --cores auto|all|LIST  run on the fast cores (auto, default), all cores, or e.g. 4-7
+  --tune [FILE]          AUTO-TUNE: test this phone, pick + save the best preset and CPU setup
+  --goal G               for --tune: speed | balanced (default) | size | quality
+  --cores all|auto|LIST  all cores (default), the fast cores only (auto), or e.g. 4-7
   --threads N            fixed encoder thread budget (0 = auto)
   --resume               skip files whose finished output already exists
   --lanczos              sharper downscaling (files ~5% bigger); --bicubic = default
@@ -3748,6 +4005,8 @@ main() {
       --race-all)    RACE_MODE=all; shift;;
       --no-quality)  NOQUALITY=1; shift;;
       --cpu)         CPU_MODE=1; shift;;
+      --tune)        TUNE_MODE=1; shift;;
+      --goal)        if (( $# >= 2 )); then TUNE_GOAL=${2,,}; shift 2; else err "--goal needs speed | balanced | size | quality"; exit 1; fi;;
       --cores)    if (( $# >= 2 )); then CORES=${2,,}; shift 2; else err "--cores needs auto | all | a list like 4-7"; exit 1; fi;;
       --threads)  if (( $# >= 2 )); then THREADS=$2; shift 2; else err "--threads needs a number (0 = auto)"; exit 1; fi;;
       --resume)   SKIP_DONE=1; shift;;
@@ -3774,6 +4033,7 @@ main() {
     ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow) ;;
     *) err "Bad --repair-preset value."; exit 1;;
   esac
+  case $TUNE_GOAL in ""|speed|balanced|size|quality) ;; *) err "--goal must be speed, balanced, size or quality."; exit 1;; esac
   [[ $CORES == auto || $CORES == all || $CORES =~ ^[0-9]+([-,][0-9]+)*$ ]] || { err "--cores must be auto, all or a list like 4-7."; exit 1; }
   [[ $THREADS =~ ^[0-9]+$ ]] && (( THREADS <= 128 )) || { err "--threads must be 0-128."; exit 1; }
   case $FRAME_FMT in jpg|jpeg|png|bmp|webp) [[ $FRAME_FMT == jpeg ]] && FRAME_FMT=jpg;; *) err "Bad --frame-format (jpg | png | bmp | webp)."; exit 1;; esac
@@ -3865,6 +4125,11 @@ main() {
   trap on_int INT TERM
   trap cleanup EXIT
 
+  if (( TUNE_MODE )); then
+    if (( ${#SELECTED[@]} )); then auto_tune "${SELECTED[0]}"; exit $?
+    elif [[ -t 0 ]]; then auto_tune ""; exit $?
+    else err "Usage: vc --tune FILE [--goal speed|balanced|size|quality]"; exit 1; fi
+  fi
   if [[ -n $RACE_MODE ]]; then
     local race_f=""
     if (( ${#SELECTED[@]} )); then race_f=${SELECTED[0]}
@@ -3934,6 +4199,7 @@ main() {
     finish_flow
     exit $rc
   fi
+  first_run_offer
   main_menu
 }
 
