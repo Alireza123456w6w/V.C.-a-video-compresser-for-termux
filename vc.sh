@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.5 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v2.8 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -17,6 +17,35 @@
 #     vc --tune               # AUTO-TUNE: test this phone, pick + save the fastest settings
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 2.8:
+#   + PICK FROM THE QUEUE: in Repair & Sync and in the Tools (GIF / audio / thumbnails /
+#     info) you now choose WHICH of the videos you queued earlier to work on: one
+#     (type its number), several (1 3 5-7) or all (a / Enter). The rest of the queue
+#     stays untouched for later.
+#
+#  What's new in 2.7:
+#   + "a" = ADD ALL: in the video finder, a adds EVERY video that is found (or every
+#     search result), not just one page. Tools (GIF / audio / thumbnails) and
+#     Repair open the same finder when the queue is empty, so a works everywhere.
+#   + FOLDER BROWSER FIXED: on phones where ~/storage/shared is a link, it showed only
+#     "/sdcard" with no folders and no videos. Now it lists folders (with how many
+#     videos each holds, newest first), x shows empty folders too, aa adds everything
+#     inside a folder including sub-folders, u goes up. Folders typed as /sdcard or
+#     ~/storage/shared also work on the command line now.
+#   + Queued videos are now ticked correctly in the finder list on every phone.
+#
+#  What's new in 2.6:
+#   + QUEUE FOR EVERYTHING: pick many videos once (menu 1), then Repair & Sync
+#     (diagnose / auto-repair / quick fix / audio shift) and the Tools (GIF,
+#     audio, thumbnails) run over the whole queue ONE AFTER ANOTHER on their own.
+#     Questions are asked once and reused; failures never stop the queue; a
+#     summary lists every file. Diagnose-all offers to repair only the broken ones.
+#   + REPAIR IS MORE RELIABLE: RESCUE MODE (if the first attempt fails, vc retries
+#     by re-encoding and skipping damaged data), a VERIFY step on every output
+#     (length, audio/video length, the end of the file really decodes), disk-space
+#     check BEFORE a long job, original date kept (file time + creation_time, so the
+#     gallery keeps its place), damaged headers read with a bigger probe, HDR warning.
 #
 #  What's new in 2.5:
 #   + EASY VIDEO FINDER: menu 1 now shows your NEWEST videos from the whole phone
@@ -106,7 +135,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.5"
+VERSION="2.8"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -176,6 +205,11 @@ TEMP_C=""; TEMP_NOTE=""; FREQ_FILE=""; FREQ_PID=""; FREQ_CPUS=""; FREQ_AVG=""; F
 NOQUALITY=0; SSIM_VAL=""; NOW_US=0; CPU_MODE=0
 declare -a CPU_CAP=() CPU_FREQ=() CPU_PART=() CPU_BIGIDX=()
 RACE_LEN=8; TUNE_GOAL=""; TUNE_PICK=""; TUNE_WHY=""; AGE_TXT=""; TUNE_MODE=0
+ASK_MEMO_DIR=""; FORCE_TARGET=""; QUEUE_MS=""; VERIFY_OK=1; VERIFY_NOTE=""; DIAG_NPROBS=-1
+FV_ROOT=""; FV_REAL=""
+declare -a PICKED=()
+declare -a DIAG_PROBS=()
+D_CTIME=""; D_TRC=""; D_NSUBS=0; D_VDUR=""; D_ADUR=""
 declare -a RACE_R_NAMES=() RACE_R_SPD=() RACE_R_SZ=() RACE_R_Q=() RACE_R_TM=() FV_ALL=()
 
 # --------------------------------------------------------- small utilities ---
@@ -245,14 +279,19 @@ ratio_dec() {   # "30000/1001" | "25" , decimals(2|3) -> RATIO="29.97" (no forks
   printf -v RATIO '%d.%0*d' $(( x / pw )) "$sc" $(( x % pw ))
 }
 ask() {
-  local p=$1 d=${2:-} a
+  local p=$1 d=${2:-} a mk=""
+  if [[ -n $ASK_MEMO_DIR ]]; then               # batch tools: reuse the first answer for every file
+    mk="$ASK_MEMO_DIR/${p//[^A-Za-z0-9]/_}"; mk=${mk:0:240}
+    if [[ -f $mk ]]; then printf '%s' "$(<"$mk")"; return 0; fi
+  fi
   if [[ -n $d ]]; then
     read -r -p "$p [$d]: " a || exit 0
-    printf '%s' "${a:-$d}"
+    a=${a:-$d}
   else
     read -r -p "$p: " a || exit 0
-    printf '%s' "$a"
   fi
+  [[ -n $mk ]] && printf '%s' "$a" > "$mk"
+  printf '%s' "$a"
 }
 ask_int() {   # prompt min max default
   local a
@@ -263,7 +302,9 @@ ask_int() {   # prompt min max default
   done
 }
 yesno() {     # prompt default(y|n)
-  local a; a=$(ask "$1 (y/n)" "${2:-y}")
+  local a
+  if [[ -n $ASK_MEMO_DIR && $1 == Open* ]]; then [[ ${2:-y} == y* ]]; return; fi   # never open files in a batch
+  a=$(ask "$1 (y/n)" "${2:-y}")
   [[ ${a,,} == y* ]]
 }
 
@@ -894,58 +935,70 @@ frac2dec() {   # "30000/1001" | "29.97" -> decimal number
     else print "0" }'
 }
 
-diag_probe() {   # $1 file -> D_* fields (one ffprobe call); fails when there is no video stream
-  local f=$1 line kv k v ctype codec w h pix rfr afr st tb sr ch dur fmt
+_diag_probe_run() {   # $1 file  $2 extra ffprobe flags (split on purpose)
+  local f=$1 extra=$2 line kv k v ctype codec w h pix rfr afr st tb sr ch dur fmt ctime trc
   local vdone=0 adone=0
   local -a P
   D_VCODEC=""; D_W=0; D_H=0; D_PIX=""; D_RFPS=""; D_AFPS=""; D_VSTART=""; D_VTB=""
   D_ACODEC=""; D_ARATE=0; D_ACH=0; D_ASTART=""; D_ANUM=0; D_DUR=0; D_FMT=""; D_VTS=0
-  [[ -f $f ]] || return 1
+  D_CTIME=""; D_TRC=""; D_NSUBS=0; D_VDUR=""; D_ADUR=""
   while IFS= read -r line; do
-    ctype=""; codec=""; w=""; h=""; pix=""; rfr=""; afr=""; st=""; tb=""; sr=""; ch=""; dur=""; fmt=""
+    ctype=""; codec=""; w=""; h=""; pix=""; rfr=""; afr=""; st=""; tb=""; sr=""; ch=""; dur=""; fmt=""; ctime=""; trc=""
     IFS='|' read -ra P <<<"$line"
     for kv in "${P[@]:1}"; do
       k=${kv%%=*}; v=${kv#*=}
       case $k in
-        codec_type)     ctype=$v;;
-        codec_name)     codec=$v;;
-        width)          w=$v;;
-        height)         h=$v;;
-        pix_fmt)        pix=$v;;
-        r_frame_rate)   rfr=$v;;
-        avg_frame_rate) afr=$v;;
-        start_time)     st=$v;;
-        time_base)      tb=$v;;
-        sample_rate)    sr=$v;;
-        channels)       ch=$v;;
-        duration)       dur=$v;;
-        format_name)    fmt=$v;;
+        codec_type)         ctype=$v;;
+        codec_name)         codec=$v;;
+        width)              w=$v;;
+        height)             h=$v;;
+        pix_fmt)            pix=$v;;
+        r_frame_rate)       rfr=$v;;
+        avg_frame_rate)     afr=$v;;
+        start_time)         st=$v;;
+        time_base)          tb=$v;;
+        sample_rate)        sr=$v;;
+        channels)           ch=$v;;
+        duration)           dur=$v;;
+        format_name)        fmt=$v;;
+        color_transfer)     trc=$v;;
+        tag:creation_time)  ctime=$v;;
       esac
     done
     case ${P[0]} in
-      format) D_DUR=$dur; D_FMT=$fmt;;
+      format) D_DUR=$dur; D_FMT=$fmt; D_CTIME=$ctime;;
       stream)
         case $ctype in
           video)
             if (( ! vdone )); then
               vdone=1; D_VCODEC=$codec; D_W=$w; D_H=$h; D_PIX=$pix; D_RFPS=$rfr; D_AFPS=$afr; D_VSTART=$st; D_VTB=$tb
+              D_TRC=$trc; D_VDUR=$dur
             fi;;
           audio)
             D_ANUM=$(( D_ANUM + 1 ))
             if (( ! adone )); then
-              adone=1; D_ACODEC=$codec; D_ARATE=$sr; D_ACH=$ch; D_ASTART=$st
+              adone=1; D_ACODEC=$codec; D_ARATE=$sr; D_ACH=$ch; D_ASTART=$st; D_ADUR=$dur
             fi;;
+          subtitle) D_NSUBS=$(( D_NSUBS + 1 ));;
         esac;;
     esac
-  done < <(ffprobe -v error -show_entries \
-    'format=duration,format_name:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base,sample_rate,channels' \
+  done < <(ffprobe -v error $extra -show_entries \
+    'format=duration,format_name:format_tags=creation_time:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base,sample_rate,channels,color_transfer,duration' \
     -of compact -- "$f" 2>/dev/null)
+}
+diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream (damaged headers get a bigger probe)
+  local f=$1
+  [[ -f $f ]] || return 1
+  _diag_probe_run "$f" ""
+  [[ -n $D_VCODEC ]] || _diag_probe_run "$f" "-analyzeduration 200M -probesize 200M"
   [[ -n $D_VCODEC ]] || return 1
   case $D_VCODEC in mjpeg|jpegls|png|bmp|tiff) return 1;; esac
   [[ $D_W =~ ^[0-9]+$ ]] || D_W=0
   [[ $D_H =~ ^[0-9]+$ ]] || D_H=0
   [[ $D_ARATE =~ ^[0-9]+$ ]] || D_ARATE=0
   [[ $D_ACH =~ ^[0-9]+$ ]] || D_ACH=0
+  [[ $D_VDUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || D_VDUR=""
+  [[ $D_ADUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || D_ADUR=""
   if [[ $D_VTB == */* && ${D_VTB#*/} =~ ^[0-9]+$ ]]; then D_VTS=${D_VTB#*/}; fi
   [[ $D_DUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || D_DUR=0
   D_FMT=${D_FMT%%,*}; D_FMT=${D_FMT//\"/}
@@ -1055,7 +1108,8 @@ snap_fps() {   # $1 detected fps -> "<fps-filter arg> <display>" (NTSC as exact 
 diag_report() {   # $1 file -> human-readable sync / TV-compatibility report
   local f=$1 vst ast aoff ms offword i=0
   local -a probs=()
-  diag_probe "$f" || { err "No video stream: $(basename -- "$f")"; return 1; }
+  DIAG_NPROBS=-1; DIAG_PROBS=()
+  diag_probe "$f" || { err "No video stream (damaged or not a video): $(basename -- "$f")"; return 1; }
   diag_vfr_scan "$f"; diag_faststart "$f"
   vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
   printf '\n%s== Diagnosis: %s ==%s\n' "$C_B" "$(basename -- "$f")" "$C_0"
@@ -1104,6 +1158,7 @@ diag_report() {   # $1 file -> human-readable sync / TV-compatibility report
   else
     printf '\n  %sNo sync problems found - should play fine on any device.%s\n' "$C_G" "$C_0"
   fi
+  DIAG_NPROBS=${#probs[@]}; DIAG_PROBS=("${probs[@]}")
   return 0
 }
 
@@ -1630,11 +1685,11 @@ estimate_size() {
 
 # ---------------------------------------------------------- file selection ---
 list_videos() {
-  find "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
+  find -H "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
     -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-
 }
 list_videos_sz() {   # "size<TAB>path" lines, newest first (one find, no per-file stat)
-  find "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
+  find -H "$1" -maxdepth 1 -type f -regextype posix-extended -iregex ".*\.($VIDEO_EXT)" \
     -printf '%T@\t%s\t%p\n' 2>/dev/null | sort -rn | cut -f2-
 }
 add_sel() {
@@ -1682,40 +1737,79 @@ pick_from_dir() {
 
 # --- v2.0: real folder browser -----------------------------------------------
 browse_folders() {
-  local cur="${HOME}/storage/shared" ans i rel v vids=() vsz=() dirs=() line
-  [[ -d $cur ]] || cur="$HOME"
+  local cur ans i rel v root line rest p child n showall=0 hid pc
+  local -a vids=() vsz=() dirs=() order=() alld=()
+  local -A cnt=()
+  fv_root; root=$FV_ROOT; cur=$root
+  (( ${#FV_ALL[@]} )) || fv_scan
   while true; do
-    clear_screen
-    printf '%s== Browse folders ==%s\n\n' "$C_B" "$C_0"
-    printf ' %s\n\n' "$(pretty "$cur")"
-    mapfile -t dirs < <(find "$cur" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort | head -n 40)
+    # video counts per sub-folder come from the scan (no extra work); folders are fresh from disk
+    cnt=(); order=()
+    for line in "${FV_ALL[@]}"; do
+      rest=${line#*$'\t'}; p=${rest#*$'\t'}
+      [[ $p == "$cur"/* ]] || continue
+      child=${p#"$cur"/}; [[ $child == */* ]] || continue
+      child=${child%%/*}
+      if [[ -z ${cnt[$child]+x} ]]; then order+=("$child"); cnt[$child]=0; fi
+      cnt[$child]=$(( cnt[$child] + 1 ))
+    done
+    mapfile -t alld < <(find -H "$cur" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+    dirs=(); hid=0
+    for child in "${order[@]}"; do
+      for p in "${alld[@]}"; do [[ $p == "$child" ]] && { dirs+=("$child"); break; }; done
+    done
+    for p in "${alld[@]}"; do
+      [[ -n ${cnt[$p]+x} ]] && continue
+      if (( showall || ${#FV_ALL[@]} == 0 )); then dirs+=("$p"); else hid=$(( hid + 1 )); fi
+    done
     vids=(); vsz=()
     while IFS= read -r line; do
       [[ -n $line ]] || continue
       vsz+=("${line%%$'\t'*}"); vids+=("${line#*$'\t'}"); SZC[${line#*$'\t'}]=${line%%$'\t'*}
     done < <(list_videos_sz "$cur" | head -n 40)
-    for i in "${!dirs[@]}"; do printf ' d%-2d) %s/\n' $(( i + 1 )) "${dirs[i]}"; done
-    (( ${#dirs[@]} > 0 )) && echo
+    clear_screen
+    printf '%s== Browse folders ==%s\n\n' "$C_B" "$C_0"
+    printf ' %s\n\n' "$(pretty "$cur")"
+    for (( i = 0; i < ${#dirs[@]} && i < 30; i++ )); do
+      pc=${cnt[${dirs[i]}]-0}
+      if (( pc > 0 )); then printf ' %-4s %s/   %s%d video%s%s\n' "d$(( i + 1 ))" "$(trunc "${dirs[i]}")" "$C_D" "$pc" "$( (( pc == 1 )) || echo s )" "$C_0"
+      else printf ' %-4s %s/\n' "d$(( i + 1 ))" "$(trunc "${dirs[i]}")"; fi
+    done
+    (( ${#dirs[@]} > 30 )) && printf '  %s... %d more folders%s\n' "$C_D" $(( ${#dirs[@]} - 30 )) "$C_0"
+    (( hid > 0 )) && printf '  %s(%d folder(s) without videos hidden - x shows them)%s\n' "$C_D" "$hid" "$C_0"
+    (( ${#dirs[@]} > 0 || hid > 0 )) && echo
     for i in "${!vids[@]}"; do
       printf ' %3d) %8s  %s\n' $(( i + 1 )) "$(human "${vsz[i]}")" "$(trunc "${vids[i]##*/}")"
     done
-    (( ${#vids[@]} == 0 )) && echo "  (no videos in this folder)"
+    (( ${#vids[@]} == 0 )) && echo "  (no videos directly in this folder)"
     echo
-    echo " number = select video   d<n> = open folder   a = add all here"
-    echo " p = type a path   u = go up   b = back"
+    echo " number = pick video     d<n> = open folder"
+    echo " a = add all videos here  aa = add ALL inside (sub-folders too)"
+    echo " u = up   x = empty folders on/off   r = rescan"
+    echo " p = type a path   b = back"
     read -r -p "> " ans || return
     case ${ans,,} in
       b|"") return;;
-      u) cur=$(dirname -- "$cur");;
+      u) if [[ $cur == "$root" ]]; then warn "This is the top of your phone storage."; sleep 1; else cur=$(dirname -- "$cur"); fi;;
+      x) showall=$(( 1 - showall ));;
+      r) fv_scan;;
       p) ans=$(ask "Path (file or folder)" "")
          [[ -n $ans ]] && { add_path "$ans"; return; };;
       a) if (( ${#vids[@]} > 0 )); then
            for v in "${vids[@]}"; do add_sel "$v"; done
            ok "Added ${#vids[@]} video(s) from this folder."
            return
-         fi;;
+         else warn "No videos directly here - try aa (everything inside)."; sleep 1; fi;;
+      aa) n=0
+          for line in "${FV_ALL[@]}"; do
+            rest=${line#*$'\t'}; p=${rest#*$'\t'}
+            [[ $p == "$cur"/* ]] || continue
+            add_sel "$p"; n=$(( n + 1 ))
+          done
+          if (( n > 0 )); then ok "Added $n video(s) from this folder and its sub-folders."; return
+          else warn "No videos found inside (press r to rescan)."; sleep 1; fi;;
       d*)
-        rel=${ans#d}
+        rel=${ans#d}; rel=${rel#D}
         if [[ $rel =~ ^[0-9]+$ ]] && (( rel >= 1 && rel <= ${#dirs[@]} )); then
           cur="$cur/${dirs[rel-1]}"
         fi;;
@@ -1729,12 +1823,18 @@ browse_folders() {
 }
 
 # ================================================== EASY VIDEO FINDER (v2.5)
+fv_root() {   # top of the phone's shared storage -> FV_ROOT (as typed) and FV_REAL (links resolved)
+  if   [[ -d $HOME/storage/shared ]]; then FV_ROOT="$HOME/storage/shared"
+  elif [[ -d /sdcard ]];              then FV_ROOT=/sdcard
+  elif [[ -d /storage/emulated/0 ]];  then FV_ROOT=/storage/emulated/0
+  else FV_ROOT=$HOME; fi
+  FV_REAL=$(readlink -f -- "$FV_ROOT" 2>/dev/null) || FV_REAL=$FV_ROOT
+  [[ -n $FV_REAL ]] || FV_REAL=$FV_ROOT
+}
 fv_scan() {   # one pass over the phone's shared storage -> FV_ALL ("epoch<TAB>size<TAB>path", newest first)
   local -a roots=()
   local line
-  [[ -d $HOME/storage/shared ]] && roots+=("$HOME/storage/shared")
-  if (( ${#roots[@]} == 0 )) && [[ -d /sdcard ]]; then roots+=(/sdcard); fi
-  (( ${#roots[@]} )) || roots+=("$HOME")
+  fv_root; roots=("$FV_ROOT")
   FV_ALL=()
   printf '  %sLooking for videos on your phone...%s' "$C_D" "$C_0"
   while IFS= read -r line; do
@@ -1754,7 +1854,7 @@ fv_age() {   # epoch -> AGE_TXT
   else printf -v AGE_TXT '%(%Y-%m-%d)T' "$t"; fi
 }
 find_videos() {   # $1 = multi (default: add to the queue) | one (sets PICK_RESULT)
-  local mode=${1:-multi} page=0 per=8 q="" ans i n tot line path size mt rest dir lbl mark hidden tok lo hi added sel first last
+  local mode=${1:-multi} page=0 per=8 q="" ans i n tot line path size mt rest dir lbl mark hidden tok lo hi added sel first last real
   local -a view=() toks=()
   PICK_RESULT=""
   (( ${#FV_ALL[@]} )) || fv_scan
@@ -1787,7 +1887,8 @@ find_videos() {   # $1 = multi (default: add to the queue) | one (sets PICK_RESU
       fv_age "$mt"
       dir=${path%/*}; lbl=${dir##*/}; dir=${dir%/*}
       case ${dir##*/} in shared|0|emulated|storage|sdcard|"") ;; *) lbl="${dir##*/}/$lbl";; esac
-      mark=" "; for sel in "${SELECTED[@]}"; do [[ $sel == "$path" ]] && mark="✔"; done
+      real=$path; [[ $path == "$FV_ROOT"/* ]] && real=$FV_REAL${path#"$FV_ROOT"}
+      mark=" "; for sel in "${SELECTED[@]}"; do [[ $sel == "$real" || $sel == "$path" ]] && mark="✔"; done
       printf ' %s%2d) %8s  %s  %s\n' "$mark" $(( i + 1 )) "$(human "$size")" "$AGE_TXT" "$(trunc "$lbl")"
       printf '        %s\n' "$(trunc "${path##*/}")"
     done
@@ -1798,7 +1899,7 @@ find_videos() {   # $1 = multi (default: add to the queue) | one (sets PICK_RESU
       echo " f = folders   p = type a path   b = cancel"
     else
       echo " numbers = pick (1 3 5-7)   word = search"
-      echo " m = more   a = pick this page   s = START now"
+      printf ' m = more   a = pick ALL %d   s = START now\n' "$tot"
       echo " f = folders   p = type a path   d = done"
     fi
     read -r -p "> " ans || return 1
@@ -1815,8 +1916,12 @@ find_videos() {   # $1 = multi (default: add to the queue) | one (sets PICK_RESU
            [[ -n $ans ]] && { warn "Not found: $ans"; sleep 1; }
          else [[ -n $ans ]] && add_path "$ans"; fi;;
       a) if [[ $mode != one ]]; then
-           for (( i = first; i < last; i++ )); do line=${view[i]}; add_sel "${line#*$'\t'*$'\t'}"; done
-           ok "Added $(( last - first )) video(s)."; sleep 1
+           if (( tot == 0 )); then warn "Nothing to add."; sleep 1
+           elif (( tot > 40 )) && ! yesno "Add all $tot videos to the queue?" y; then :
+           else
+             for (( i = 0; i < tot; i++ )); do line=${view[i]}; add_sel "${line#*$'\t'*$'\t'}"; done
+             ok "Added all $tot video(s) - ${#SELECTED[@]} in the queue."; sleep 1
+           fi
          fi;;
       s) if [[ $mode != one ]]; then
            if (( ${#SELECTED[@]} )); then start_flow; return 0; else warn "Pick at least one video first."; sleep 1; fi
@@ -2037,6 +2142,7 @@ finish_flow() {   # what to do after a batch (configurable: Settings > 20)
 pick_target() {   # sets PICK_RESULT (prints prompts to stdout, not the result)
   PICK_RESULT=""
   local i c p
+  if [[ -n $FORCE_TARGET ]]; then PICK_RESULT=$FORCE_TARGET; return 0; fi     # queue runner decides the file
   if (( ${#SELECTED[@]} )); then
     if (( ${#SELECTED[@]} == 1 )); then PICK_RESULT=${SELECTED[0]}; return 0; fi
     echo "Pick a video:"
@@ -2274,16 +2380,62 @@ extract_subs_silent() {   # $1 video  $2 output path without extension
   return 0
 }
 
+
+# ----------------------------------------------- repair helpers (v2.6) ------
+keep_dates() { touch -r "$1" "$2" 2>/dev/null; return 0; }   # output keeps the original file time (gallery order)
+space_check() {   # $1 destination dir  $2 bytes needed -> 0 = enough room (checked BEFORE a long job)
+  local free
+  free=$(free_bytes "$1")
+  if [[ $free =~ ^[0-9]+$ ]] && (( free > 0 && free < $2 )); then
+    err "Not enough free space in $(pretty "$1"): need about $(human "$2"), only $(human "$free") free."
+    return 1
+  fi
+  return 0
+}
+repair_verify() {   # $1 output  $2 expected duration  $3 slack seconds  (needs diag_probe of the OUTPUT just done)
+  local out=$1 exp=$2 slack=${3:-0} dd gap te
+  local -a issues=()
+  VERIFY_OK=1; VERIFY_NOTE=""
+  dd=$(awk -v a="$D_DUR" -v b="$exp" 'BEGIN{ d = a - b; if (d < 0) d = -d; printf "%.2f", d }')
+  if awk -v d="$dd" -v s="$slack" 'BEGIN{ exit !(d > 1.0 + s) }'; then issues+=("length differs from the original by ${dd}s"); fi
+  if (( D_ANUM > 0 )) && [[ -n $D_VDUR && -n $D_ADUR ]]; then
+    gap=$(awk -v a="$D_ADUR" -v v="$D_VDUR" 'BEGIN{ d = a - v; if (d < 0) d = -d; printf "%.2f", d }')
+    if awk -v d="$gap" -v s="$slack" 'BEGIN{ exit !(d > 0.6 + s) }'; then issues+=("audio and video lengths differ by ${gap}s"); fi
+  fi
+  te=$(ffmpeg -nostdin -v error -sseof -4 -i "$out" -map 0:v:0 -an -f null - 2>&1 | head -n 2)
+  [[ -n $te ]] && issues+=("the last seconds do not decode cleanly")
+  if (( ${#issues[@]} )); then VERIFY_OK=0; VERIFY_NOTE=$(IFS=';'; printf '%s' "${issues[*]}"); fi
+  return 0
+}
+
+repair_rescue_run() {   # called from repair_file: re-encode video + audio cleanly, skipping damaged data
+  local -a rargs=()
+  rargs=(-err_detect ignore_err -fflags +genpts+discardcorrupt+igndts -analyzeduration 200M -probesize 200M -i "$src" -map 0:v:0)
+  (( has_audio > 0 )) && rargs+=(-map 0:a:0)
+  rargs+=(-vf "$rvf" -c:v libx264 -preset "$REPAIR_PRESET" -crf "$REPAIR_CRF" -pix_fmt yuv420p -profile:v high)
+  (( THREADS_PER_JOB > 0 )) && rargs+=(-threads "$THREADS_PER_JOB")
+  (( has_audio > 0 )) && rargs+=(-af "aresample=48000:async=1" -c:a aac -b:a "${abr}k")
+  rargs+=(-sn -map_metadata -1 -map_chapters -1 "${meta[@]}" -muxdelay 0 -avoid_negative_ts make_zero \
+    "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
+  run_ffmpeg "rescue" 1 1 "${rargs[@]}"
+}
 repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   local src=$(readlink -f -- "$1") tag=${2:-}
   local name base dir out tmp rc t0=$SECONDS in_sz out_sz saved need tier
   local vfix=0 afix=0 vf="" fps_arg="" fps_show="" abr=192 vfps=0 stereo=""
   local vst ast b_timing b_ts b_vts b_vinfo b_ainfo b_fast b_gap n_vst n_ast n_gap negts=0 c
-  local after_timing="?" after_ts="?" after_fast="?" nsubs extra_audio
-  local -a vreasons=() areasons=() fargs=() venc=() aargs=() fast=()
+  local after_timing="?" after_ts="?" after_fast="?" nsubs extra_audio src_dur rescued=0 rstat rvf has_audio out2 vdone=0
+  local -a vreasons=() areasons=() fargs=() venc=() aargs=() fast=() meta=()
   name=$(basename -- "$src"); in_sz=$(fsize "$src")
-  if ! diag_probe "$src"; then err "${tag}Not a (supported) video file: $name"; return 1; fi
+  if ! diag_probe "$src"; then
+    err "${tag}Cannot read this video (damaged or not a video): $name"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (unreadable)" "$src" ""
+    tally fail; return 1
+  fi
   diag_vfr_scan "$src"; diag_faststart "$src"
+  src_dur=$D_DUR; has_audio=$D_ANUM
+  [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
+  case $D_TRC in smpte2084|arib-std-b67) warn "${tag}HDR video: converting to 8-bit SDR can look washed out. Keep the original if colours matter.";; esac
   vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
   dir=$(dirname -- "$src"); base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s fps, 1/%s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
@@ -2305,7 +2457,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   fi
   [[ -n $REPAIR_FPS ]] && { vfix=1; vreasons+=("forced --fps"); }
   extra_audio=$(( D_ANUM > 1 ? D_ANUM - 1 : 0 ))
-  nsubs=$(count_subs "$src")
+  nsubs=$D_NSUBS
   awk -v v="$vst" -v a="$ast" 'BEGIN{ if (v < -0.005 || a < -0.005) exit 1 }' || negts=1
   b_timing="CFR + exact ticks"
   (( D_ROUND )) && b_timing="CFR + rounded ticks"
@@ -2320,6 +2472,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
 
   if (( vfix == 0 && afix == 0 && D_FAST == 1 && negts == 0 )) && [[ $D_FMT == mov ]]; then
     ok "${tag}Already TV-friendly (H.264, constant rate, exact timestamps, safe audio, faststart) - nothing to do."
+    add_result "$name" "$(human "$in_sz")" "-" "0%" "-" "NO FIX NEEDED" "$src" ""
     return 0
   fi
 
@@ -2341,6 +2494,16 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     fi
     vf="fps=$fps_arg"
     if (( D_W % 2 != 0 || D_H % 2 != 0 )); then vf="scale=trunc(iw/2)*2:trunc(ih/2)*2,$vf"; fi
+  fi
+
+  # ---- video filter RESCUE mode would need (target rate + even size), kept ready now
+  rvf=$vf
+  if [[ -z $rvf ]]; then
+    vfps=$D_FPSMED
+    awk -v x="$vfps" 'BEGIN{ exit !(x + 0 > 1) }' || vfps=$(frac2dec "$D_AFPS")
+    read -r fps_arg fps_show < <(snap_fps "$vfps")
+    rvf="fps=$fps_arg"
+    if (( D_W % 2 != 0 || D_H % 2 != 0 )); then rvf="scale=trunc(iw/2)*2:trunc(ih/2)*2,$rvf"; fi
   fi
 
   # ---- plan + confirmation (interactive mode only)
@@ -2379,7 +2542,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
       esac
     done
   else
-    info "${tag}Plan: $tier$( (( vfix )) && printf ' - %s' "$(IFS=', '; printf '%s' "${vreasons[*]}")" )$( (( afix && D_ANUM > 0 )) && printf ' + audio fix' )"
+    info "${tag}Plan: $tier$( (( vfix )) && printf ' - %s' "$(IFS=', '; printf '%s' "${vreasons[*]}")" )$( (( afix && D_ANUM > 0 )) && printf ' + audio fix' )$( (( extra_audio > 0 )) && printf ' (+%d extra audio track(s) dropped)' "$extra_audio" )"
   fi
 
   # ---- run the repair (output is BUILT on fast local storage first, so
@@ -2387,6 +2550,10 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   out=$(unique_file "$dir" "${base}_repaired" "mp4")
   need=$(( in_sz + 65536 ))
   (( vfix )) && need=$(( in_sz * 3 / 4 + 1048576 ))
+  if ! space_check "$dir" "$need"; then
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (no space)" "$src" ""
+    tally fail; return 1
+  fi
   out_tmp "$out" "$need"; tmp=$OT_TMP; CUR_TMP=$tmp
   fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
   mkdir -p "$CONF_DIR" 2>/dev/null
@@ -2416,14 +2583,22 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   # no forced timescale: ffmpeg writes an exact 1/fps base (e.g. 1/24000 with
   # uniform 1001-tick frames) - the old forced 90000 planted rounding on
   # 23.976 fps films, which itself caused gradual drift on TVs
-  fargs+=(-sn -map_metadata -1 -map_chapters -1 -muxdelay 0 -avoid_negative_ts make_zero \
+  fargs+=(-sn -map_metadata -1 -map_chapters -1 "${meta[@]}" -muxdelay 0 -avoid_negative_ts make_zero \
     "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
   run_ffmpeg "repair" 1 1 "${fargs[@]}"
   rc=$?
+  if (( rc != 0 )) || [[ ! -s $tmp ]]; then
+    # ---- RESCUE MODE: damaged data -> skip it and rebuild video + audio cleanly
+    rm -f -- "$tmp"
+    warn "${tag}First attempt failed - trying RESCUE mode (re-encodes everything, skips damaged data)."
+    rescued=1
+    repair_rescue_run
+    rc=$?
+  fi
   CUR_TMP=""
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
-    err "${tag}Repair failed (ffmpeg exit $rc). Last log lines:"
-    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    err "${tag}Repair failed even in rescue mode (ffmpeg exit $rc). Last log lines:"
+    tail -n 6 "${LOGF:-$LOG}" | sed 's/^/    /' >&2
     rm -f -- "$tmp"
     add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED" "$src" ""
     tally fail
@@ -2435,11 +2610,34 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     tally fail
     return 1
   fi
+  keep_dates "$src" "$out"
+  # ---- pre-check: a stream-copied/remuxed file keeps any damage - escalate to RESCUE once
+  if (( rescued == 0 )); then
+    VERIFY_OK=0
+    if diag_probe "$out"; then repair_verify "$out" "$src_dur"; fi
+    (( VERIFY_OK )) && vdone=1
+    if (( ! VERIFY_OK )); then
+      warn "${tag}The result did not pass the check ($VERIFY_NOTE) - rebuilding in RESCUE mode."
+      out2=$(unique_file "$dir" "${base}_repaired" "mp4")
+      out_tmp "$out2" "$(( in_sz * 3 / 4 + 1048576 ))"; tmp=$OT_TMP; CUR_TMP=$tmp
+      fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
+      repair_rescue_run; rc=$?
+      CUR_TMP=""
+      if (( rc == 0 )) && [[ -s $tmp ]] && commit_out "$tmp" "$out2"; then
+        rm -f -- "$out"; mv -f -- "$out2" "$out"; keep_dates "$src" "$out"; rescued=1
+      else
+        warn "${tag}Rescue mode could not improve it - keeping the first result."
+        rm -f -- "$tmp" "$out2"
+      fi
+    fi
+  fi
   (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
   out_sz=$(fsize "$out")
 
-  # ---- verify: show what changed
+  # ---- verify: show what changed, and check the result really is sound
+  VERIFY_OK=0; VERIFY_NOTE="the repaired file cannot be read back"
   if diag_probe "$out" && diag_vfr_scan "$out" && diag_faststart "$out"; then
+    if (( vdone )); then VERIFY_OK=1; VERIFY_NOTE=""; else repair_verify "$out" "$src_dur"; fi
     n_vst=$(num_or0 "$D_VSTART"); n_ast=$(num_or0 "$D_ASTART")
     n_gap=$(awk -v a="$n_ast" -v v="$n_vst" 'BEGIN{ d = a - v; if (d < 0) d = -d; printf "%d", d * 1000 }')
     after_timing="CFR + exact ticks"
@@ -2464,9 +2662,16 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   fi
   saved=$(awk -v a="$in_sz" -v b="$out_sz" 'BEGIN{ if (a+0<=0) { print "0%"; exit }
     d=(1-b/a)*100; printf "%s%.0f%%", (d>=0 ? "-" : "+"), (d>=0 ? d : -d) }')
-  ok "${tag}Repaired: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  (${saved}, $(fmt_time $(( SECONDS - t0 ))))"
+  rstat="REPAIRED"; (( rescued )) && rstat="REPAIRED (rescue)"
+  if (( VERIFY_OK )); then
+    ok "${tag}Repaired + verified: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  (${saved}, $(fmt_time $(( SECONDS - t0 ))))"
+  else
+    warn "${tag}Repaired, but please CHECK the result: $VERIFY_NOTE"
+    rstat="REPAIRED (CHECK)"
+  fi
+  (( rescued )) && info "  Rescue mode skipped damaged data: a few frames may be missing - watch the result once."
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
-  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "REPAIRED" "$src" "$out"
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "$rstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
   return 0
@@ -2474,64 +2679,98 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
 
 quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 (seconds)
   local src=$(readlink -f -- "$1") tag=${2:-}
-  local name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs
-  local -a fargs=() fast=()
-  name=$(basename -- "$src")
-  if ! diag_probe "$src"; then err "${tag}Not a (supported) video file: $name"; return 1; fi
+  local name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs src_dur qstat
+  local s_round s_vfr s_vcodec s_acodec s_arate s_anum
+  local -a fargs=() fast=() meta=()
+  name=$(basename -- "$src"); in_sz=$(fsize "$src")
+  if ! diag_probe "$src"; then
+    err "${tag}Cannot read this video (damaged or not a video): $name"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (unreadable)" "$src" ""
+    tally fail; return 1
+  fi
   diag_vfr_scan "$src"
-  in_sz=$(fsize "$src"); dir=$(dirname -- "$src"); base=${name%.*}
+  src_dur=$D_DUR; nsubs=$D_NSUBS
+  s_round=$D_ROUND; s_vfr=$D_VFR; s_vcodec=$D_VCODEC; s_acodec=$D_ACODEC; s_arate=$D_ARATE; s_anum=$D_ANUM
+  [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
+  dir=$(dirname -- "$src"); base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
     "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(fmt_time "$D_DUR")" "$(human "$in_sz")" "$C_0"
   out=$(unique_file "$dir" "${base}_fixed" "mp4")
+  if ! space_check "$dir" "$(( in_sz + 1048576 ))"; then
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (no space)" "$src" ""
+    tally fail; return 1
+  fi
   out_tmp "$out" "$(( in_sz + 65536 ))"; tmp=$OT_TMP; CUR_TMP=$tmp
   fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
   EDUR=$D_DUR
   mkdir -p "$CONF_DIR" 2>/dev/null
   fargs=(-fflags +genpts -i "$src" -map 0:v:0)
-  (( D_ANUM > 0 )) && fargs+=(-map 0:a:0)
-  fargs+=(-c copy -sn -map_metadata -1 -map_chapters -1 -muxdelay 0 -avoid_negative_ts make_zero \
+  (( s_anum > 0 )) && fargs+=(-map 0:a:0)
+  fargs+=(-c copy -sn -map_metadata -1 -map_chapters -1 "${meta[@]}" -muxdelay 0 -avoid_negative_ts make_zero \
     "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
   run_ffmpeg "quickfix" 1 1 "${fargs[@]}"
   rc=$?; CUR_TMP=""
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     err "${tag}Quick fix failed (ffmpeg exit $rc). Last log lines:"
-    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    tail -n 6 "${LOGF:-$LOG}" | sed 's/^/    /' >&2
     rm -f -- "$tmp"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED (try Auto-Repair)" "$src" ""
     tally fail
     return 1
   fi
   if ! commit_out "$tmp" "$out"; then
     err "${tag}Could not move the fixed file into place."
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED (move)" "$src" ""
     tally fail
     return 1
   fi
-  nsubs=$(count_subs "$src"); (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
+  keep_dates "$src" "$out"
+  (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
   out_sz=$(fsize "$out")
-  ok "${tag}Fixed: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  ($(fmt_time $(( SECONDS - t0 ))))"
-  (( D_ROUND )) && warn "Timestamps are still rounded (gradual TV drift) - run Auto-Repair to rebuild them."
-  (( D_VFR && ! D_ROUND )) && warn "Video is still variable frame rate - run Auto-Repair to stop the drift."
-  [[ $D_VCODEC != h264 ]] && warn "Video codec kept as '$D_VCODEC' - run Auto-Repair to convert to H.264."
-  if (( D_ANUM > 0 )); then
-    case $D_ACODEC in aac|ac3|eac3) ;; *) warn "Audio codec kept as '$D_ACODEC' - run Auto-Repair to convert to AAC.";; esac
-    [[ $D_ARATE == 48000 ]] || warn "Audio kept at ${D_ARATE:-?} Hz - run Auto-Repair to resample to 48 kHz."
+  qstat="QUICKFIXED"
+  VERIFY_OK=0; VERIFY_NOTE="the fixed file cannot be read back"
+  if diag_probe "$out"; then repair_verify "$out" "$src_dur"; fi
+  if (( VERIFY_OK )); then
+    ok "${tag}Fixed + verified: $(basename -- "$out")  $(human "$in_sz") -> $(human "$out_sz")  ($(fmt_time $(( SECONDS - t0 ))))"
+  else
+    warn "${tag}Fixed, but please CHECK the result: $VERIFY_NOTE"; qstat="QUICKFIXED (CHECK)"
+  fi
+  (( s_round )) && warn "Timestamps are still rounded (gradual TV drift) - run Auto-Repair to rebuild them."
+  (( s_vfr && ! s_round )) && warn "Video is still variable frame rate - run Auto-Repair to stop the drift."
+  [[ $s_vcodec != h264 ]] && warn "Video codec kept as '$s_vcodec' - run Auto-Repair to convert to H.264."
+  if (( s_anum > 0 )); then
+    case $s_acodec in aac|ac3|eac3) ;; *) warn "Audio codec kept as '$s_acodec' - run Auto-Repair to convert to AAC.";; esac
+    [[ $s_arate == 48000 ]] || warn "Audio kept at ${s_arate:-?} Hz - run Auto-Repair to resample to 48 kHz."
   fi
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
-  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "QUICKFIXED" "$src" "$out"
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "$qstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
   return 0
 }
 
 sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
-  local src=$(readlink -f -- "$1") ms=$2 off name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs
-  local -a aargs=() fast=()
+  local src=$(readlink -f -- "$1") ms=$2 off name base dir out tmp rc t0=$SECONDS in_sz out_sz nsubs src_dur sstat slack
+  local -a aargs=() fast=() meta=()
+  name=$(basename -- "$src"); in_sz=$(fsize "$src")
   [[ $ms =~ ^-?[0-9]+$ ]] || { err "Shift must be a number of milliseconds (e.g. 250 or -250)."; return 1; }
   (( ms == 0 )) && { err "A shift of 0 ms does nothing."; return 1; }
   (( ms > 10000 || ms < -10000 )) && { err "Use a shift between -10000 and 10000 ms."; return 1; }
-  if ! diag_probe "$src"; then err "Not a (supported) video file."; return 1; fi
-  (( D_ANUM > 0 )) || { err "This file has no audio track."; return 1; }
+  if ! diag_probe "$src"; then
+    err "Cannot read this video (damaged or not a video): $name"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (unreadable)" "$src" ""
+    tally fail; return 1
+  fi
+  if (( D_ANUM == 0 )); then
+    err "This file has no audio track: $name"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (no audio)" "$src" ""
+    tally fail; return 1
+  fi
+  src_dur=$D_DUR; nsubs=$D_NSUBS
+  [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
   off=$(awk -v m="$ms" 'BEGIN{ printf "%.3f", m / 1000 }')
-  name=$(basename -- "$src"); base=${name%.*}; dir=$(dirname -- "$src"); in_sz=$(fsize "$src")
+  slack=$(awk -v m="$ms" 'BEGIN{ if (m < 0) m = -m; printf "%.3f", m / 1000 }')
+  base=${name%.*}; dir=$(dirname -- "$src")
   if (( ms > 0 )); then info "Delaying audio by ${ms} ms (audio was too early)."
   else info "Advancing audio by ${ms#-} ms (audio was too late)."; fi
   case $D_ACODEC in
@@ -2540,35 +2779,46 @@ sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
        warn "Audio re-encoded to AAC ('$D_ACODEC' is not safe in MP4).";;
   esac
   out=$(unique_file "$dir" "${base}_shifted" "mp4")
+  if ! space_check "$dir" "$(( in_sz + 1048576 ))"; then
+    add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (no space)" "$src" ""
+    tally fail; return 1
+  fi
   out_tmp "$out" "$(( in_sz + 65536 ))"; tmp=$OT_TMP; CUR_TMP=$tmp
   fast=(-movflags +faststart); (( OT_DIRECT )) && fast=()
   EDUR=$D_DUR
   mkdir -p "$CONF_DIR" 2>/dev/null
   run_ffmpeg "shift" 1 1 -i "$src" -itsoffset "$off" -i "$src" \
-    -map 0:v:0 -map 1:a:0 -c:v copy "${aargs[@]}" -sn -map_metadata -1 \
+    -map 0:v:0 -map 1:a:0 -c:v copy "${aargs[@]}" -sn -map_metadata -1 "${meta[@]}" \
     -avoid_negative_ts make_zero -muxdelay 0 "${fast[@]}" \
     -max_muxing_queue_size 4096 -f mp4 "$tmp"
   rc=$?; CUR_TMP=""
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     err "Audio shift failed (ffmpeg exit $rc). Last log lines:"
-    tail -n 6 "$LOG" | sed 's/^/    /' >&2
+    tail -n 6 "${LOGF:-$LOG}" | sed 's/^/    /' >&2
     rm -f -- "$tmp"
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED" "$src" ""
     tally fail
     return 1
   fi
   if ! commit_out "$tmp" "$out"; then
     err "Could not move the shifted file into place."
+    add_result "$name" "$(human "$in_sz")" "-" "-" "$(fmt_time $(( SECONDS - t0 )))" "FAILED (move)" "$src" ""
     tally fail
     return 1
   fi
-  nsubs=$(count_subs "$src"); (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
+  keep_dates "$src" "$out"
+  (( nsubs > 0 )) && extract_subs_silent "$src" "${out%.*}"
   out_sz=$(fsize "$out")
+  sstat="SHIFTED"
+  VERIFY_OK=0; VERIFY_NOTE="the shifted file cannot be read back"
   if diag_probe "$out"; then
     ok "New start times - video: $(num_or0 "$D_VSTART") s, audio: $(num_or0 "$D_ASTART") s"
+    repair_verify "$out" "$(awk -v d="$src_dur" -v o="$off" 'BEGIN{ printf "%.3f", d + ((o > 0) ? o : 0) }')" "$slack"
   fi
-  ok "Shifted file: $(pretty "$out")  ($(human "$in_sz") -> $(human "$out_sz"))"
+  if (( VERIFY_OK )); then ok "Shifted + verified: $(pretty "$out")  ($(human "$in_sz") -> $(human "$out_sz"))"
+  else warn "Shifted, but please CHECK the result: $VERIFY_NOTE"; sstat="SHIFTED (CHECK)"; fi
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
-  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "SHIFTED" "$src" "$out"
+  add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "$sstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
   return 0
@@ -2584,7 +2834,8 @@ shift_audio_dialog() {   # $1 video
   return 0
 }
 
-repair_batch() {   # repair every queued video (sequential or -j parallel)
+queue_run() {   # $1 label  $2 function(src, tag): runs it over the WHOLE queue, one after another (or -j in parallel)
+  local label=$1 fn=$2
   (( ${#SELECTED[@]} )) || { err "No videos selected."; return 1; }
   local prev_auto=$REPAIR_AUTO
   REPAIR_AUTO=1
@@ -2597,14 +2848,14 @@ repair_batch() {   # repair every queued video (sequential or -j parallel)
   local i=0 n=${#SELECTED[@]} f st a b running=0
   (( n > 1 )) && calc_threads "$PARALLEL_JOBS" || calc_threads 1
   if (( PARALLEL_JOBS > 1 && n > 1 )); then
-    info "Parallel repair: up to $PARALLEL_JOBS files at once ($n total, $THREADS_PER_JOB threads each)"
+    info "$label: up to $PARALLEL_JOBS files at once ($n total, $THREADS_PER_JOB threads each)"
     for f in "${SELECTED[@]}"; do
       i=$(( i + 1 ))
       while (( running >= PARALLEL_JOBS )); do wait -n || true; running=$(( running - 1 )); done
       printf '%s[%d/%d] %s%s\n' "$C_B" "$i" "$n" "$(trunc "$(basename -- "$f")")" "$C_0"
       (
         SIMPLE=1 LOGF="$BATCH_TMP/log_$i" STATS="$BATCH_TMP/stats" RESULT_FILE="$BATCH_TMP/results"
-        REPAIR_AUTO=1 repair_file "$f" "[$i/$n] "
+        REPAIR_AUTO=1 "$fn" "$f" "[$i/$n] "
       ) &
       running=$(( running + 1 ))
     done
@@ -2622,43 +2873,175 @@ repair_batch() {   # repair every queued video (sequential or -j parallel)
   else
     for f in "${SELECTED[@]}"; do
       i=$(( i + 1 ))
-      printf '\n%s== Repair [%d/%d]: %s ==%s\n' "$C_B" "$i" "$n" "$(basename -- "$f")" "$C_0"
-      repair_file "$f" "[$i/$n] " || true
+      printf '\n%s== %s [%d/%d]: %s ==%s\n' "$C_B" "$label" "$i" "$n" "$(basename -- "$f")" "$C_0"
+      "$fn" "$f" "[$i/$n] " || true
+      printf '  %s%d of %d done  (ok %d, failed %d)%s\n' "$C_D" "$i" "$n" "$N_OK" "$N_FAIL" "$C_0"
     done
   fi
   rm -rf "$BATCH_TMP"; BATCH_TMP=""
   wake_unlock
   print_summary
-  notify "Repair finished: $N_OK ok, $N_FAIL failed"
+  notify "$label finished: $N_OK ok, $N_FAIL failed"
   REPAIR_AUTO=$prev_auto
   (( N_FAIL == 0 ))
 }
+repair_batch() { queue_run "Repair" repair_file; }
+q_shift()      { sync_shift_file "$1" "$QUEUE_MS"; }
+ask_shift_ms() {   # asks ONCE -> QUEUE_MS (valid, non-zero) ; 1 = cancelled
+  local ms
+  echo " Positive = delay the audio (sound is too early)."
+  echo " Negative = advance the audio (sound is too late)."
+  echo " Example: 250    or    -250        (applies to every queued video)"
+  ms=$(ask "Shift audio by (ms)" "")
+  [[ $ms =~ ^-?[0-9]+$ ]] && (( ms != 0 && ms >= -10000 && ms <= 10000 )) || { [[ -n $ms ]] && warn "Use a whole number of ms between -10000 and 10000, not 0."; return 1; }
+  QUEUE_MS=$ms
+}
+diag_queue() {   # diagnose every queued video; offers to repair exactly the ones with problems
+  local f i=0 n=${#SELECTED[@]} brief=0 np pr bad=0 good=0 unread=0
+  local -a fix=() saved=()
+  (( n > 3 )) && brief=1
+  for f in "${SELECTED[@]}"; do
+    i=$(( i + 1 ))
+    if (( brief )); then
+      diag_report "$f" >/dev/null 2>&1; np=$DIAG_NPROBS
+      if   (( np < 0 )); then printf ' %s[%d/%d]%s %s✘%s %s - cannot be read\n' "$C_D" "$i" "$n" "$C_0" "$C_R" "$C_0" "$(trunc "$(basename -- "$f")")"; unread=$(( unread + 1 ))
+      elif (( np == 0 )); then printf ' %s[%d/%d]%s %s✔%s %s - ok\n' "$C_D" "$i" "$n" "$C_0" "$C_G" "$C_0" "$(trunc "$(basename -- "$f")")"; good=$(( good + 1 ))
+      else
+        printf ' %s[%d/%d]%s %s!%s %s - %d problem(s)\n' "$C_D" "$i" "$n" "$C_0" "$C_Y" "$C_0" "$(trunc "$(basename -- "$f")")" "$np"
+        for pr in "${DIAG_PROBS[@]}"; do printf '          %s%s%s\n' "$C_D" "$(trunc "$pr")" "$C_0"; done
+        fix+=("$f"); bad=$(( bad + 1 ))
+      fi
+    else
+      diag_report "$f" || true; np=$DIAG_NPROBS
+      if   (( np < 0 )); then unread=$(( unread + 1 ))
+      elif (( np == 0 )); then good=$(( good + 1 ))
+      else fix+=("$f"); bad=$(( bad + 1 )); fi
+    fi
+  done
+  (( n > 1 )) && printf '\n%s== Diagnosis finished ==%s  %d ok, %d need repair, %d unreadable\n' "$C_B" "$C_0" "$good" "$bad" "$unread"
+  if (( bad > 0 )) && [[ -t 0 ]] && yesno "Auto-repair the $bad video(s) with problems now, one after another?" y; then
+    saved=("${SELECTED[@]}"); SELECTED=("${fix[@]}")
+    repair_batch
+    SELECTED=("${saved[@]}")
+  fi
+  return 0
+}
+need_queue() {   # opens the finder when the queue is empty
+  (( ${#SELECTED[@]} )) || find_videos multi
+  (( ${#SELECTED[@]} )) || { warn "Nothing selected."; sleep 1; return 1; }
+}
+
+queue_pick() {   # $1 label -> PICKED = the chosen part of the queue (one, several or all). 1 = cancelled
+  local label=$1 n=${#SELECTED[@]} i ans tok lo hi k added
+  local -A got=()
+  PICKED=()
+  (( n == 0 )) && return 1
+  if (( n == 1 )) || ! [[ -t 0 && -t 1 ]]; then PICKED=("${SELECTED[@]}"); return 0; fi
+  printf '\n%s%s%s - which of your %d queued videos?\n' "$C_B" "$label" "$C_0" "$n"
+  for (( i = 0; i < n && i < 30; i++ )); do
+    fsize_v "${SELECTED[i]}"
+    printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "$FSZ")" "$(trunc "$(basename -- "${SELECTED[i]}")")"
+  done
+  (( n > 30 )) && printf '  %s... %d more (their numbers work too)%s\n' "$C_D" $(( n - 30 )) "$C_0"
+  echo " a or Enter = ALL     one number = just that video"
+  echo " several: 1 3 5-7     b = cancel"
+  while true; do
+    read -r -p "> " ans || return 1
+    ans=${ans//,/ }
+    case ${ans,,} in
+      ""|a|all) PICKED=("${SELECTED[@]}"); return 0;;
+      b|0|q) return 1;;
+    esac
+    got=(); PICKED=(); added=0
+    for tok in $ans; do
+      if   [[ $tok =~ ^[0-9]+$ ]]; then lo=$tok; hi=$tok
+      elif [[ $tok =~ ^([0-9]+)-([0-9]+)$ ]]; then lo=${BASH_REMATCH[1]}; hi=${BASH_REMATCH[2]}
+      else continue; fi
+      for (( k = lo; k <= hi; k++ )); do
+        if (( k >= 1 && k <= n )) && [[ -z ${got[$k]-} ]]; then got[$k]=1; PICKED+=("${SELECTED[k-1]}"); added=$(( added + 1 )); fi
+      done
+    done
+    (( added > 0 )) && return 0
+    warn "Type a (all), one number, or several like 1 3 5-7."
+  done
+}
+run_on_picked() {   # $1 label, rest = command; runs it with the queue temporarily narrowed to the picked videos
+  local label=$1 rc
+  shift
+  queue_pick "$label" || return 1
+  local -a saved=("${SELECTED[@]}")
+  SELECTED=("${PICKED[@]}")
+  "$@"; rc=$?
+  SELECTED=("${saved[@]}")
+  return $rc
+}
+_rm_repair() { if (( ${#SELECTED[@]} == 1 )); then repair_file "${SELECTED[0]}"; else repair_batch; fi; }
+_rm_quick()  { if (( ${#SELECTED[@]} == 1 )); then REPAIR_AUTO=0 quickfix_file "${SELECTED[0]}"; else queue_run "Quick fix" quickfix_file; fi; }
+_rm_shift()  {
+  ask_shift_ms || return 1
+  if (( ${#SELECTED[@]} == 1 )); then sync_shift_file "${SELECTED[0]}" "$QUEUE_MS"; else queue_run "Audio shift" q_shift; fi
+}
+tool_on_queue() {   # $1 function (uses pick_target)  $2 label: one video, several or all of the queue
+  local fn=$1 label=$2 n f i=0 okc=0 failc=0 rc
+  local -a failed=()
+  if (( ${#SELECTED[@]} == 0 )) && [[ -t 0 && -t 1 ]]; then
+    info "$label: pick the videos (a = all of them, numbers, or type a name)"
+    find_videos multi
+  fi
+  (( ${#SELECTED[@]} )) || { warn "Nothing selected."; return 1; }
+  queue_pick "$label" || return 1
+  n=${#PICKED[@]}
+  if (( n == 1 )); then
+    FORCE_TARGET=${PICKED[0]}; "$fn"; rc=$?; FORCE_TARGET=""
+    return $rc
+  fi
+  info "$n videos, one after another - the same settings are used for each (asked once)."
+  ASK_MEMO_DIR=$(mktemp -d) || { ASK_MEMO_DIR=""; err "Cannot create temp dir."; return 1; }
+  wake_lock
+  for f in "${PICKED[@]}"; do
+    i=$(( i + 1 ))
+    printf '\n%s== %s [%d/%d]: %s ==%s\n' "$C_B" "$label" "$i" "$n" "$(basename -- "$f")" "$C_0"
+    FORCE_TARGET=$f
+    if "$fn"; then okc=$(( okc + 1 )); else failc=$(( failc + 1 )); failed+=("$(basename -- "$f")"); fi
+  done
+  FORCE_TARGET=""; rm -rf -- "$ASK_MEMO_DIR"; ASK_MEMO_DIR=""
+  wake_unlock
+  printf '\n%s== %s finished ==%s  %d ok, %d failed\n' "$C_B" "$label" "$C_0" "$okc" "$failc"
+  for f in "${failed[@]}"; do printf '   %s✘%s %s\n' "$C_R" "$C_0" "$f"; done
+  notify "$label finished: $okc ok, $failc failed"
+  return 0
+}
 
 repair_menu() {
-  local vid="" c
+  local c n i
   while true; do
     clear_screen
+    n=${#SELECTED[@]}
     printf '%s== Repair & Sync ==%s\n\n' "$C_B" "$C_0"
-    if [[ -n $vid ]]; then printf ' Target: %s\n' "$(trunc "$(pretty "$vid")")"
-    else printf ' Target: (none selected)\n'; fi
+    if (( n == 0 )); then printf ' Queue: empty - press 1 to choose videos\n'
+    elif (( n == 1 )); then printf ' Queue: %s\n' "$(trunc "$(pretty "${SELECTED[0]}")")"
+    else
+      printf ' Queue: %d videos - handled one after another, automatically\n' "$n"
+      for (( i = 0; i < n && i < 4; i++ )); do printf '   %s- %s%s\n' "$C_D" "$(trunc "$(basename -- "${SELECTED[i]}")")" "$C_0"; done
+      (( n > 4 )) && printf '   %s... and %d more%s\n' "$C_D" $(( n - 4 )) "$C_0"
+    fi
     printf ' Fixes audio/video drift and playback problems on TVs & USB players.\n\n'
-    echo " 1) Select target video"
-    echo " 2) Diagnose (check sync & TV compatibility)"
-    echo " 3) Auto-Repair (smart tiers + turbo - re-encodes only what is broken)"
-    echo " 4) Quick fix (seconds - faststart + clean MP4, no re-encode)"
-    echo " 5) Shift audio by +/- milliseconds (constant early/late audio)"
-    echo " 6) Repair all queued videos (batch, uses -j parallel jobs)"
+    echo " 1) Choose videos (add to the queue)"
+    echo " 2) Diagnose (find out which ones need fixing)"
+    echo " 3) Auto-Repair (fixes only what is broken)"
+    echo " 4) Quick fix (seconds each, no re-encode)"
+    echo " 5) Shift audio by +/- milliseconds"
+    echo "    (2-5 ask which of the queued videos: one, several or all)"
+    echo " 6) View / edit the queue"
     echo " b) back"
     read -r -p "> " c || return
     case $c in
-      1) if pick_target; then vid=$PICK_RESULT; ok "Target: $(basename -- "$vid")"; fi;;
-      2) if [[ -n $vid ]]; then diag_report "$vid"; pause; fi;;
-      3) if [[ -n $vid ]]; then repair_file "$vid"; pause; fi;;
-      4) if [[ -n $vid ]]; then quickfix_file "$vid"; pause; fi;;
-      5) if [[ -n $vid ]]; then shift_audio_dialog "$vid"; pause; fi;;
-      6) if (( ${#SELECTED[@]} )); then
-           repair_batch; pause
-         else warn "Queue is empty - choose videos from the main menu first."; fi;;
+      1) find_videos multi;;
+      2) need_queue && { run_on_picked "Diagnose" diag_queue; pause; };;
+      3) need_queue && { run_on_picked "Auto-Repair" _rm_repair; pause; };;
+      4) need_queue && { run_on_picked "Quick fix" _rm_quick; pause; };;
+      5) need_queue && { run_on_picked "Shift audio" _rm_shift; pause; };;
+      6) queue_menu;;
       b|B|"") return;;
     esac
   done
@@ -2688,7 +3071,9 @@ make_gif() {
     yesno "Open it now?" n && open_file "$out"
   else
     err "GIF creation failed."; tail -n 5 "$LOG" >&2
+    return 1
   fi
+  return 0
 }
 
 extract_audio() {
@@ -2725,7 +3110,9 @@ extract_audio() {
     yesno "Open it now?" n && open_file "$out"
   else
     err "Audio extraction failed."; tail -n 5 "$LOG" >&2
+    return 1
   fi
+  return 0
 }
 
 make_thumb() {
@@ -2745,7 +3132,7 @@ make_thumb() {
          ok "Saved: $(pretty "$out")"
          yesno "Open it now?" n && open_file "$out"
        else
-         err "Screenshot failed."
+         err "Screenshot failed."; return 1
        fi;;
     2) iv=$(awk -v d="$DUR" 'BEGIN{ if (d<9) d=9; printf "%.3f", d/9 }')
        out=$(unique_file "$(dirname -- "$src")" "${base}_sheet" "jpg")
@@ -2765,6 +3152,7 @@ make_thumb() {
        yesno "Open it now?" n && open_file "$out";;
     *) return 1;;
   esac
+  return 0
 }
 
 # --------------------------------------------------------------- info tools ---
@@ -3714,9 +4102,9 @@ tools_menu() {
     echo " 1) Video info (selected files)"
     echo " 2) Estimate output size (20 s test encode)"
     echo " 3) Subtitle studio (add / extract / remove SRT)"
-    echo " 4) Make GIF from a video"
-    echo " 5) Extract audio (MP3 / M4A)"
-    echo " 6) Thumbnail / contact sheet"
+    echo " 4) Make GIF from a video          (one or many)"
+    echo " 5) Extract audio (MP3 / M4A)       (one or many)"
+    echo " 6) Thumbnail / contact sheet       (one or many)"
     echo " 7) Check installation / encoders"
     echo " 8) Setup (install ffmpeg, storage access)"
     echo " 9) Install 'vc' command"
@@ -3726,12 +4114,12 @@ tools_menu() {
     echo " b) back"
     read -r -p "> " c || exit 0
     case $c in
-      1) show_info; pause;;
+      1) need_queue && { run_on_picked "Video info" show_info; pause; };;
       2) estimate_size; pause;;
       3) sub_studio;;
-      4) make_gif; pause;;
-      5) extract_audio; pause;;
-      6) make_thumb; pause;;
+      4) tool_on_queue make_gif "Make GIF"; pause;;
+      5) tool_on_queue extract_audio "Extract audio"; pause;;
+      6) tool_on_queue make_thumb "Thumbnail"; pause;;
       7) check_deps; pause;;
       8) do_setup; pause;;
       9) do_install; pause;;
@@ -4158,17 +4546,19 @@ main() {
     case $REPAIR_ACTION in
       diagnose)
         (( ${#SELECTED[@]} )) || { err "Usage: vc --diagnose FILE"; exit 1; }
-        for rf in "${SELECTED[@]}"; do diag_report "$rf" || true; done
+        diag_queue
         exit 0;;
       quickfix)
         (( ${#SELECTED[@]} )) || { err "Usage: vc --quickfix FILE"; exit 1; }
         REPAIR_AUTO=1
-        for rf in "${SELECTED[@]}"; do quickfix_file "$rf"; done
-        exit 0;;
+        queue_run "Quick fix" quickfix_file
+        exit $?;;
       shift)
-        (( ${#SELECTED[@]} == 1 )) || { err "Usage: vc --sync-shift MS FILE (exactly one file)"; exit 1; }
+        (( ${#SELECTED[@]} )) || { err "Usage: vc --sync-shift MS FILE [FILE ...]"; exit 1; }
         REPAIR_AUTO=1
-        sync_shift_file "${SELECTED[0]}" "$REPAIR_SHIFT_MS"
+        if (( ${#SELECTED[@]} == 1 )); then sync_shift_file "${SELECTED[0]}" "$REPAIR_SHIFT_MS"; exit $?; fi
+        QUEUE_MS=$REPAIR_SHIFT_MS
+        queue_run "Audio shift" q_shift
         exit $?;;
       repair)
         if (( ${#SELECTED[@]} )); then
