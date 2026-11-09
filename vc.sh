@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v2.8 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v3.1 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -17,6 +17,31 @@
 #     vc --tune               # AUTO-TUNE: test this phone, pick + save the fastest settings
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 3.1:
+#   + REPAIR LAB (Repair menu 7, or vc --repair-lab FILE): runs every repair method on
+#     your video (quick remux, smart Auto-Repair, full rebuild, rescue, MP4Box and
+#     untrunc when installed), measures time + size, re-checks each result (does it
+#     play to the end, are problems left?) and keeps the fastest result that is
+#     completely fixed. Unreadable MP4s also get MP4Box / untrunc automatically.
+#   + AUTO-INSTALLER (vc --setup, Tools 8): installs ffmpeg and every helper the
+#     features need (openssl, xz, tar, gpac/MP4Box, util-linux, less, termux-api ...)
+#     one by one, with retries and a clear table of what worked. vc --doctor shows
+#     the status. Missing helpers are also offered on the spot when a feature needs one.
+#   + Fixed: -k vp9 was rejected on the command line.
+#
+#  What's new in 3.0:
+#   + FORMATS: reads far more video formats (MPEG/VOB/TS/M2TS, WMV/ASF, FLV, RM/RMVB,
+#     OGV, MXF, DV, 3GP, raw H.264/H.265 and more - anything ffmpeg can decode works,
+#     also files with unusual extensions when you type the path). Output containers:
+#     MP4, MKV, WebM, MOV, AVI, TS (vc picks matching codecs: WebM = VP9/AV1 + Opus,
+#     AVI = H.264 + MP3, subtitles only where the container can hold them).
+#   + NEW CODEC: VP9 (+ preset "web" -> WebM) next to x265, x264, AV1, hardware.
+#   + Interlaced sources (DVD, TV recordings) are deinterlaced automatically (also in
+#     Repair); optional AUTO-CROP removes black bars (smaller files).
+#   + .w6w VAULT: a new container that holds videos, pictures, audio, text, scripts,
+#     subtitles... encrypted. vc detects what each item is, and can list, play,
+#     extract and convert them. See menu w or: vc --w6w
 #
 #  What's new in 2.8:
 #   + PICK FROM THE QUEUE: in Repair & Sync and in the Tools (GIF / audio / thumbnails /
@@ -135,16 +160,16 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="2.8"
+VERSION="3.1"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
 CONF="$CONF_DIR/settings.conf"
 PROF_DIR="$CONF_DIR/profiles"
 LOG="$CONF_DIR/last_run.log"
-VIDEO_EXT='mp4|mkv|mov|avi|webm|3gp|m4v|flv|ts|mpg|mpeg|wmv|mts|m2ts'
-SETTING_VARS="CODEC CRF VBR SPEED HEIGHT FPS ABR AUDIO TARGET_MB DENOISE STRIP_META OUTDIR SUFFIX PRESET_NAME PARALLEL_JOBS KEEP_SUBS SUB_MODE SUB_FILE SUB_LANG SUB_SIZE SUB_COLOR OUT_EXT FINISH_ACTION SKIP_DONE FRAME_FMT FRAME_Q FRAME_STEP FRAME_H SCALER CORES THREADS"
-PRESET_LIST="balanced quality small tiny social compat fast turbo target hardware av1"
+VIDEO_EXT='mp4|m4v|mov|qt|mkv|mk3d|webm|avi|divx|xvid|wmv|asf|wm|flv|f4v|3gp|3g2|3gpp|mpg|mpeg|mpe|m1v|m2v|mpv|ts|m2ts|mts|m2t|tp|trp|vob|ogv|ogm|rm|rmvb|mxf|dv|dif|mj2|y4m|ivf|nut|gxf|amv|bik|smk|vro|evo|wtv|dvr-ms|mjpeg|mjpg|h264|264|h265|265|hevc|avc|vc1|lrv|insv|mp4v'
+SETTING_VARS="CODEC CRF VBR SPEED HEIGHT FPS ABR AUDIO TARGET_MB DENOISE STRIP_META OUTDIR SUFFIX PRESET_NAME PARALLEL_JOBS KEEP_SUBS SUB_MODE SUB_FILE SUB_LANG SUB_SIZE SUB_COLOR OUT_EXT FINISH_ACTION SKIP_DONE FRAME_FMT FRAME_Q FRAME_STEP FRAME_H SCALER CORES THREADS DEINT AUTOCROP"
+PRESET_LIST="balanced quality small tiny social compat fast turbo target hardware av1 web"
 
 # ------------------------------------------------------------------ colors ---
 if [[ -t 1 ]]; then
@@ -206,6 +231,8 @@ NOQUALITY=0; SSIM_VAL=""; NOW_US=0; CPU_MODE=0
 declare -a CPU_CAP=() CPU_FREQ=() CPU_PART=() CPU_BIGIDX=()
 RACE_LEN=8; TUNE_GOAL=""; TUNE_PICK=""; TUNE_WHY=""; AGE_TXT=""; TUNE_MODE=0
 ASK_MEMO_DIR=""; FORCE_TARGET=""; QUEUE_MS=""; VERIFY_OK=1; VERIFY_NOTE=""; DIAG_NPROBS=-1
+REPAIR_FORCE=""; REPAIR_OUTDIR=""; REPAIR_REF=""; RM_OUT=""; SETUP_LOG=""; LAB_SAMPLE=0
+AENC_NAME=aac; CT_SUBS=mov_text; CT_FMT=mp4; CT_FAST=1; CT_STAGE=1; CT_HVC=1; CROP_VF=""; SRC_FIELD=""; D_FIELD=""
 FV_ROOT=""; FV_REAL=""
 declare -a PICKED=()
 declare -a DIAG_PROBS=()
@@ -239,6 +266,7 @@ human() {   # bytes -> "1.5 GB" / "12.3 MB" / "800 KB" (pure bash, no forks)
   [[ $b =~ ^[0-9]+$ ]] || b=0
   if   (( b >= 1073741824 )); then x=$(( (b * 100 + 536870912) / 1073741824 )); printf '%d.%02d GB' $(( x / 100 )) $(( x % 100 ))
   elif (( b >= 1048576 ));    then x=$(( (b * 10 + 524288) / 1048576 ));        printf '%d.%d MB' $(( x / 10 )) $(( x % 10 ))
+  elif (( b < 1024 )); then printf '%d B' "$b"
   else printf '%d KB' $(( (b + 512) / 1024 )); fi
 }
 fmt_time() {   # seconds -> hh:mm:ss (pure bash)
@@ -629,6 +657,7 @@ preset_desc() {
     target)   echo "H.265 two-pass, 720p, ~95 MB (change size in Settings)";;
     hardware) echo "Phone's hardware H.265 encoder - very fast, experimental";;
     av1)      echo "AV1 (SVT-AV1) - next-gen, ~30% smaller than H.265";;
+    web)      echo "VP9 + Opus in WebM, 720p - websites, Chrome/Firefox";;
   esac
 }
 apply_preset() {
@@ -647,6 +676,7 @@ apply_preset() {
     target)   TARGET_MB=95;;
     hardware) CODEC=hw265;;
     av1)      CODEC=av1; CRF=34;;
+    web)      CODEC=vp9; CRF=34; SPEED=veryfast;;
     *) return 1;;
   esac
 }
@@ -657,7 +687,7 @@ set_defaults() {
   PARALLEL_JOBS=1; KEEP_SUBS=1; SUB_MODE="soft"; SUB_FILE=""
   SUB_LANG="fa"; SUB_SIZE=24; SUB_COLOR="&H00FFFFFF"
   OUT_EXT="mp4"; FINISH_ACTION="menu"
-  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"; CORES="all"; THREADS=0
+  SKIP_DONE=0; FRAME_FMT="jpg"; FRAME_Q=2; FRAME_STEP=1; FRAME_H=0; SCALER="bicubic"; CORES="all"; THREADS=0; DEINT=1; AUTOCROP=0
 }
 
 # ------------------------------------------------------ settings & profiles ---
@@ -671,8 +701,15 @@ codec_label() {
     x265)  echo "H.265 / HEVC (libx265)";;
     x264)  echo "H.264 / AVC (libx264)";;
     av1)   echo "AV1 (SVT-AV1) - next-gen";;
+    vp9)   echo "VP9 (libvpx-vp9) - WebM / web";;
     hw265) echo "H.265 hardware (MediaCodec, experimental)";;
     hw264) echo "H.264 hardware (MediaCodec, experimental)";;
+  esac
+}
+vp9_cpu() {   # x265-style speed names -> libvpx-vp9 cpu-used (0 slowest .. 5 fastest useful)
+  case $SPEED in
+    veryslow) echo 0;; slower|slow) echo 1;; medium) echo 2;; fast) echo 3;;
+    faster|veryfast) echo 4;; *) echo 5;;
   esac
 }
 svt_preset_num() {   # map x265-style speed names to SVT-AV1 preset numbers
@@ -734,18 +771,19 @@ plan_line() {
 
 # --------------------------------------------------------------- probing -----
 probe() {   # one ffprobe call -> DUR + SRC_* (video, audio, subtitle info)
-  local f=$1 line kv k v ctype codec w h rfr afr br pix trc ach dur
+  local f=$1 line kv k v ctype codec w h rfr afr br pix trc ach dur fo
   local vdone=0 adone=0
   local -a P
-  DUR=""; SRC_VCODEC=""; SRC_W=""; SRC_H=""; SRC_FPS=0; SRC_AFPS=0; SRC_VBR=""; SRC_PIX=""; SRC_TRC=""
+  DUR=""; SRC_VCODEC=""; SRC_W=""; SRC_H=""; SRC_FPS=0; SRC_AFPS=0; SRC_VBR=""; SRC_PIX=""; SRC_TRC=""; SRC_FIELD=""
   SRC_ACODEC=""; SRC_ABR=""; SRC_ACH=0; SRC_NSUBS=0; SRC_SUBBAD=0
   [[ -f $f ]] || { err "Not a file: $f"; return 1; }
   while IFS= read -r line; do
-    ctype=""; codec=""; w=""; h=""; rfr=""; afr=""; br=""; pix=""; trc=""; ach=""; dur=""
+    ctype=""; codec=""; w=""; h=""; rfr=""; afr=""; br=""; pix=""; trc=""; ach=""; dur=""; fo=""
     IFS='|' read -ra P <<<"$line"
     for kv in "${P[@]:1}"; do
       k=${kv%%=*}; v=${kv#*=}
       case $k in
+        field_order)     fo=$v;;
         codec_type)      ctype=$v;;
         codec_name)      codec=$v;;
         width)           w=$v;;
@@ -765,7 +803,7 @@ probe() {   # one ffprobe call -> DUR + SRC_* (video, audio, subtitle info)
         case $ctype in
           video)
             if (( ! vdone )); then
-              vdone=1; SRC_VCODEC=$codec; SRC_W=$w; SRC_H=$h; SRC_PIX=$pix; SRC_TRC=$trc
+              vdone=1; SRC_VCODEC=$codec; SRC_W=$w; SRC_H=$h; SRC_PIX=$pix; SRC_TRC=$trc; SRC_FIELD=$fo
               ratio_dec "$rfr" 2; SRC_FPS=$RATIO
               ratio_dec "$afr" 3; SRC_AFPS=$RATIO
               [[ $br =~ ^[0-9]+$ ]] && SRC_VBR=$(( br / 1000 ))
@@ -782,7 +820,7 @@ probe() {   # one ffprobe call -> DUR + SRC_* (video, audio, subtitle info)
         esac;;
     esac
   done < <(ffprobe -v error -show_entries \
-    'format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,pix_fmt,color_transfer,channels' \
+    'format=duration:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,pix_fmt,color_transfer,channels,field_order' \
     -of compact -- "$f" 2>/dev/null)
   [[ $DUR =~ ^[0-9]+(\.[0-9]+)?$ ]] || { err "Cannot read duration: $(basename -- "$f")"; return 1; }
   [[ -n $SRC_VCODEC ]] || { err "No video stream: $(basename -- "$f")"; return 1; }
@@ -911,9 +949,14 @@ calc_bitrate() {   # video kbps needed to hit TARGET_MB (decimal MB, 3% safety m
   awk -v mb="$TARGET_MB" -v d="$EDUR" -v a="$a" \
     'BEGIN{ v = mb*8000*0.97/d - a; if (v < 40) exit 1; printf "%d", v }'
 }
-audio_plan() {   # AUD_COPY=1 when the source audio is already AAC at/below the target (copy = faster, no generation loss)
+audio_plan() {   # AUD_COPY=1 when the source audio is already the target codec at/below the target bitrate
   AUD_COPY=0
-  [[ $AUDIO == aac && $SRC_ACODEC == aac ]] || return 0
+  [[ $AUDIO == aac ]] || return 0
+  case $AENC_NAME in
+    libopus)    [[ $SRC_ACODEC == opus ]] || return 0;;
+    libmp3lame) [[ $SRC_ACODEC == mp3 ]]  || return 0;;
+    *)          [[ $SRC_ACODEC == aac ]]  || return 0;;
+  esac
   [[ $SRC_ABR =~ ^[0-9]+$ ]] && (( SRC_ABR > 0 && SRC_ABR <= ABR )) || return 0
   if (( ABR <= 48 )); then (( SRC_ACH == 1 )) || return 0
   else (( SRC_ACH >= 1 && SRC_ACH <= 2 )) || return 0; fi
@@ -936,14 +979,14 @@ frac2dec() {   # "30000/1001" | "29.97" -> decimal number
 }
 
 _diag_probe_run() {   # $1 file  $2 extra ffprobe flags (split on purpose)
-  local f=$1 extra=$2 line kv k v ctype codec w h pix rfr afr st tb sr ch dur fmt ctime trc
+  local f=$1 extra=$2 line kv k v ctype codec w h pix rfr afr st tb sr ch dur fmt ctime trc fo
   local vdone=0 adone=0
   local -a P
   D_VCODEC=""; D_W=0; D_H=0; D_PIX=""; D_RFPS=""; D_AFPS=""; D_VSTART=""; D_VTB=""
   D_ACODEC=""; D_ARATE=0; D_ACH=0; D_ASTART=""; D_ANUM=0; D_DUR=0; D_FMT=""; D_VTS=0
-  D_CTIME=""; D_TRC=""; D_NSUBS=0; D_VDUR=""; D_ADUR=""
+  D_CTIME=""; D_TRC=""; D_NSUBS=0; D_VDUR=""; D_ADUR=""; D_FIELD=""
   while IFS= read -r line; do
-    ctype=""; codec=""; w=""; h=""; pix=""; rfr=""; afr=""; st=""; tb=""; sr=""; ch=""; dur=""; fmt=""; ctime=""; trc=""
+    ctype=""; codec=""; w=""; h=""; pix=""; rfr=""; afr=""; st=""; tb=""; sr=""; ch=""; dur=""; fmt=""; ctime=""; trc=""; fo=""
     IFS='|' read -ra P <<<"$line"
     for kv in "${P[@]:1}"; do
       k=${kv%%=*}; v=${kv#*=}
@@ -962,6 +1005,7 @@ _diag_probe_run() {   # $1 file  $2 extra ffprobe flags (split on purpose)
         duration)           dur=$v;;
         format_name)        fmt=$v;;
         color_transfer)     trc=$v;;
+        field_order)        fo=$v;;
         tag:creation_time)  ctime=$v;;
       esac
     done
@@ -972,7 +1016,7 @@ _diag_probe_run() {   # $1 file  $2 extra ffprobe flags (split on purpose)
           video)
             if (( ! vdone )); then
               vdone=1; D_VCODEC=$codec; D_W=$w; D_H=$h; D_PIX=$pix; D_RFPS=$rfr; D_AFPS=$afr; D_VSTART=$st; D_VTB=$tb
-              D_TRC=$trc; D_VDUR=$dur
+              D_TRC=$trc; D_VDUR=$dur; D_FIELD=$fo
             fi;;
           audio)
             D_ANUM=$(( D_ANUM + 1 ))
@@ -983,7 +1027,7 @@ _diag_probe_run() {   # $1 file  $2 extra ffprobe flags (split on purpose)
         esac;;
     esac
   done < <(ffprobe -v error $extra -show_entries \
-    'format=duration,format_name:format_tags=creation_time:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base,sample_rate,channels,color_transfer,duration' \
+    'format=duration,format_name:format_tags=creation_time:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,start_time,time_base,sample_rate,channels,color_transfer,duration,field_order' \
     -of compact -- "$f" 2>/dev/null)
 }
 diag_probe() {   # $1 file -> D_* fields; fails when there is no video stream (damaged headers get a bigger probe)
@@ -1166,6 +1210,9 @@ diag_report() {   # $1 file -> human-readable sync / TV-compatibility report
 build_vf() {
   local f=() sf=""
   [[ $SCALER == lanczos ]] && sf=":flags=lanczos"
+  # interlaced sources (DVD, TV recordings): remove the comb lines first
+  case $SRC_FIELD in tt|bb|tb|bt) (( DEINT )) && f+=("yadif=mode=0:parity=-1:deint=1");; esac
+  [[ -n $CROP_VF ]] && f+=("$CROP_VF")
   # frame-rate limit FIRST: dropped frames are never scaled or denoised
   if (( FPS > 0 )) && awk -v s="$SRC_FPS" -v t="$FPS" 'BEGIN{ exit !(s > t+0.5) }'; then
     f+=("fps=$FPS")
@@ -1187,7 +1234,7 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
   case $CODEC in
     x265)
       VENC+=(-c:v libx265 -preset "$SPEED" -pix_fmt yuv420p)
-      [[ $OUT_EXT == mp4 ]] && VENC+=(-tag:v hvc1)
+      (( CT_HVC )) && VENC+=(-tag:v hvc1)
       if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi
       case $pass in
         p1) xp+=":pass=1:stats=$TMPD/x265.stats";;
@@ -1198,6 +1245,7 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
     x264)
       VENC+=(-c:v libx264 -preset "$SPEED" -pix_fmt yuv420p)
       [[ -n $th ]] && VENC+=(-threads "$th")
+      [[ $OUT_EXT == avi ]] && VENC+=(-bf 0)
       if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi
       case $pass in
         p1) VENC+=(-pass 1 -passlogfile "$TMPD/x264");;
@@ -1207,22 +1255,46 @@ build_venc() {   # $1 = single|p1|p2   $2 = video kbps (empty = CRF mode)
       VENC+=(-c:v libsvtav1 -preset "$(svt_preset_num)" -pix_fmt yuv420p)
       [[ -n $th ]] && VENC+=(-threads "$th")
       if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-crf "$CRF"); fi;;
+    vp9)
+      VENC+=(-c:v libvpx-vp9 -pix_fmt yuv420p -row-mt 1 -tile-columns 2 -deadline good -cpu-used "$(vp9_cpu)" -threads "${th:-$(nproc 2>/dev/null || echo 4)}")
+      if [[ -n $br ]]; then VENC+=(-b:v "${br}k"); else VENC+=(-b:v 0 -crf "$CRF"); fi
+      case $pass in
+        p1) VENC+=(-pass 1 -passlogfile "$TMPD/vp9");;
+        p2) VENC+=(-pass 2 -passlogfile "$TMPD/vp9");;
+      esac;;
     hw265) VENC+=(-c:v hevc_mediacodec -b:v "${br:-$VBR}k")
-           [[ $OUT_EXT == mp4 ]] && VENC+=(-tag:v hvc1);;
+           (( CT_HVC )) && VENC+=(-tag:v hvc1);;
     hw264) VENC+=(-c:v h264_mediacodec -b:v "${br:-$VBR}k");;
   esac
 }
 build_aenc() {
   audio_plan
+  local ac=2; (( ABR <= 48 )) && ac=1
   case $AUDIO in
     none) AENC=(-an);;
-    copy) AENC=(-c:a copy);;
+    copy) if acodec_ok "$SRC_ACODEC"; then AENC=(-c:a copy)
+          else
+            case $AENC_NAME in libopus) AENC=(-c:a libopus -b:a "${ABR}k" -vbr on);; libmp3lame) AENC=(-c:a libmp3lame -b:a "${ABR}k");; *) AENC=(-c:a aac -b:a "${ABR}k");; esac
+          fi;;
     *)    if (( AUD_COPY )); then
             AENC=(-c:a copy)
           else
-            local ac=2; (( ABR <= 48 )) && ac=1
-            AENC=(-c:a aac -b:a "${ABR}k" -ac "$ac")
+            case $AENC_NAME in
+              libopus)    AENC=(-c:a libopus -b:a "${ABR}k" -ac "$ac" -vbr on);;
+              libmp3lame) AENC=(-c:a libmp3lame -b:a "${ABR}k" -ac "$ac");;
+              *)          AENC=(-c:a aac -b:a "${ABR}k" -ac "$ac");;
+            esac
           fi;;
+  esac
+}
+acodec_ok() {   # can this source audio codec be copied into the chosen container? (empty = no audio = fine)
+  [[ -n $1 ]] || return 0
+  case $OUT_EXT in
+    mkv)  return 0;;
+    webm) [[ $1 == opus || $1 == vorbis ]];;
+    avi)  case $1 in mp3|aac|ac3|pcm_s16le) return 0;; *) return 1;; esac;;
+    ts)   case $1 in aac|ac3|eac3|mp2|mp3) return 0;; *) return 1;; esac;;
+    *)    case $1 in aac|mp3|ac3|eac3|alac|opus) return 0;; *) return 1;; esac;;
   esac
 }
 
@@ -1384,7 +1456,80 @@ commit_out() {   # $1 built tmp, $2 final path -> 0 = the file is in place
 }
 
 # ------------------------------------------------------- compress one file ---
+
+container_rules() {   # sets CT_* for OUT_EXT and nudges CODEC/OUT_EXT when they cannot go together (call inside compress_file: CODEC/OUT_EXT are local there)
+  AENC_NAME=aac; CT_SUBS=mov_text; CT_FMT=mp4; CT_FAST=1; CT_STAGE=1; CT_HVC=1
+  if [[ $CODEC == vp9 ]] && [[ $OUT_EXT == mp4 || $OUT_EXT == mov || $OUT_EXT == avi || $OUT_EXT == ts ]]; then
+    [[ $PRESET_NAME == web ]] || warn "VP9 belongs in WebM (or MKV) - writing WebM for this file."; OUT_EXT=webm
+  fi
+  case $OUT_EXT in
+    mp4) ;;
+    mov) CT_FMT=mov;;
+    mkv) CT_FMT=matroska; CT_SUBS=srt; CT_FAST=0; CT_STAGE=0; CT_HVC=0;;
+    webm)
+      CT_FMT=webm; CT_SUBS=webvtt; CT_FAST=0; CT_STAGE=0; CT_HVC=0; AENC_NAME=libopus
+      case $CODEC in
+        vp9|av1) ;;
+        x265) warn "WebM holds VP9/AV1 only - using VP9 for this file."; CODEC=vp9; CRF=$(( CRF + 7 )); SPEED=${SPEED/ultrafast/veryfast};;
+        x264) warn "WebM holds VP9/AV1 only - using VP9 for this file."; CODEC=vp9; CRF=$(( CRF + 8 ));;
+        *)    warn "WebM holds VP9/AV1 only - using VP9 for this file."; CODEC=vp9; CRF=34;;
+      esac
+      (( CRF > 63 )) && CRF=63
+      have_enc libopus || AENC_NAME=libvorbis;;
+    avi)
+      CT_FMT=avi; CT_SUBS=""; CT_FAST=0; CT_STAGE=0; CT_HVC=0
+      have_enc libmp3lame && AENC_NAME=libmp3lame
+      case $CODEC in
+        x264) ;;
+        x265|av1|hw265|hw264|vp9) warn "AVI works best with H.264 - using x264 for this file."
+              case $CODEC in x265) CRF=$(( CRF > 5 ? CRF - 5 : 18 ));; vp9) CRF=$(( CRF > 12 ? CRF - 12 : 20 ));; av1) CRF=$(( CRF > 13 ? CRF - 13 : 20 ));; esac
+              CODEC=x264;;
+      esac;;
+    ts)
+      CT_FMT=mpegts; CT_SUBS=""; CT_FAST=0; CT_STAGE=0; CT_HVC=0
+      case $CODEC in
+        vp9|av1) warn "MPEG-TS needs H.264/H.265 - using x264 for this file."; CODEC=x264; CRF=$(( CRF > 13 ? CRF - 13 : 20 ));;
+      esac;;
+  esac
+  return 0
+}
+
+autocrop_find() {   # $1 src -> CROP_VF ("crop=W:H:X:Y" or ""): black bars measured at 3 points, applied only when they agree
+  local src=$1 st pos t out crop fw="" fh="" n=0 ux0=99999 uy0=99999 ux1=0 uy1=0 i dx
+  local -a CX=() CY=() CR=() CB=()
+  local w h x y W H
+  CROP_VF=""
+  st=${TRIM_START:-0}
+  for pos in 0.2 0.5 0.8; do
+    t=$(awk -v s="$st" -v d="${EDUR:-$DUR}" -v p="$pos" 'BEGIN{ printf "%.2f", s + d * p }')
+    out=$(ffmpeg -nostdin -hide_banner -v info -ss "$t" -t 2 -i "$src" -map 0:v:0 -an \
+          -vf "cropdetect=24:2:0,showinfo" -f null - 2>&1)
+    if [[ -z $fw && $out =~ \ s:([0-9]+)x([0-9]+) ]]; then fw=${BASH_REMATCH[1]}; fh=${BASH_REMATCH[2]}; fi
+    crop=$(grep -o 'crop=[0-9]*:[0-9]*:[0-9]*:[0-9]*' <<<"$out" | tail -n1)
+    [[ $crop =~ crop=([0-9]+):([0-9]+):([0-9]+):([0-9]+) ]] || return 1
+    w=${BASH_REMATCH[1]}; h=${BASH_REMATCH[2]}; x=${BASH_REMATCH[3]}; y=${BASH_REMATCH[4]}
+    CX+=("$x"); CY+=("$y"); CR+=("$(( x + w ))"); CB+=("$(( y + h ))")
+    (( x < ux0 )) && ux0=$x; (( y < uy0 )) && uy0=$y
+    (( x + w > ux1 )) && ux1=$(( x + w )); (( y + h > uy1 )) && uy1=$(( y + h ))
+    n=$(( n + 1 ))
+  done
+  [[ -n $fw && $n -eq 3 ]] || return 1
+  for (( i = 0; i < 3; i++ )); do          # all three scenes must agree within 8 px, or the bars are not reliable
+    for dx in $(( CX[i] - ux0 )) $(( CY[i] - uy0 )) $(( ux1 - CR[i] )) $(( uy1 - CB[i] )); do
+      if (( dx > 8 )); then info "  Black bars differ between scenes - not cropping."; return 1; fi
+    done
+  done
+  ux0=$(( ux0 / 2 * 2 )); uy0=$(( uy0 / 2 * 2 ))
+  W=$(( (ux1 - ux0) / 2 * 2 )); H=$(( (uy1 - uy0) / 2 * 2 ))
+  (( W > 0 && H > 0 )) || return 1
+  (( W * H * 100 <= fw * fh * 97 )) || return 1                 # less than 3% saved: not worth it
+  (( W * H * 100 >= fw * fh * 55 )) || { info "  Crop would remove over 45% of the picture - ignored (dark scenes?)."; return 1; }
+  CROP_VF="crop=$W:$H:$ux0:$uy0"
+  info "  Black bars found: ${fw}x${fh} -> ${W}x${H}"
+  return 0
+}
 compress_file() {
+  local CODEC=$CODEC CRF=$CRF SPEED=$SPEED OUT_EXT=$OUT_EXT      # container rules may adjust these for THIS file only
   local src=$1 fidx=${2:-0} fn=${3:-0} tag=""
   local name dst tmp in_sz out_sz saved passes=1 br="" vf rc=0 odur status t0=$SECONDS
   local extarg=() maps=() scodec=() submeta=() fmt fast subfilter="" srt="" keepsubs subn ex_nsubs ex_bad prev
@@ -1395,6 +1540,7 @@ compress_file() {
     tally fail; return 1
   fi
   ex_nsubs=$SRC_NSUBS; ex_bad=$SRC_SUBBAD     # one probe call gave us everything
+  container_rules
   in_sz=$(fsize "$src")
   if ! calc_edur; then
     err "Trim range is outside the video."
@@ -1436,7 +1582,7 @@ compress_file() {
 
   TMPD=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
   dst=$(unique_out "$src")
-  if [[ $OUT_EXT == mp4 ]]; then
+  if (( CT_STAGE )); then
     out_tmp "$dst" "$in_sz"; tmp=$OT_TMP          # built locally, moved at the end
   else
     tmp="$dst.part"; OT_DIRECT=0                   # MKV needs no faststart pass
@@ -1451,7 +1597,7 @@ compress_file() {
     if [[ -z $srt ]]; then
       warn "No matching .srt found - nothing embedded."
     else
-      info "Embedding subtitles: $(basename -- "$srt")"
+      [[ -n $CT_SUBS ]] && info "Embedding subtitles: $(basename -- "$srt")"
       cp -f -- "$srt" "$TMPD/sub.srt"
       if awk -v s="${TRIM_START:-0}" 'BEGIN{ exit !(s+0 > 0) }'; then
         shift_srt "$TMPD/sub.srt" "$TMPD/sub2.srt" "${TRIM_START:-0}" && mv -f "$TMPD/sub2.srt" "$TMPD/sub.srt" \
@@ -1463,6 +1609,10 @@ compress_file() {
   setup_burn "$src" && subfilter=$SUBFILTER
 
   keepsubs=$KEEP_SUBS
+  if [[ -z $CT_SUBS ]]; then
+    (( ex_nsubs > 0 || ${#srt} > 0 )) && warn "${OUT_EXT^^} cannot hold subtitles - they are left out (use MKV/MP4 to keep them)."
+    keepsubs=0; srt=""
+  fi
   if (( keepsubs )) && (( ex_nsubs > 0 )) && (( ex_bad )); then
     warn "Bitmap subtitles (PGS/DVD) cannot be copied to this container - dropping them."
     keepsubs=0
@@ -1471,22 +1621,25 @@ compress_file() {
 
   maps=(-map 0:v:0 -map '0:a?')
   (( keepsubs )) && maps+=(-map '0:s?')
+  [[ -z $CT_SUBS ]] && maps+=(-sn)
   if [[ -n $srt ]]; then
     extarg=(-i "$srt")
     maps+=(-map 1:0)
   fi
-  if [[ $OUT_EXT == mkv ]]; then scodec=(-c:s srt); else scodec=(-c:s mov_text); fi
+  [[ -n $CT_SUBS ]] && scodec=(-c:s "$CT_SUBS")
   if [[ -n $srt ]]; then
     subn=0; (( keepsubs )) && subn=$ex_nsubs      # index of the NEW track among kept subtitle tracks
     local sublang=$SUB_LANG
-    [[ $OUT_EXT == mp4 ]] && sublang=$(lang3 "$sublang")
+    [[ $OUT_EXT == mp4 || $OUT_EXT == mov ]] && sublang=$(lang3 "$sublang")
     submeta=(-metadata:s:s:$subn language="$sublang")
   fi
 
-  fmt=(-f mp4); fast=(-movflags +faststart)
-  [[ $OUT_EXT == mkv ]] && { fmt=(-f matroska); fast=(); }
+  fmt=(-f "$CT_FMT"); fast=()
+  (( CT_FAST )) && fast=(-movflags +faststart)
   (( OT_DIRECT )) && fast=()
 
+  CROP_VF=""; (( AUTOCROP )) && autocrop_find "$src"
+  case $SRC_FIELD in tt|bb|tb|bt) (( DEINT )) && printf '  %sInterlaced picture - deinterlacing%s\n' "$C_D" "$C_0";; esac
   vf=$(build_vf)
   [[ -n $subfilter ]] && vf="${vf:+$vf,}$subfilter"
   VFARG=(); [[ -n $vf ]] && VFARG=(-vf "$vf")
@@ -1529,7 +1682,7 @@ compress_file() {
   CUR_TMP=""
   [[ -n $BATCH_TMP && -f $BATCH_TMP/part_$fidx ]] && rm -f -- "$BATCH_TMP/part_$fidx"
 
-  out_sz=$(fsize "$dst")
+  out_sz=$(fsize "$dst"); LAST_OUT=$dst
   saved=$(awk -v a="$in_sz" -v b="$out_sz" 'BEGIN{ d=(1-b/a)*100; printf "%s%.0f%%", (d>=0 ? "-" : "+"), (d>=0 ? d : -d) }')
   status="OK"
   odur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$dst" 2>/dev/null | head -n1)
@@ -2419,6 +2572,177 @@ repair_rescue_run() {   # called from repair_file: re-encode video + audio clean
     "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
   run_ffmpeg "rescue" 1 1 "${rargs[@]}"
 }
+
+# ============================================================ REPAIR LAB (v3.1)
+repair_mp4box() {   # $1 src $2 outdir -> RM_OUT ; MP4Box rewrites the container (rebuilds index tables)
+  local src=$1 od=$2 base out
+  RM_OUT=""
+  tool_have MP4Box || return 1
+  base=${src##*/}; base=${base%.*}
+  mkdir -p -- "$od"; out=$(unique_file "$od" "${base}_mp4box" mp4)
+  MP4Box -add "$src" -new "$out" >>"${LOGF:-$LOG}" 2>&1
+  [[ -s $out ]] || { rm -f -- "$out"; return 1; }
+  RM_OUT=$out
+}
+repair_untrunc() {   # $1 broken $2 healthy reference (same camera/settings) $3 outdir -> RM_OUT
+  local src=$1 ref=$2 od=$3 base made out
+  RM_OUT=""
+  tool_have untrunc || return 1
+  [[ -f $ref ]] || return 1
+  base=${src##*/}; made="${src%.*}_fixed.${src##*.}"
+  mkdir -p -- "$od"
+  rm -f -- "$made"
+  ( cd "$(dirname -- "$src")" && untrunc "$ref" "$src" >>"${LOGF:-$LOG}" 2>&1 )
+  [[ -s $made ]] || return 1
+  out=$(unique_file "$od" "${base%.*}_untrunc" "${src##*.}")
+  mv -f -- "$made" "$out"
+  RM_OUT=$out
+}
+repair_structural() {   # $1 src $2 tag -> 0 when the file was rebuilt from its structure (results already recorded)
+  local src=$1 tag=${2:-} ext=${1##*.} od out in_sz name rd
+  ext=${ext,,}
+  case $ext in mp4|m4v|mov|qt|3gp|3g2) ;; *) return 1;; esac
+  tool_have MP4Box || tool_have untrunc || return 1
+  od=${REPAIR_OUTDIR:-$(dirname -- "$src")}; name=${src##*/}; in_sz=$(fsize "$src")
+  info "${tag}Cannot read it normally - trying the structure tools ..."
+  rd=$REPAIR_REF
+  if tool_have MP4Box && repair_mp4box "$src" "$od"; then out=$RM_OUT
+    if diag_probe "$out"; then repair_verify "$out" "$D_DUR"; else VERIFY_OK=0; fi
+    if (( VERIFY_OK )); then
+      keep_dates "$src" "$out"; LAST_OUT=$out
+      ok "${tag}Rebuilt with MP4Box: $(basename -- "$out")  ($(human "$in_sz") -> $(human "$(fsize "$out")"))"
+      add_result "$name" "$(human "$in_sz")" "$(human "$(fsize "$out")")" "-" "-" "REPAIRED (structure)" "$src" "$out"
+      tally ok "$in_sz" "$(fsize "$out")"; return 0
+    fi
+    rm -f -- "$out"
+  fi
+  if tool_have untrunc; then
+    if [[ -z $rd && $REPAIR_AUTO == 0 && -t 0 ]]; then rd=$(ask "A healthy video from the SAME camera/app (blank = skip untrunc)" ""); rd=${rd/#\~/$HOME}; fi
+    if [[ -n $rd && -f $rd ]] && repair_untrunc "$src" "$rd" "$od"; then out=$RM_OUT
+      if diag_probe "$out"; then repair_verify "$out" "$D_DUR"; else VERIFY_OK=0; fi
+      if (( VERIFY_OK )); then
+        keep_dates "$src" "$out"; LAST_OUT=$out
+        ok "${tag}Rebuilt with untrunc: $(basename -- "$out")  ($(human "$in_sz") -> $(human "$(fsize "$out")"))"
+        add_result "$name" "$(human "$in_sz")" "$(human "$(fsize "$out")")" "-" "-" "REPAIRED (untrunc)" "$src" "$out"
+        tally ok "$in_sz" "$(fsize "$out")"; return 0
+      fi
+      rm -f -- "$out"
+    fi
+  fi
+  return 1
+}
+repair_lab_methods() {   # $1 src $2 ref $3 readable(1|0) -> LAB_M (names)
+  LAB_M=()
+  local ext=${1##*.}; ext=${ext,,}
+  if (( $3 )); then LAB_M+=(quick auto rebuild rescue); fi
+  case $ext in mp4|m4v|mov|qt|3gp|3g2)
+    tool_have MP4Box && LAB_M+=(mp4box)
+    [[ -n $2 && -f $2 ]] && tool_have untrunc && LAB_M+=(untrunc);;
+  esac
+}
+repair_lab_label() { case $1 in
+  quick) echo "quick remux";; auto) echo "smart Auto-Repair";; rebuild) echo "full rebuild";; rescue) echo "rescue mode";;
+  mp4box) echo "MP4Box";; untrunc) echo "untrunc";; *) echo "$1";; esac; }
+repair_lab() {   # $1 video  $2 optional healthy reference file
+  local src=$(readlink -f -- "$1") ref=${2:-$REPAIR_REF} td m i readable=1 t0 t1 us out vok note np sz rows=0 win=-1 best_t=0 best_np=999 mt kept lbl exp full_src
+  local -a LAB_M=() r_out=() r_us=() r_sz=() r_np=() r_ok=() r_note=() r_ran=()
+  [[ -f $src ]] || { err "No such file: $1"; return 1; }
+  [[ -n $ref ]] && ref=$(readlink -f -- "$ref" 2>/dev/null)
+  full_src=$src
+  diag_probe "$src" || readable=0
+  repair_lab_methods "$src" "$ref" "$readable"
+  printf '\n%s== Repair lab ==%s\n' "$C_B" "$C_0"
+  printf '  %s\n' "$(trunc "$(basename -- "$src")")"
+  if (( readable )); then
+    info "Readable: $D_VCODEC${D_ACODEC:+ + $D_ACODEC}, $(fmt_time "$D_DUR"), $(human "$(fsize "$src")")"
+    if (( LAB_SAMPLE )) || { (( ${D_DUR%%.*} > 300 )) && [[ -t 0 ]] && yesno "This video is long (every re-encode method takes about as long as the video). Test on a 60 s sample first?" y; }; then
+      LAB_SAMPLE=1
+    fi
+  else
+    warn "ffmpeg cannot read this file (damaged headers) - only the structure tools can help."
+    (( ${#LAB_M[@]} )) || { err "No structure tool available. Install MP4Box:  vc --setup repair"; return 1; }
+  fi
+  td=$(mktemp -d) || return 1
+  if (( readable && LAB_SAMPLE )); then      # same problems, a fraction of the time: cut a 60 s piece from the middle
+    mt=$(awk -v d="$D_DUR" 'BEGIN{ s = (d - 60) / 2; if (s < 0) s = 0; printf "%.2f", s }')
+    ffmpeg -nostdin -v error -y -ss "$mt" -t 60 -i "$src" -c copy -map 0 -f mp4 "$td/sample.mp4" 2>>"$LOG" && [[ -s $td/sample.mp4 ]] && src="$td/sample.mp4" && info "Testing on a 60 s sample (from ${mt}s)."
+  fi
+  exp=$D_DUR; (( readable )) && { diag_probe "$src" && exp=$D_DUR; }
+  info "Methods: $(for m in "${LAB_M[@]}"; do printf '%s, ' "$(repair_lab_label "$m")"; done | sed 's/, $//')"
+  mkdir -p "$CONF_DIR"; : > "$LOG"
+  for i in "${!LAB_M[@]}"; do
+    m=${LAB_M[i]}
+    printf '  %-18s %srunning...%s' "$(repair_lab_label "$m")" "$C_D" "$C_0"
+    now_us; t0=$NOW_US
+    mkdir -p "$td/$m"
+    case $m in
+      mp4box)  ( LOGF="$td/$m.log"; repair_mp4box "$src" "$td/$m" ) >/dev/null 2>&1;;
+      untrunc) ( LOGF="$td/$m.log"; repair_untrunc "$src" "$ref" "$td/$m" ) >/dev/null 2>&1;;
+      *)       ( export SIMPLE=1 REPAIR_AUTO=1 REPAIR_OUTDIR="$td/$m" LOGF="$td/$m.log"
+                 case $m in rebuild) REPAIR_FORCE=rebuild;; rescue) REPAIR_FORCE=rescue;; *) REPAIR_FORCE="";; esac
+                 RESULT_FILE="$td/$m.results" STATS="$td/$m.stats"
+                 case $m in quick) quickfix_file "$src";; *) repair_file "$src";; esac ) >/dev/null 2>&1;;
+    esac
+    now_us; us=$(( NOW_US - t0 ))
+    out=$(ls -t "$td/$m"/*.mp4 "$td/$m"/*.mov 2>/dev/null | head -n1)
+    r_ran[i]=1; r_us[i]=$us; r_out[i]=$out; r_ok[i]=0; r_np[i]=-1; r_sz[i]=0; r_note[i]=""
+    if [[ -n $out && -s $out ]]; then
+      r_sz[i]=$(fsize "$out")
+      if diag_probe "$out"; then
+        repair_verify "$out" "$( (( readable )) && echo "$exp" || echo "$D_DUR" )"; r_ok[i]=$VERIFY_OK; r_note[i]=$VERIFY_NOTE
+        diag_report "$out" >/dev/null 2>&1; r_np[i]=$DIAG_NPROBS
+      else r_note[i]="result cannot be read"; fi
+    else r_note[i]="nothing produced"; fi
+    printf '\r\033[K'
+    if [[ -n $out && -s $out ]]; then
+      np=${r_np[i]}
+      printf '  %-18s %7s  %9s  %s  %s\n' "$(repair_lab_label "$m")" "$(fmt_time $(( us / 1000000 )))" "$(human "${r_sz[i]}")" \
+        "$( (( np == 0 )) && echo "no problems left" || { (( np > 0 )) && echo "$np problem(s) left" || echo "?"; } )" \
+        "$( (( r_ok[i] )) && echo "${C_G}plays OK${C_0}" || echo "${C_R}CHECK: ${r_note[i]}${C_0}" )"
+    else
+      printf '  %-18s %7s  %9s  %s\n' "$(repair_lab_label "$m")" "$(fmt_time $(( us / 1000000 )))" "-" "${C_D}${r_note[i]}${C_0}"
+    fi
+  done
+  # winner: plays OK AND no problems left, fastest; else plays OK with the fewest problems, fastest
+  for i in "${!LAB_M[@]}"; do
+    (( r_ok[i] )) || continue
+    np=${r_np[i]}; (( np < 0 )) && continue
+    if (( win < 0 )) || (( np < best_np )) || (( np == best_np && r_us[i] < best_t )); then win=$i; best_np=$np; best_t=${r_us[i]}; fi
+  done
+  if (( win < 0 )); then
+    printf '\n  %sNo method produced a file that plays cleanly.%s\n' "$C_R" "$C_0"
+    info "  Try again with a healthy reference video from the same camera (--ref FILE, needs untrunc), or keep the original."
+    rm -rf -- "$td"; return 1
+  fi
+  m=${LAB_M[win]}
+  printf '\n  %sBest:%s %s  (%s, %s)\n' "$C_G" "$C_0" "$(repair_lab_label "$m")" "$(fmt_time $(( best_t / 1000000 )))" \
+    "$( (( best_np == 0 )) && echo "completely fixed" || echo "$best_np problem(s) remain" )"
+  if (( LAB_SAMPLE )); then
+    info "  That was on a 60 s sample. Run the winner on the whole video?"
+    if [[ -t 0 ]] && yesno "Repair the whole video with '$(repair_lab_label "$m")' now?" y; then
+      rm -rf -- "$td"
+      mkdir -p "$CONF_DIR"
+      case $m in
+        quick)   REPAIR_AUTO=1 quickfix_file "$full_src";;
+        auto)    REPAIR_AUTO=1 repair_file "$full_src";;
+        rebuild) REPAIR_AUTO=1 REPAIR_FORCE=rebuild repair_file "$full_src";;
+        rescue)  REPAIR_AUTO=1 REPAIR_FORCE=rescue repair_file "$full_src";;
+        mp4box)  repair_mp4box "$full_src" "$(dirname -- "$full_src")" && ok "Saved: $(pretty "$RM_OUT")";;
+        untrunc) repair_untrunc "$full_src" "$ref" "$(dirname -- "$full_src")" && ok "Saved: $(pretty "$RM_OUT")";;
+      esac
+      return 0
+    fi
+    rm -rf -- "$td"; return 0
+  fi
+  # keep the winner next to the original
+  out=${r_out[win]}
+  kept=$(unique_file "$(dirname -- "$full_src")" "$(basename -- "${full_src%.*}")_repaired" "${out##*.}")
+  mv -f -- "$out" "$kept"; keep_dates "$full_src" "$kept"
+  ok "Kept: $(pretty "$kept")"
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$kept" >/dev/null 2>&1 & }
+  rm -rf -- "$td"
+  return 0
+}
 repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   local src=$(readlink -f -- "$1") tag=${2:-}
   local name base dir out tmp rc t0=$SECONDS in_sz out_sz saved need tier
@@ -2428,6 +2752,8 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   local -a vreasons=() areasons=() fargs=() venc=() aargs=() fast=() meta=()
   name=$(basename -- "$src"); in_sz=$(fsize "$src")
   if ! diag_probe "$src"; then
+    # damaged headers: try the structure tools (MP4Box, untrunc) before giving up
+    if repair_structural "$src" "$tag"; then return 0; fi
     err "${tag}Cannot read this video (damaged or not a video): $name"
     add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (unreadable)" "$src" ""
     tally fail; return 1
@@ -2437,7 +2763,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
   case $D_TRC in smpte2084|arib-std-b67) warn "${tag}HDR video: converting to 8-bit SDR can look washed out. Keep the original if colours matter.";; esac
   vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
-  dir=$(dirname -- "$src"); base=${name%.*}
+  dir=${REPAIR_OUTDIR:-$(dirname -- "$src")}; base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s fps, 1/%s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
     "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_AFPS")" \
     "$( (( D_VTS > 0 )) && echo "$D_VTS" || echo "?" )" "$(fmt_time "$D_DUR")" \
@@ -2456,6 +2782,9 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     (( D_ACH > 2 )) && abr=256
   fi
   [[ -n $REPAIR_FPS ]] && { vfix=1; vreasons+=("forced --fps"); }
+  case $REPAIR_FORCE in
+    rebuild|rescue) vfix=1; afix=$(( D_ANUM > 0 ? 1 : 0 )); vreasons+=("forced $REPAIR_FORCE");;
+  esac
   extra_audio=$(( D_ANUM > 1 ? D_ANUM - 1 : 0 ))
   nsubs=$D_NSUBS
   awk -v v="$vst" -v a="$ast" 'BEGIN{ if (v < -0.005 || a < -0.005) exit 1 }' || negts=1
@@ -2494,6 +2823,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     fi
     vf="fps=$fps_arg"
     if (( D_W % 2 != 0 || D_H % 2 != 0 )); then vf="scale=trunc(iw/2)*2:trunc(ih/2)*2,$vf"; fi
+    case $D_FIELD in tt|bb|tb|bt) (( DEINT )) && { vf="yadif=mode=0:parity=-1:deint=1,$vf"; info "${tag}Interlaced picture - deinterlacing while re-encoding."; };; esac
   fi
 
   # ---- video filter RESCUE mode would need (target rate + even size), kept ready now
@@ -2504,6 +2834,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     read -r fps_arg fps_show < <(snap_fps "$vfps")
     rvf="fps=$fps_arg"
     if (( D_W % 2 != 0 || D_H % 2 != 0 )); then rvf="scale=trunc(iw/2)*2:trunc(ih/2)*2,$rvf"; fi
+    case $D_FIELD in tt|bb|tb|bt) (( DEINT )) && rvf="yadif=mode=0:parity=-1:deint=1,$rvf";; esac
   fi
 
   # ---- plan + confirmation (interactive mode only)
@@ -2585,12 +2916,12 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   # 23.976 fps films, which itself caused gradual drift on TVs
   fargs+=(-sn -map_metadata -1 -map_chapters -1 "${meta[@]}" -muxdelay 0 -avoid_negative_ts make_zero \
     "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
-  run_ffmpeg "repair" 1 1 "${fargs[@]}"
-  rc=$?
+  if [[ $REPAIR_FORCE == rescue ]]; then rc=1
+  else run_ffmpeg "repair" 1 1 "${fargs[@]}"; rc=$?; fi
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     # ---- RESCUE MODE: damaged data -> skip it and rebuild video + audio cleanly
     rm -f -- "$tmp"
-    warn "${tag}First attempt failed - trying RESCUE mode (re-encodes everything, skips damaged data)."
+    [[ $REPAIR_FORCE == rescue ]] || warn "${tag}First attempt failed - trying RESCUE mode (re-encodes everything, skips damaged data)."
     rescued=1
     repair_rescue_run
     rc=$?
@@ -2671,6 +3002,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   fi
   (( rescued )) && info "  Rescue mode skipped damaged data: a few frames may be missing - watch the result once."
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
+  LAST_OUT=$out
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "$rstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
@@ -2692,7 +3024,7 @@ quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 
   src_dur=$D_DUR; nsubs=$D_NSUBS
   s_round=$D_ROUND; s_vfr=$D_VFR; s_vcodec=$D_VCODEC; s_acodec=$D_ACODEC; s_arate=$D_ARATE; s_anum=$D_ANUM
   [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
-  dir=$(dirname -- "$src"); base=${name%.*}
+  dir=${REPAIR_OUTDIR:-$(dirname -- "$src")}; base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
     "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(fmt_time "$D_DUR")" "$(human "$in_sz")" "$C_0"
   out=$(unique_file "$dir" "${base}_fixed" "mp4")
@@ -2743,6 +3075,7 @@ quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 
     [[ $s_arate == 48000 ]] || warn "Audio kept at ${s_arate:-?} Hz - run Auto-Repair to resample to 48 kHz."
   fi
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
+  LAST_OUT=$out
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "$qstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
@@ -2977,6 +3310,10 @@ run_on_picked() {   # $1 label, rest = command; runs it with the queue temporari
 }
 _rm_repair() { if (( ${#SELECTED[@]} == 1 )); then repair_file "${SELECTED[0]}"; else repair_batch; fi; }
 _rm_quick()  { if (( ${#SELECTED[@]} == 1 )); then REPAIR_AUTO=0 quickfix_file "${SELECTED[0]}"; else queue_run "Quick fix" quickfix_file; fi; }
+_rm_lab()    {
+  (( ${#SELECTED[@]} == 1 )) || { warn "The lab tests one video at a time - pick a single number."; return 1; }
+  repair_lab "${SELECTED[0]}"
+}
 _rm_shift()  {
   ask_shift_ms || return 1
   if (( ${#SELECTED[@]} == 1 )); then sync_shift_file "${SELECTED[0]}" "$QUEUE_MS"; else queue_run "Audio shift" q_shift; fi
@@ -3033,6 +3370,7 @@ repair_menu() {
     echo " 5) Shift audio by +/- milliseconds"
     echo "    (2-5 ask which of the queued videos: one, several or all)"
     echo " 6) View / edit the queue"
+    echo " 7) REPAIR LAB (test every repair method on one video, keep the best)"
     echo " b) back"
     read -r -p "> " c || return
     case $c in
@@ -3042,6 +3380,7 @@ repair_menu() {
       4) need_queue && { run_on_picked "Quick fix" _rm_quick; pause; };;
       5) need_queue && { run_on_picked "Shift audio" _rm_shift; pause; };;
       6) queue_menu;;
+      7) need_queue && { run_on_picked "Repair lab (pick ONE video)" _rm_lab; pause; };;
       b|B|"") return;;
     esac
   done
@@ -3417,6 +3756,7 @@ ssim_label() {   # rough human label for an SSIM value
 now_us() { if [[ -n ${EPOCHREALTIME-} ]]; then NOW_US=${EPOCHREALTIME/[.,]/}; else NOW_US=$(( SECONDS * 1000000 )); fi; }
 race_setup() {   # $1 video -> RACE_* globals, settings snapshot, temp dir
   RACE_SRC=$1
+  CROP_VF=""; AENC_NAME=aac; CT_SUBS=mov_text; CT_FMT=mp4; CT_FAST=1; CT_STAGE=1; CT_HVC=1
   probe "$RACE_SRC" || return 1
   detect_ff_caps
   RACE_SLEN=$(awk -v d="$DUR" -v L="$RACE_LEN" 'BEGIN{ printf "%.3f", (d > L + 2) ? L : d }')
@@ -3465,12 +3805,13 @@ preset_race() {   # $1 optional video: every preset -> speed, size, time, qualit
   info "${RACE_SLEN}s sample of $(trunc "$(basename -- "$src")") - measured on THIS device"
   info "CPU: ${PIN_NOTE:-all cores}$( (( THREADS_PER_JOB > 0 )) && echo ", $THREADS_PER_JOB thread(s)" )"
   printf '  %s%-9s %8s  %10s  %9s  %s%s\n' "$C_D" "preset" "speed" "est. size" "est. time" "quality (SSIM)" "$C_0"
-  for p in turbo fast balanced quality small tiny social compat av1 hardware; do
+  for p in turbo fast balanced quality small tiny social compat av1 web hardware; do
     apply_preset "$p" || continue
     TARGET_MB=0
     case $CODEC in
       hw*) have_enc "$(hw_encoder_name)" || continue;;
       av1) have_enc libsvtav1 || continue;;
+      vp9) have_enc libvpx-vp9 || continue;;
     esac
     printf '  %-9s %srunning...%s' "$p" "$C_D" "$C_0"
     race_encode
@@ -3803,22 +4144,148 @@ check_deps() {
   done
   fd=$(fonts_dir)
   if [[ -n $fd ]]; then ok "fonts directory (subtitle burn-in): $fd"; else warn "no fonts dir found - subtitle burn-in may fail"; fi
-  for c in termux-wake-lock termux-notification termux-media-scan termux-open; do
+  for c in termux-wake-lock termux-media-scan; do
     if command -v "$c" >/dev/null 2>&1; then ok "optional: $c"; else info "optional (Termux tools): $c not available"; fi
   done
   if [[ -d $HOME/storage/shared ]]; then ok "shared storage access OK"; else warn "no storage access - run: termux-setup-storage"; fi
+  setup_status all
+  if (( ${#SETUP_MISSING[@]} )) && [[ -t 0 ]] && yesno "Install the ${#SETUP_MISSING[@]} missing package(s) now (automatic)?" y; then setup_run all; fi
 }
-do_setup() {
-  if command -v pkg >/dev/null 2>&1; then
-    pkg install -y ffmpeg gawk || err "pkg install failed (try: pkg update)"
-    if [[ -t 0 ]] && yesno "Also install termux-api (notifications + gallery refresh; needs the Termux:API app)?" n; then
-      pkg install -y termux-api
+
+# ============================================================ AUTO-INSTALLER (v3.1)
+tool_have() { command -v "$1" >/dev/null 2>&1; }
+# group|command|package|what it is for|required(1/0)
+SETUP_TABLE=(
+  "core|ffmpeg|ffmpeg|the video engine (compress, repair, frames, everything)|1"
+  "core|ffprobe|ffmpeg|reads video information|1"
+  "core|awk|gawk|calculations in the progress bar and plans|1"
+  "core|find|findutils|finds your videos|1"
+  "w6w|openssl|openssl-tool|.w6w encryption|0"
+  "w6w|xz|xz-utils|.w6w text compression|0"
+  "w6w|tar|tar|.w6w container|0"
+  "w6w|less|less|reading long text inside a .w6w|0"
+  "perf|taskset|util-linux|pin work to the fast cores (optional speed-up)|0"
+  "repair|MP4Box|gpac|extra repair for broken MP4 files|0"
+  "repair|untrunc|untrunc|rebuild a cut-off MP4 from a healthy one (often not in the Termux repo)|0"
+  "extras|termux-notification|termux-api|notifications, gallery refresh (also needs the Termux:API app)|0"
+  "extras|termux-open|termux-tools|opens files with Android apps|0"
+  "extras|file|file|recognises file types|0"
+)
+is_termux() { [[ ${PREFIX:-} == *com.termux* || -n ${TERMUX_VERSION:-} ]]; }
+
+setup_status() {   # $1 group (all|core|w6w|perf|repair|extras) -> prints a table, SETUP_MISSING = packages still missing
+  local g=${1:-all} row grp cmd pk why req missing=0 shown=""
+  SETUP_MISSING=()
+  printf '\n%s== Tools ==%s\n' "$C_B" "$C_0"
+  for row in "${SETUP_TABLE[@]}"; do
+    IFS='|' read -r grp cmd pk why req <<<"$row"
+    [[ $g == all || $g == "$grp" ]] || continue
+    if tool_have "$cmd"; then
+      printf '  %s✔%s %-18s %s%s%s\n' "$C_G" "$C_0" "$cmd" "$C_D" "$why" "$C_0"
+    else
+      printf '  %s%s%s %-18s %s%s  [pkg: %s]%s\n' "$( [[ $req == 1 ]] && echo "$C_R" || echo "$C_Y" )" "$( [[ $req == 1 ]] && echo ✘ || echo - )" "$C_0" "$cmd" "$C_D" "$why" "$pk" "$C_0"
+      if [[ " ${SETUP_MISSING[*]-} " != *" $pk "* ]]; then SETUP_MISSING+=("$pk"); fi
     fi
+  done
+  return 0
+}
+pkg_install() {   # $1 package -> 0 installed, 1 failed, 2 not available in the repository
+  local p=$1 out rc
+  export DEBIAN_FRONTEND=noninteractive
+  mkdir -p "$CONF_DIR" 2>/dev/null; SETUP_LOG=${SETUP_LOG:-$CONF_DIR/setup.log}
+  if tool_have apt-get; then
+    out=$(apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef install "$p" 2>&1); rc=$?
+  elif tool_have pkg; then
+    out=$(pkg install -y "$p" 2>&1); rc=$?
   else
-    warn "'pkg' not found - install ffmpeg and gawk with your package manager."
+    return 1
   fi
-  [[ -d $HOME/storage ]] || { command -v termux-setup-storage >/dev/null 2>&1 && termux-setup-storage; }
+  printf '== install %s (rc=%s)\n%s\n' "$p" "$rc" "$out" >> "$SETUP_LOG" 2>/dev/null
+  (( rc == 0 )) && return 0
+  grep -qiE 'unable to locate package|has no installation candidate|no packages found' <<<"$out" && return 2
+  return 1
+}
+pkg_refresh() {   # update the package lists once (failure is not fatal)
+  local out rc
+  if tool_have apt-get; then out=$(apt-get -y update 2>&1); rc=$?
+  elif tool_have pkg; then out=$(pkg update -y 2>&1); rc=$?
+  else return 1; fi
+  printf '== update (rc=%s)\n%s\n' "$rc" "$out" >> "${SETUP_LOG:-/dev/null}" 2>/dev/null
+  return $rc
+}
+setup_storage() {   # shared-storage permission (Android shows a dialog the first time)
+  [[ -d $HOME/storage/shared ]] && return 0
+  tool_have termux-setup-storage || return 0
+  info "Allow storage access in the Android dialog that appears ..."
+  termux-setup-storage
+  local i
+  for (( i = 0; i < 20; i++ )); do [[ -d $HOME/storage/shared ]] && { ok "Storage access granted."; return 0; }; sleep 1; done
+  warn "Storage permission not seen yet. Accept the Android dialog, then run: vc --setup"
+  return 0
+}
+setup_run() {   # $1 group -> installs what is missing; never stops on optional failures. rc 1 only if a CORE tool is still missing
+  local g=${1:-all} pk i=0 n res fail=0 core_bad=0 row grp cmd p2 why req
+  local -a todo=() failed=() absent=()
+  mkdir -p "$CONF_DIR" 2>/dev/null; SETUP_LOG=$CONF_DIR/setup.log; : > "$SETUP_LOG"
+  if ! is_termux && ! tool_have pkg && [[ $(id -u 2>/dev/null) != 0 ]]; then
+    warn "Not running in Termux and not root - install these yourself with your package manager:"
+    setup_status "$g"; printf '  packages: %s\n' "${SETUP_MISSING[*]:-none}"; return 1
+  fi
+  setup_status "$g"
+  todo=("${SETUP_MISSING[@]}")
+  if (( ${#todo[@]} == 0 )); then ok "Everything for '$g' is already installed."; setup_storage; return 0; fi
+  info "Installing ${#todo[@]} package(s): ${todo[*]}   (log: $(pretty "$SETUP_LOG"))"
+  if ! pkg_refresh; then
+    warn "Could not refresh the package lists (internet? try again, or run: termux-change-repo). Trying to install anyway ..."
+  fi
+  n=${#todo[@]}
+  for pk in "${todo[@]}"; do
+    i=$(( i + 1 ))
+    printf '  [%d/%d] %s ... ' "$i" "$n" "$pk"
+    res=1
+    pkg_install "$pk"; res=$?
+    if (( res == 1 )); then            # one more try after refreshing (flaky mirrors are common)
+      pkg_refresh >/dev/null 2>&1; pkg_install "$pk"; res=$?
+    fi
+    case $res in
+      0) printf '%sinstalled%s\n' "$C_G" "$C_0";;
+      2) printf '%snot in the repository%s\n' "$C_Y" "$C_0"; absent+=("$pk");;
+      *) printf '%sfailed%s\n' "$C_R" "$C_0"; failed+=("$pk");;
+    esac
+  done
+  hash -r 2>/dev/null
+  setup_status "$g"
+  for row in "${SETUP_TABLE[@]}"; do
+    IFS='|' read -r grp cmd p2 why req <<<"$row"
+    [[ $g == all || $g == "$grp" ]] || continue
+    [[ $req == 1 ]] && ! tool_have "$cmd" && core_bad=1
+  done
+  (( ${#absent[@]} )) && info "Not available for this phone's repository: ${absent[*]} (optional - vc works without)."
+  (( ${#failed[@]} )) && warn "Could not install: ${failed[*]}  - see $(pretty "$SETUP_LOG"). Check your connection and run: vc --setup"
+  setup_storage
+  if [[ $g == all || $g == extras ]] && tool_have termux-notification && ! timeout 6 termux-battery-status >/dev/null 2>&1; then
+    info "termux-api is installed, but the Termux:API Android app is needed too (F-Droid / GitHub). Notifications work after you install it."
+  fi
+  if (( core_bad )); then err "A required tool is still missing."; return 1; fi
   ok "Setup finished."
+  return 0
+}
+ensure_tool() {   # $1 command $2 package $3 what it is for -> 0 when available (offers to install it on the spot)
+  tool_have "$1" && return 0
+  if [[ -t 0 && -t 1 ]]; then
+    warn "'$1' is needed for $3 and is not installed (package: $2)."
+    if yesno "Install it now?" y; then
+      pkg_refresh >/dev/null 2>&1; pkg_install "$2"; hash -r 2>/dev/null
+      tool_have "$1" && { ok "Installed $2."; return 0; }
+      err "Could not install $2 (see: vc --setup)."
+    fi
+    return 1
+  fi
+  err "'$1' is missing (package: $2). Install it with:  vc --setup"
+  return 1
+}
+do_setup() {   # $1 group: all (default) | core | w6w | perf | repair | extras
+  setup_run "${1:-all}"
 }
 do_install() {
   local dest="${PREFIX:-/usr/local}/bin/vc"
@@ -3833,8 +4300,12 @@ set_codec() {
   echo " 3) hw265 hardware H.265 (MediaCodec) - fast, experimental"
   echo " 4) hw264 hardware H.264 (MediaCodec) - fast, experimental"
   echo " 5) av1   AV1 (SVT-AV1) - next-gen, ~30% smaller, needs a modern player"
+  echo " 6) vp9   VP9 (libvpx) - WebM / web browsers, ~25% smaller than H.264"
   c=$(ask "Choose" "")
-  case $c in 1) CODEC=x265;; 2) CODEC=x264;; 3) CODEC=hw265;; 4) CODEC=hw264;; 5) CODEC=av1;; *) return;; esac
+  case $c in 1) CODEC=x265;; 2) CODEC=x264;; 3) CODEC=hw265;; 4) CODEC=hw264;; 5) CODEC=av1;; 6) CODEC=vp9;; *) return;; esac
+  if [[ $CODEC == vp9 ]] && ! have_enc libvpx-vp9; then
+    warn "This ffmpeg build has no libvpx-vp9. Keeping $old."; CODEC=$old; return
+  fi
   if [[ $CODEC == hw* ]] && ! have_enc "$(hw_encoder_name)"; then
     warn "This ffmpeg build has no $(hw_encoder_name). Keeping $old."; CODEC=$old; return
   fi
@@ -3846,8 +4317,12 @@ set_codec() {
   elif [[ $old == x265 && $CODEC == av1 ]];  then CRF=$(( CRF + 8 ))
   elif [[ $old == av1 && $CODEC == x265 ]];  then CRF=$(( CRF - 8 ))
   elif [[ $old == x264 && $CODEC == av1 ]];  then CRF=$(( CRF + 13 ))
-  elif [[ $old == av1 && $CODEC == x264 ]];  then CRF=$(( CRF - 13 )); fi
-  maxc=51; [[ $CODEC == av1 ]] && maxc=60
+  elif [[ $old == av1 && $CODEC == x264 ]];  then CRF=$(( CRF - 13 ))
+  elif [[ $old == x265 && $CODEC == vp9 ]];  then CRF=$(( CRF + 7 ))
+  elif [[ $old == x264 && $CODEC == vp9 ]];  then CRF=$(( CRF + 8 ))
+  elif [[ $old == vp9 && $CODEC == x265 ]];  then CRF=$(( CRF - 7 ))
+  elif [[ $old == vp9 && $CODEC == x264 ]];  then CRF=$(( CRF - 8 )); fi
+  maxc=51; [[ $CODEC == av1 ]] && maxc=60; [[ $CODEC == vp9 ]] && maxc=63
   (( CRF < 0 )) && CRF=0; (( CRF > maxc )) && CRF=$maxc
   PRESET_NAME=custom
 }
@@ -3944,10 +4419,14 @@ set_suffix() { SUFFIX=$(ask "Filename suffix" "$SUFFIX"); SUFFIX=${SUFFIX//\//_}
 set_parallel() { PARALLEL_JOBS=$(ask_int "Parallel jobs (1 = one file at a time)" 1 8 "$PARALLEL_JOBS"); }
 set_format() {
   local c
-  echo " 1) MP4 - most compatible (subtitles as mov_text)"
-  echo " 2) MKV - keeps SRT subtitles natively, more streams"
+  echo " 1) MP4  - most compatible (soft subtitles)"
+  echo " 2) MKV  - keeps any subtitles, many streams"
+  echo " 3) WebM - for websites (VP9/AV1 + Opus: vc switches the codec)"
+  echo " 4) MOV  - Apple / editing tools (like MP4)"
+  echo " 5) AVI  - old players (H.264 + MP3, no subtitles)"
+  echo " 6) TS   - broadcast / some TVs (no subtitles)"
   c=$(ask "Choose" "")
-  case $c in 1) OUT_EXT=mp4;; 2) OUT_EXT=mkv;; esac
+  case $c in 1) OUT_EXT=mp4;; 2) OUT_EXT=mkv;; 3) OUT_EXT=webm;; 4) OUT_EXT=mov;; 5) OUT_EXT=avi;; 6) OUT_EXT=ts;; esac
 }
 set_submode() {
   local c
@@ -4010,6 +4489,8 @@ settings_menu() {
     printf ' 21) Resume mode      %s  (skip files that already have a finished output)\n' "$(yn_label "$SKIP_DONE")"
     printf ' 22) Frame extractor  %s, %s, %s\n' "$(frame_fmt_label)" "$(frame_step_label)" "$(frame_h_label)"
     printf ' 23) Downscaler       %s\n' "$( [[ $SCALER == lanczos ]] && echo "Lanczos (sharper, files ~5% bigger)" || echo "bicubic (default)" )"
+    printf ' 26) Deinterlace      %s  (DVD / TV recordings)\n' "$(yn_label "$DEINT")"
+    printf ' 27) Auto-crop bars   %s  (removes black bars: smaller files)\n' "$(yn_label "$AUTOCROP")"
     printf ' 24) CPU cores        %s  [now: %s]\n' "$CORES" "${PIN_NOTE:-all cores}"
     printf ' 25) Encoder threads  %s\n' "$( (( THREADS > 0 )) && echo "$THREADS (fixed)" || echo "auto" )"
     printf '\n  s) save as default     b) back\n'
@@ -4032,6 +4513,8 @@ settings_menu() {
       21) SKIP_DONE=$(( 1 - SKIP_DONE ));;
       22) frames_options;;
       23) if [[ $SCALER == lanczos ]]; then SCALER=bicubic; else SCALER=lanczos; fi; PRESET_NAME=custom;;
+      26) DEINT=$(( 1 - DEINT ));;
+      27) AUTOCROP=$(( 1 - AUTOCROP ));;
       24) detect_cpu
           [[ -n $CPU_TOPO ]] && info "Layout: $CPU_TOPO"
           echo " 1) auto  (only the fast cores - test with the CPU test first)"
@@ -4106,7 +4589,7 @@ tools_menu() {
     echo " 5) Extract audio (MP3 / M4A)       (one or many)"
     echo " 6) Thumbnail / contact sheet       (one or many)"
     echo " 7) Check installation / encoders"
-    echo " 8) Setup (install ffmpeg, storage access)"
+    echo " 8) Install / fix all tools (automatic)"
     echo " 9) Install 'vc' command"
     echo "10) Show last log"
     echo "11) Extract frames (time range -> new folder)"
@@ -4121,7 +4604,7 @@ tools_menu() {
       5) tool_on_queue extract_audio "Extract audio"; pause;;
       6) tool_on_queue make_thumb "Thumbnail"; pause;;
       7) check_deps; pause;;
-      8) do_setup; pause;;
+      8) do_setup all; pause;;
       9) do_install; pause;;
       10) if [[ -s $LOG ]]; then tail -n 40 "$LOG"; else echo "(log is empty)"; fi; pause;;
       11) frames_flow; pause;;
@@ -4182,6 +4665,7 @@ main_menu() {
     echo " 9) START compression"
     echo " f) Extract frames (time range -> new folder)"
     echo " t) Speed lab & AUTO-TUNE (fastest settings for this phone)"
+    echo " w) W6W vault (encrypted .w6w: video, pictures, text, audio ...)"
     echo " r) Results & compare (last batch)"
     echo " c) Clear selection"
     echo " 0) Quit"
@@ -4198,6 +4682,7 @@ main_menu() {
       9) start_flow;;
       f|F) frames_flow; pause;;
       t|T) race_menu;;
+      w|W) w6w_menu;;
       r|R) results_menu;;
       c|C) SELECTED=();;
       0|q|Q) exit 0;;
@@ -4260,11 +4745,19 @@ Speed tools:
   --race-all FILE        all three (a few minutes); --no-quality skips the SSIM scoring
   --cpu                  show CPU layout (big/little), pinning and readable sensors
   --tune [FILE]          AUTO-TUNE: test this phone, pick + save the best preset and CPU setup
+  --repair-lab FILE      test EVERY repair method on a video (time, size, plays-to-the-end,
+                         problems left) and keep the best:  [--ref HEALTHY.mp4] [--sample]
+  --w6w CMD ...          .w6w vault (encrypted container for video, pictures, audio, text, scripts):
+                           pack OUT.w6w FILE|FOLDER ...  [--squeeze] [--password] [--comment TEXT]
+                           info F.w6w | verify F.w6w | play F.w6w [N] | key show|export|import HEX|new
+                           extract F.w6w [-o DIR] [N ...] | convert F.w6w [--to FMT] [-o DIR] [N ...]
   --goal G               for --tune: speed | balanced (default) | size | quality
   --cores all|auto|LIST  all cores (default), the fast cores only (auto), or e.g. 4-7
   --threads N            fixed encoder thread budget (0 = auto)
   --resume               skip files whose finished output already exists
   --lanczos              sharper downscaling (files ~5% bigger); --bicubic = default
+  --format FMT           output container: mp4 (default) | mkv | webm | mov | avi | ts
+  --no-deint             do not deinterlace DVD / TV sources;  --autocrop = remove black bars
 
 Repair & sync options:
   --repair FILE...       fix A/V drift and make the file play on any TV/USB
@@ -4283,7 +4776,9 @@ Repair & sync options:
   --stereo               downmix surround audio to stereo
 
 Other commands:
-  vc --setup      install ffmpeg and storage access
+  vc --setup [GROUP]  install everything the features need (ffmpeg, openssl, xz, tar, gpac ...);
+                      GROUP = all (default) | core | w6w | perf | repair | extras
+  vc --doctor     show which tools are installed (and offer to install the missing ones)
   vc --install    install this script as the 'vc' command
   vc --version
 
@@ -4304,6 +4799,10 @@ Examples:
   vc --frames movie.mp4 -S 0 -E 60 --frame-step key --frame-height 480
   vc --race movie.mp4                         # which preset suits this phone?
   vc movie.mp4 -p turbo -y                    # options may follow the file
+  vc movie.mkv -p web -y                      # VP9 + Opus in WebM (websites)
+  vc --w6w pack trip.w6w movie.mp4 movie.srt cover.jpg notes.txt   # one encrypted file
+  vc --w6w info trip.w6w ;  vc --w6w convert trip.w6w --to mp4
+  vc old_dvd.vob --format mp4 --autocrop -y   # DVD rip: deinterlaced, bars removed
 EOF
 }
 
@@ -4332,11 +4831,647 @@ on_int() {
   exit 130
 }
 
+# ======================================================================= .W6W VAULT
+# A .w6w file is ONE encrypted container that can hold anything: videos, pictures, audio,
+# text, scripts (.sh .py ...), subtitles, documents, other files. vc looks at every item
+# when it is packed, remembers what it is (kind, codecs, size, linked subtitle) and can
+# later list, play/view, extract and convert it. Only vc + the right key can open it.
+#
+#   file layout (v1)          bytes
+#     "W6W1"                  0-3    magic
+#     mode  'D' | 'P'         4      D = this phone's device key, P = password
+#     flags + reserved        5-7
+#     salt                    8-15   8 random bytes (PBKDF2)
+#     iv                      16-31  16 random bytes (AES-CBC)
+#     ciphertext              32-... AES-256-CBC( tar( W6W.MANIFEST, e001, e002 ... ) )
+#     HMAC-SHA256             last 32 bytes, over everything before it (encrypt-then-MAC)
+#   keys: PBKDF2-HMAC-SHA256, 200000 rounds; separate keys for encryption and MAC.
+W6W_ITER=200000
+W6W_SQUEEZE=0; W6W_PWMODE=0; W6W_TO=""; W6W_COMMENT=""; W6W_SECRET=""; W6W_MAC_SECRET=""
+W6W_KEY=""; W6W_IV=""; W6W_MK=""; W6W_DEVKEY=""; W6W_PASSWORD=${W6W_PASSWORD:-}; LAST_OUT=""
+W_CREATED=""; W_COMMENT_TXT=""; W_N=0; WD_KIND=""; WD_EXT=""; WD_DETAIL=""; WD_DUR=""
+declare -a W_KIND=() W_EXT=() W_STORED=() W_SIZE=() W_DUR=() W_FOR=() W_MT=() W_DETAIL=() W_NAME=()
+
+w6w_have_tools() {
+  ensure_tool openssl openssl-tool ".w6w encryption" || return 1
+  ensure_tool tar tar "the .w6w container" || return 1
+  ensure_tool xz xz-utils ".w6w text compression" || return 1
+  tool_have od || { err "'od' (coreutils) is missing: pkg install coreutils"; return 1; }
+  return 0
+}
+w6w_read_secret() {   # $1 prompt -> REPLY_SECRET (every typed character shows as *, backspace works)
+  local prompt=$1 ch pw="" junk
+  printf '%s' "$prompt" >&2
+  while IFS= read -r -s -n1 ch; do
+    case $ch in
+      ""|$'\r') break;;                                             # Enter
+      $'\177'|$'\b') if [[ -n $pw ]]; then pw=${pw%?}; printf '\b \b' >&2; fi;;
+      $'\e') read -r -s -n2 -t 0.05 junk;;                          # arrow keys etc.: ignore
+      *) pw+=$ch; printf '*' >&2;;
+    esac
+  done
+  printf '\n' >&2
+  REPLY_SECRET=$pw
+}
+w6w_secret_for() {   # $1 mode D|P  $2 "confirm" (ask twice when creating) -> W6W_SECRET
+  local a b
+  case $1 in
+    D) w6w_device_key; W6W_SECRET=$W6W_DEVKEY;;
+    P) if [[ -n $W6W_PASSWORD ]]; then W6W_SECRET=$W6W_PASSWORD
+       else
+         [[ -t 0 ]] || { err "Password needed: set W6W_PASSWORD or run in a terminal."; return 1; }
+         info "Type the password - each letter shows as *   (⌫ deletes, Enter finishes)"
+         w6w_read_secret "Password: "; a=$REPLY_SECRET
+         if [[ ${2:-} == confirm ]]; then
+           w6w_read_secret "Repeat password: "; b=$REPLY_SECRET
+           [[ $a == "$b" ]] || { err "The two passwords differ."; return 1; }
+         fi
+         [[ -n $a ]] || { err "Empty password."; return 1; }
+         W6W_SECRET=$a; W6W_PASSWORD=$a          # remembered for this run only
+       fi;;
+    *) err "Unknown W6W mode '$1'."; return 1;;
+  esac
+}
+w6w_derive() {   # $1 salt-hex -> W6W_KEY (encryption) and W6W_MK (MAC), both hex
+  local out
+  export W6W_SECRET W6W_MAC_SECRET="mac:$W6W_SECRET"
+  out=$(openssl enc -aes-256-cbc -pbkdf2 -iter "$W6W_ITER" -md sha256 -S "$1" -pass env:W6W_SECRET -P 2>/dev/null) || return 1
+  W6W_KEY=$(sed -n 's/^key=//p' <<<"$out")
+  out=$(openssl enc -aes-256-cbc -pbkdf2 -iter "$W6W_ITER" -md sha256 -S "$1" -pass env:W6W_MAC_SECRET -P 2>/dev/null) || return 1
+  W6W_MK=$(sed -n 's/^key=//p' <<<"$out")
+  [[ ${#W6W_KEY} -eq 64 && ${#W6W_MK} -eq 64 ]]
+}
+w6w_unlock() {   # $1 file  [$2 noverify] -> W6W_KEY W6W_IV W6W_MK ; verifies the MAC (wrong key / damaged file) unless noverify
+  local f=$1 mode sz mac want salt
+  w6w_have_tools || return 1
+  w6w_is "$f" || { err "Not a .w6w file: $f"; return 1; }
+  mode=$(head -c 5 -- "$f" | tail -c 1)
+  w6w_secret_for "$mode" || return 1
+  salt=$(w6w_field "$f" 8 8); W6W_IV=$(w6w_field "$f" 16 16)
+  w6w_derive "$salt" || { err "Key derivation failed (is openssl working?)."; return 1; }
+  if [[ ${2:-} != noverify ]]; then
+    sz=$(stat -c %s -- "$f"); (( sz > 80 )) || { err "File is too short / damaged."; return 1; }
+    mac=$(head -c -32 -- "$f" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$W6W_MK" -binary | od -An -v -tx1 | tr -d ' \n')
+    want=$(w6w_field "$f" $(( sz - 32 )) 32)
+    if [[ $mac != "$want" ]]; then
+      err "Cannot open: wrong key/password, or the file was changed or damaged."
+      [[ $mode == P ]] && W6W_PASSWORD=""
+      return 1
+    fi
+  fi
+  return 0
+}
+w6w_stream() { tail -c +33 -- "$1" | head -c -32 | openssl enc -d -aes-256-cbc -K "$W6W_KEY" -iv "$W6W_IV"; }
+
+# ---------------------------------------------------------------- what is this file?
+w6w_detect() {   # $1 file -> WD_KIND WD_EXT WD_DETAIL WD_DUR
+  local f=$1 ext n line k v ctype codec w h br dur vc="" ac="" vw="" vh="" ab="" nf="" isvid=0 isaud=0 fmtn=
+  local -a P
+  n=${f##*/}; ext=""; [[ $n == *.* ]] && ext=${n##*.}; ext=${ext,,}
+  WD_KIND=other; WD_EXT=$ext; WD_DETAIL=""; WD_DUR=""
+  case $ext in
+    srt|ass|ssa|vtt|sub|sbv|ttml|smi|lrc) WD_KIND=subtitle; WD_DETAIL=$ext; return 0;;
+    sh|bash|zsh|ksh|fish|py|pl|rb|php|lua|js|mjs|ps1|bat|cmd|awk|sed|jl|rs|go|c|cpp|h|java|kt|swift)
+      WD_KIND=script; WD_DETAIL="$ext source"; return 0;;
+    txt|md|log|csv|tsv|json|xml|yaml|yml|ini|conf|cfg|toml|html|htm|css|rst|tex|svg|rtf|srt)
+      WD_KIND=text; WD_DETAIL="$ext text"; [[ $ext == svg ]] && WD_KIND=image; return 0;;
+    pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|epub|mobi) WD_KIND=document; WD_DETAIL=$ext; return 0;;
+    zip|rar|7z|tar|gz|tgz|xz|bz2|zst|apk|iso) WD_KIND=archive; WD_DETAIL=$ext; return 0;;
+    bin|dat|dll|exe|so|db|sqlite|dex|odex|img|elf|o|a|class|pyc|wasm) WD_KIND=other; WD_DETAIL="binary ($ext)"; return 0;;
+  esac
+  # look inside with ffprobe (pictures, audio and video of any format ffmpeg knows)
+  while IFS= read -r line; do
+    ctype=""; codec=""; w=""; h=""; br=""; dur=""; fnm=""
+    IFS='|' read -ra P <<<"$line"
+    for k in "${P[@]:1}"; do
+      v=${k#*=}; k=${k%%=*}
+      case $k in format_name) fnm=$v;; codec_type) ctype=$v;; codec_name) codec=$v;; width) w=$v;; height) h=$v;; bit_rate) br=$v;; duration) dur=$v;; nb_frames) nf=$v;; esac
+    done
+    case ${P[0]} in
+      format) [[ $dur =~ ^[0-9]+(\.[0-9]+)?$ ]] && WD_DUR=$dur; fmtn=$fnm;;
+      stream)
+        case $ctype in
+          video) if (( ! isvid )); then isvid=1; vc=$codec; vw=$w; vh=$h; fi;;
+          audio) if (( ! isaud )); then isaud=1; ac=$codec; [[ $br =~ ^[0-9]+$ ]] && ab=$(( br / 1000 )); fi;;
+        esac;;
+    esac
+  done < <(ffprobe -v error -show_entries 'format=duration,format_name:stream=codec_type,codec_name,width,height,bit_rate,nb_frames' -of compact -- "$f" 2>/dev/null)
+  # ffprobe "recognises" random binary or plain text as ANSI-art / teletext: not real media
+  case $fmtn in tty|bin|xbin|ansi|idf|adf|artworx|tmv|image_*pipe*|"") [[ $fmtn == image_* ]] || { isvid=0; isaud=0; };; esac
+  case $vc in bintext|xbin|idf|ansi|ascii|tty) isvid=0;; esac
+  if (( isvid )); then
+    case $ext in
+      jpg|jpeg|jfif|png|webp|bmp|tif|tiff|gif|heic|heif|avif|ico|apng) WD_KIND=image;;
+      *) case $vc in
+           mjpeg|png|bmp|tiff|webp|jpegls|jpeg2000|apng|gif)
+             if [[ $nf =~ ^[0-9]+$ ]] && (( nf <= 1 )); then WD_KIND=image; else WD_KIND=video; fi;;
+           *) WD_KIND=video;;
+         esac;;
+    esac
+    if [[ $WD_KIND == image ]]; then WD_DETAIL="$vc ${vw}x${vh}"; WD_DUR=""
+    else WD_DETAIL="$vc${ac:++$ac} ${vw}x${vh}"; fi
+    return 0
+  fi
+  if (( isaud )); then WD_KIND=audio; WD_DETAIL="$ac${ab:+ ${ab}k}"; return 0; fi
+  # not media: text, script or something else
+  if [[ -s $f ]] && LC_ALL=C grep -Iq . -- "$f" 2>/dev/null; then
+    if [[ $(head -c 2 -- "$f") == '#!' ]]; then WD_KIND=script; WD_DETAIL="script ($(head -n1 -- "$f" | cut -c1-30))"
+    else WD_KIND=text; WD_DETAIL="text"; fi
+    return 0
+  fi
+  WD_KIND=other; WD_DETAIL="binary"
+  return 0
+}
+w6w_label() {   # kind -> short upper-case label
+  case $1 in video) echo VIDEO;; image) echo IMAGE;; audio) echo AUDIO;; subtitle) echo SUBTITLE;; text) echo TEXT;; script) echo SCRIPT;; document) echo DOCUMENT;; archive) echo ARCHIVE;; *) echo FILE;; esac
+}
+
+# ---------------------------------------------------------------- squeeze (smaller before packing)
+w6w_squeeze() {   # $1 file $2 kind $3 workdir -> W_SQ = path to use (the original when nothing smaller was made)
+  local f=$1 kind=$2 wd=$3 out snap="" insz osz
+  W_SQ=$f
+  insz=$(fsize "$f")
+  case $kind in
+    video)
+      snap=$(mktemp) || return 0
+      write_settings "$snap"
+      OUTDIR=$wd; SUFFIX="_w6w"; SUB_MODE=off; DELETE_ORIG=0; TRIM_START=""; TRIM_END=""; SKIP_DONE=0
+      LAST_OUT=""
+      compress_file "$f" 0 0 >&2 || true
+      load_conf "$snap"; rm -f -- "$snap"
+      if [[ -n $LAST_OUT && -s $LAST_OUT ]]; then
+        osz=$(fsize "$LAST_OUT")
+        if (( osz < insz )); then W_SQ=$LAST_OUT; else rm -f -- "$LAST_OUT"; fi
+      fi;;
+    image)
+      [[ $WD_EXT == gif || $WD_EXT == svg ]] && return 0
+      have_enc libwebp || return 0
+      out="$wd/sq_$$_${RANDOM}.webp"
+      if ffmpeg -nostdin -v error -y -i "$f" -frames:v 1 -c:v libwebp -quality 82 "$out" 2>>"$LOG" && [[ -s $out ]] && (( $(fsize "$out") < insz )); then W_SQ=$out; else rm -f -- "$out"; fi;;
+    audio)
+      if have_enc libopus; then out="$wd/sq_$$_${RANDOM}.opus"; ffmpeg -nostdin -v error -y -i "$f" -vn -c:a libopus -b:a 64k "$out" 2>>"$LOG"
+      else out="$wd/sq_$$_${RANDOM}.m4a"; ffmpeg -nostdin -v error -y -i "$f" -vn -c:a aac -b:a 96k "$out" 2>>"$LOG"; fi
+      if [[ -s $out ]] && (( $(fsize "$out") < insz )); then W_SQ=$out; else rm -f -- "$out"; fi;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- pack
+w6w_collect() {   # args: files and folders -> W_LIST (every regular file, folders walked, any type)
+  local a f
+  W_LIST=()
+  for a in "$@"; do
+    a=${a#[\'\"]}; a=${a%[\'\"]}; a=${a/#\~/$HOME}
+    if [[ -d $a ]]; then
+      while IFS= read -r f; do [[ -n $f ]] && W_LIST+=("$f"); done < <(find -H "$a" -type f ! -name '.*' 2>/dev/null | LC_ALL=C sort)
+    elif [[ -f $a ]]; then W_LIST+=("$(readlink -f -- "$a")")
+    else warn "Not found: $a"; fi
+  done
+  (( ${#W_LIST[@]} ))
+}
+w6w_pack() {   # $1 output .w6w  then files/folders   (uses W6W_PWMODE, W6W_SQUEEZE, W6W_COMMENT)
+  local out=$1 f i n=0 mode=D kind wd man name ext stored src size dur forid mt base b2 j k smp smb xzl
+  local -a pf=() ek=() ee=() es=() ez=() ed=() eg=() en=() et=() ef=() ep=() fl=()
+  shift
+  w6w_have_tools || return 1
+  w6w_collect "$@" || { err "Nothing to pack."; return 1; }
+  (( W6W_PWMODE )) && mode=P
+  w6w_secret_for "$mode" confirm || return 1
+  [[ $out == *.w6w ]] || out="$out.w6w"
+  wd=$(mktemp -d) || return 1
+  # 1) look at every file, 2) optionally squeeze it, 3) store it (text-like files are xz-compressed)
+  for f in "${W_LIST[@]}"; do
+    n=$(( n + 1 ))
+    w6w_detect "$f"; kind=$WD_KIND; ext=$WD_EXT; name=${f##*/}
+    src=$f
+    if (( W6W_SQUEEZE )) && [[ $kind == video || $kind == image || $kind == audio ]]; then
+      info "[$n/${#W_LIST[@]}] squeezing $kind: $(trunc "$name")"
+      w6w_squeeze "$f" "$kind" "$wd"; src=$W_SQ
+    fi
+    size=$(fsize "$src"); dur=${WD_DUR:-0}; mt=$(stat -c %Y -- "$f" 2>/dev/null || echo 0)
+    stored=raw
+    case $kind in
+      text|script|subtitle|document)
+        xzl=-9e; (( size > 52428800 )) && xzl=-6        # huge text: a faster level
+        if xz $xzl -T0 -c -- "$src" > "$wd/e$(printf '%03d' $n)" 2>/dev/null && [[ -s $wd/e$(printf '%03d' $n) ]]; then stored=xz
+        else rm -f -- "$wd/e$(printf '%03d' $n)"; ln -s -- "$src" "$wd/e$(printf '%03d' $n)"; fi;;
+      other)
+        # compress only if a quick 1 MB sample shows it is worth it (random/encrypted data is not)
+        smp=$(head -c 1048576 -- "$src" | xz -1 -c 2>/dev/null | wc -c); smb=$(( size < 1048576 ? size : 1048576 ))
+        if (( smb > 0 && smp * 100 < smb * 85 )) && xz -6 -T0 -c -- "$src" > "$wd/e$(printf '%03d' $n).try" 2>/dev/null \
+             && (( $(fsize "$wd/e$(printf '%03d' $n).try") * 100 < size * 95 )); then
+          mv -f -- "$wd/e$(printf '%03d' $n).try" "$wd/e$(printf '%03d' $n)"; stored=xz
+        else rm -f -- "$wd/e$(printf '%03d' $n).try"; ln -s -- "$src" "$wd/e$(printf '%03d' $n)"; fi;;
+      *) ln -s -- "$src" "$wd/e$(printf '%03d' $n)";;
+    esac
+    if [[ $src != "$f" ]]; then   # squeezed: the stored name/extension follows the new file
+      name="${name%.*}.${src##*.}"; ext=${src##*.}
+    fi
+    ek[n]=$kind; ee[n]=${ext:-none}; es[n]=$stored; ez[n]=$size; ed[n]=$dur; et[n]=$mt; ep[n]=$(w6w_enc "$WD_DETAIL"); en[n]=$(w6w_enc "$name"); eg[n]=${name%.*}
+    ef[n]=0
+  done
+  # link each subtitle to the video with the same base name
+  for (( i = 1; i <= n; i++ )); do
+    [[ ${ek[i]} == subtitle ]] || continue
+    for (( j = 1; j <= n; j++ )); do
+      [[ ${ek[j]} == video ]] || continue
+      b2=${eg[j]}; base=${eg[i]}
+      if [[ ${base,,} == "${b2,,}" || ${base,,} == "${b2,,}".* ]]; then ef[i]=$j; break; fi
+    done
+  done
+  man="$wd/W6W.MANIFEST"
+  {
+    echo "W6W-MANIFEST 1"
+    echo "app=VidCompress $VERSION"
+    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "comment=$(w6w_enc "$W6W_COMMENT")"
+    echo "count=$n"
+    for (( i = 1; i <= n; i++ )); do
+      printf 'E|%d|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$i" "${ek[i]}" "${ee[i]}" "${es[i]}" "${ez[i]}" "${ed[i]}" "${ef[i]}" "${et[i]}" "${ep[i]}" "${en[i]}"
+    done
+  } > "$man"
+  for (( i = 1; i <= n; i++ )); do fl+=("e$(printf '%03d' "$i")"); done
+  info "Encrypting $n item(s) ..."
+  local salt iv mac
+  salt=$(w6w_hex_rand 8); iv=$(w6w_hex_rand 16)
+  w6w_derive "$salt" || { err "Key derivation failed."; rm -rf -- "$wd"; return 1; }
+  mkdir -p -- "$(dirname -- "$out")"
+  {
+    printf 'W6W1%s' "$mode"; printf '\0\0\0'
+    w6w_hex2bin "$salt"; w6w_hex2bin "$iv"
+  } > "$out.part"
+  if ! ( cd "$wd" && tar -chf - W6W.MANIFEST "${fl[@]}" ) | openssl enc -aes-256-cbc -K "$W6W_KEY" -iv "$iv" >> "$out.part"; then
+    err "Packing failed."; rm -rf -- "$wd" "$out.part"; return 1
+  fi
+  mac=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$W6W_MK" -binary < "$out.part" | od -An -v -tx1 | tr -d ' \n')
+  w6w_hex2bin "$mac" >> "$out.part"
+  rm -rf -- "$wd"
+  mv -f -- "$out.part" "$out"
+  ok "Created: $(pretty "$out")  ($n items, $(human "$(fsize "$out")"), $( [[ $mode == D ]] && echo "locked to this phone's key [$(w6w_fp "$W6W_DEVKEY")]" || echo "password protected" ))"
+  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
+  return 0
+}
+
+# ---------------------------------------------------------------- read the contents
+w6w_load() {   # $1 file (already unlocked) -> W_* arrays
+  local man line i F mode
+  local -a P
+  man=$(w6w_stream "$1" 2>/dev/null | tar -xOf - W6W.MANIFEST --occurrence=1 2>/dev/null)
+  [[ $man == W6W-MANIFEST* ]] || { err "Cannot read the contents (wrong key, or damaged file)."; return 1; }
+  W_KIND=(); W_EXT=(); W_STORED=(); W_SIZE=(); W_DUR=(); W_FOR=(); W_MT=(); W_DETAIL=(); W_NAME=(); W_N=0; W_CREATED=""; W_COMMENT_TXT=""
+  while IFS= read -r line; do
+    case $line in
+      created=*) W_CREATED=${line#created=};;
+      comment=*) W_COMMENT_TXT=$(w6w_dec "${line#comment=}");;
+      E\|*)
+        IFS='|' read -ra P <<<"$line"
+        i=${P[1]}
+        W_KIND[i]=${P[2]}; W_EXT[i]=${P[3]}; W_STORED[i]=${P[4]}; W_SIZE[i]=${P[5]}; W_DUR[i]=${P[6]}
+        W_FOR[i]=${P[7]}; W_MT[i]=${P[8]}; W_DETAIL[i]=$(w6w_dec "${P[9]}"); W_NAME[i]=$(w6w_dec "${P[10]}")
+        (( i > W_N )) && W_N=$i;;
+    esac
+  done <<<"$man"
+  (( W_N > 0 ))
+}
+w6w_show() {   # $1 file (loaded)
+  local i mode
+  mode=$(head -c 5 -- "$1" | tail -c 1)
+  printf '\n%s== %s ==%s\n' "$C_B" "$(basename -- "$1")" "$C_0"
+  printf '  %s%d item(s) | created %s | %s%s\n' "$C_D" "$W_N" "${W_CREATED:-?}" "$( [[ $mode == D ]] && echo "device key" || echo "password")" "$C_0"
+  [[ -n $W_COMMENT_TXT ]] && printf '  %s"%s"%s\n' "$C_D" "$W_COMMENT_TXT" "$C_0"
+  echo
+  for (( i = 1; i <= W_N; i++ )); do
+    [[ -n ${W_KIND[i]-} ]] || continue
+    printf ' %2d) %-8s %-5s %9s  %s\n' "$i" "$(w6w_label "${W_KIND[i]}")" "${W_EXT[i]}" "$(human "${W_SIZE[i]}")" "$(trunc "${W_NAME[i]}")"
+    printf '      %s%s%s%s%s\n' "$C_D" "${W_DETAIL[i]}" "$( [[ ${W_DUR[i]} != 0 && -n ${W_DUR[i]} ]] && printf ' | %s' "$(fmt_time "${W_DUR[i]}")" )" "$( (( ${W_FOR[i]:-0} > 0 )) && printf ' | subtitle for #%s' "${W_FOR[i]}" )" "$C_0"
+  done
+}
+
+# ---------------------------------------------------------------- extract / convert / play
+w6w_take() {   # $1 file  $2 workdir  $3.. indexes (empty = all)  -> eNNN files in workdir
+  local f=$1 wd=$2 i
+  local -a m=()
+  shift 2
+  for i in "$@"; do m+=("e$(printf '%03d' "$i")"); done
+  if (( ${#m[@]} )); then w6w_stream "$f" 2>/dev/null | tar -xf - -C "$wd" --occurrence=1 "${m[@]}" 2>/dev/null
+  else w6w_stream "$f" 2>/dev/null | tar -xf - -C "$wd" 2>/dev/null; fi
+  return 0
+}
+w6w_restore() {   # $1 workdir $2 index $3 destdir -> W_OUT (real file with its original name, decompressed)
+  local wd=$1 i=$2 dest=$3 nm base ext tmp
+  local e="$wd/e$(printf '%03d' "$i")"
+  [[ -e $e ]] || return 1
+  nm=${W_NAME[i]##*/}; [[ -n $nm ]] || nm="item$i.${W_EXT[i]}"
+  base=${nm%.*}; ext=${nm##*.}; [[ $nm == *.* ]] || ext=""
+  mkdir -p -- "$dest"
+  W_OUT=$(unique_file "$dest" "$base" "${ext:-bin}")
+  [[ -z $ext ]] && W_OUT=${W_OUT%.bin}
+  if [[ ${W_STORED[i]} == xz ]]; then xz -dc -- "$e" > "$W_OUT"; else cp -f -- "$e" "$W_OUT"; fi
+  rm -f -- "$e"
+  [[ -s $W_OUT ]] || [[ ${W_SIZE[i]} == 0 ]] || return 1
+  [[ ${W_MT[i]} =~ ^[0-9]+$ ]] && touch -d "@${W_MT[i]}" -- "$W_OUT" 2>/dev/null
+  return 0
+}
+w6w_extract() {   # $1 file $2 destdir  [indexes...]
+  local f=$1 dest=$2 wd i c=0
+  local -a want=()
+  shift 2
+  want=("$@")
+  wd=$(mktemp -d) || return 1
+  w6w_take "$f" "$wd" "${want[@]}"
+  if (( ${#want[@]} == 0 )); then for (( i = 1; i <= W_N; i++ )); do want+=("$i"); done; fi
+  for i in "${want[@]}"; do
+    if w6w_restore "$wd" "$i" "$dest"; then ok "$(printf '%-8s' "$(w6w_label "${W_KIND[i]}")") -> $(pretty "$W_OUT")"; c=$(( c + 1 ))
+    else warn "Item $i could not be restored."; fi
+  done
+  rm -rf -- "$wd"
+  info "$c item(s) extracted to $(pretty "$dest")"
+  return 0
+}
+w6w_convert_one() {   # $1 file path  $2 kind  $3 target ext ("" = keep)  $4 destdir  $5 subtitle path ("" none) -> W_OUT
+  local f=$1 kind=$2 to=${3,,} dest=$4 sub=${5:-} base out dur sc
+  local -a a=() ar=()
+  base=${f##*/}; base=${base%.*}
+  case $kind in
+    video)
+      case $to in mp4|mkv|webm|mov|avi|ts) ;; "") to=mkv;; *) return 1;; esac
+      out=$(unique_file "$dest" "$base" "$to")
+      ar=(-i "$f"); [[ -n $sub ]] && ar+=(-i "$sub")
+      probe "$f" >/dev/null 2>&1; dur=$DUR
+      a=(-map 0:v:0 -map '0:a?')
+      [[ -n $sub ]] && a+=(-map 1:0)
+      case $to in
+        mkv) a+=(-c copy); [[ -n $sub ]] && { case ${sub##*.} in ass|ssa) sc=ass;; *) sc=srt;; esac; a+=(-c:s "$sc"); };;
+        mp4|mov)
+          case $SRC_VCODEC in h264|hevc|av1) a+=(-c:v copy);; *) a+=(-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p);; esac
+          case $SRC_ACODEC in aac|mp3|ac3|eac3|"") a+=(-c:a copy);; *) a+=(-c:a aac -b:a 160k);; esac
+          [[ -n $sub ]] && a+=(-c:s mov_text); [[ $to == mp4 ]] && a+=(-movflags +faststart);;
+        webm)
+          case $SRC_VCODEC in vp8|vp9|av1) a+=(-c:v copy);; *) a+=(-c:v libvpx-vp9 -b:v 0 -crf 33 -row-mt 1 -deadline good -cpu-used 4);; esac
+          case $SRC_ACODEC in opus|vorbis|"") a+=(-c:a copy);; *) a+=(-c:a libopus -b:a 96k);; esac
+          [[ -n $sub ]] && a+=(-c:s webvtt);;
+        avi|ts)
+          a+=(-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a "$(have_enc libmp3lame && echo libmp3lame || echo aac)" -b:a 160k -sn);;
+      esac
+      EDUR=$dur
+      run_ffmpeg "convert" 1 1 "${ar[@]}" "${a[@]}" -max_muxing_queue_size 4096 "$out" || { rm -f -- "$out"; return 1; }
+      W_OUT=$out;;
+    image)
+      case $to in jpg|jpeg|png|webp) ;; "") w6w_copy_to "$f" "$dest"; return 0;; *) return 1;; esac
+      out=$(unique_file "$dest" "$base" "$to")
+      ffmpeg -nostdin -v error -y -i "$f" -frames:v 1 -update 1 "$out" 2>>"$LOG" && [[ -s $out ]] || { rm -f -- "$out"; return 1; }
+      W_OUT=$out;;
+    audio)
+      case $to in mp3|m4a|opus|wav|flac) ;; "") w6w_copy_to "$f" "$dest"; return 0;; *) return 1;; esac
+      out=$(unique_file "$dest" "$base" "$to")
+      case $to in
+        mp3) ar=(-c:a libmp3lame -b:a 192k);; m4a) ar=(-c:a aac -b:a 160k);; opus) ar=(-c:a libopus -b:a 96k);; wav) ar=(-c:a pcm_s16le);; flac) ar=(-c:a flac);;
+      esac
+      ffmpeg -nostdin -v error -y -i "$f" -vn "${ar[@]}" "$out" 2>>"$LOG" && [[ -s $out ]] || { rm -f -- "$out"; return 1; }
+      W_OUT=$out;;
+    subtitle)
+      case $to in srt|vtt|ass) ;; "") w6w_copy_to "$f" "$dest"; return 0;; *) return 1;; esac
+      out=$(unique_file "$dest" "$base" "$to")
+      ffmpeg -nostdin -v error -y -i "$f" "$out" 2>>"$LOG" && [[ -s $out ]] || { rm -f -- "$out"; return 1; }
+      W_OUT=$out;;
+    *) w6w_copy_to "$f" "$dest";;      # text, scripts, documents, archives, other files: restored as they are
+  esac
+  return 0
+}
+w6w_copy_to() {   # $1 file  $2 destdir -> W_OUT (same name, never overwrites)
+  local n=${1##*/} base ext
+  base=${n%.*}; ext=${n##*.}; [[ $n == *.* ]] || ext=""
+  W_OUT=$(unique_file "$2" "$base" "${ext:-bin}")
+  [[ -z $ext ]] && W_OUT=${W_OUT%.bin}
+  cp -f -- "$1" "$W_OUT"
+}
+w6w_convert() {   # $1 file $2 destdir $3 target ("" = natural defaults) [indexes...]
+  local f=$1 dest=$2 to=$3 wd i k c=0 skipped=0 tmpd sub s
+  local -a want=()
+  shift 3
+  want=("$@")
+  wd=$(mktemp -d) || return 1; tmpd=$(mktemp -d) || return 1
+  w6w_take "$f" "$wd" "${want[@]}"
+  if (( ${#want[@]} == 0 )); then for (( i = 1; i <= W_N; i++ )); do want+=("$i"); done; fi
+  mkdir -p -- "$dest"
+  # linked subtitles are restored first, then muxed into their video
+  for i in "${want[@]}"; do
+    if w6w_restore "$wd" "$i" "$tmpd"; then W_RES[i]=$W_OUT; fi
+  done
+  for i in "${want[@]}"; do
+    [[ -n ${W_RES[i]-} ]] || continue
+    k=${W_KIND[i]}
+    if [[ $k == subtitle ]] && (( ${W_FOR[i]:-0} > 0 )) && [[ -n ${W_RES[${W_FOR[i]}]-} ]] && [[ -z $to || $to == mp4 || $to == mkv || $to == webm || $to == mov ]]; then
+      continue    # goes inside its video below
+    fi
+    sub=""
+    if [[ $k == video ]]; then
+      for (( s = 1; s <= W_N; s++ )); do
+        [[ ${W_KIND[s]-} == subtitle && ${W_FOR[s]:-0} == "$i" && -n ${W_RES[s]-} ]] && { sub=${W_RES[s]}; break; }
+      done
+    fi
+    if w6w_convert_one "${W_RES[i]}" "$k" "$to" "$dest" "$sub"; then
+      ok "$(printf '%-8s' "$(w6w_label "$k")") -> $(pretty "$W_OUT")${sub:+  (+ subtitle inside)}"; c=$(( c + 1 ))
+    else
+      # this target does not fit this kind: keep the original format
+      if w6w_convert_one "${W_RES[i]}" "$k" "" "$dest" "$sub"; then ok "$(printf '%-8s' "$(w6w_label "$k")") -> $(pretty "$W_OUT")  (kept as is)"; c=$(( c + 1 ))
+      else warn "Item $i ($k) could not be converted."; skipped=$(( skipped + 1 )); fi
+    fi
+  done
+  rm -rf -- "$wd" "$tmpd"; W_RES=()
+  info "$c item(s) written to $(pretty "$dest")"
+  return 0
+}
+declare -a W_RES=()
+w6w_play() {   # $1 file (loaded) $2 index -> view / play one item without leaving a decrypted copy behind
+  local f=$1 i=$2 wd pd rest s sub="" out
+  [[ -n ${W_KIND[i]-} ]] || { err "No item $i."; return 1; }
+  wd=$(mktemp -d) || return 1
+  w6w_take "$f" "$wd" "$i"
+  case ${W_KIND[i]} in
+    text|script|subtitle)
+      if w6w_restore "$wd" "$i" "$wd/out"; then
+        printf '\n%s--- %s ---%s\n' "$C_B" "${W_NAME[i]}" "$C_0"
+        if [[ -t 1 ]] && command -v less >/dev/null 2>&1 && (( $(wc -l < "$W_OUT") > 40 )); then less -- "$W_OUT"; else head -n 200 -- "$W_OUT"; fi
+      fi;;
+    video|image|audio)
+      if [[ -d $HOME/storage/shared ]]; then pd="$HOME/storage/shared/.w6w_play"; else pd=${TMPDIR:-/tmp}/.w6w_play; fi
+      mkdir -p -- "$pd"; : > "$pd/.nomedia"
+      if w6w_restore "$wd" "$i" "$pd"; then
+        out=$W_OUT
+        if [[ ${W_KIND[i]} == video ]]; then
+          for (( s = 1; s <= W_N; s++ )); do
+            if [[ ${W_KIND[s]-} == subtitle && ${W_FOR[s]:-0} == "$i" ]]; then
+              w6w_take "$f" "$wd" "$s"; w6w_restore "$wd" "$s" "$wd/sub" && sub=$W_OUT; break
+            fi
+          done
+          if [[ -n $sub ]]; then
+            local mux="$pd/play_$$.mkv" sc=srt; [[ ${sub##*.} == ass || ${sub##*.} == ssa ]] && sc=ass
+            if ffmpeg -nostdin -v error -y -i "$out" -i "$sub" -map 0 -map 1:0 -c copy -c:s "$sc" "$mux" 2>>"$LOG" && [[ -s $mux ]]; then rm -f -- "$out"; out=$mux; fi
+          fi
+        fi
+        if command -v termux-open >/dev/null 2>&1; then
+          termux-open "$out" || warn "Could not open it with an app."
+          info "Opened. The temporary decrypted copy is deleted when you press Enter."
+          read -r -p "Press Enter when you are done ... " rest || true
+        else
+          warn "termux-open is missing (pkg install termux-tools). Decrypted copy: $out"
+          read -r -p "Press Enter to delete it ... " rest || true
+        fi
+        rm -f -- "$out" "$pd"/play_$$.mkv
+      fi;;
+    *) warn "A ${W_KIND[i]} item cannot be played - use extract.";;
+  esac
+  rm -rf -- "$wd"
+  return 0
+}
+
+# ---------------------------------------------------------------- key management
+w6w_key_cmd() {   # show | export | import HEX | new
+  w6w_have_tools || return 1
+  case ${1:-show} in
+    show)   w6w_device_key
+            printf 'Device key fingerprint: %s  (the key stays on this phone: %s)\n' "$(w6w_fp "$W6W_DEVKEY")" "$(pretty "$CONF_DIR/w6w.key")"
+            printf 'Files packed in device mode open ONLY with this key. Back it up: vc --w6w key export\n';;
+    export) w6w_device_key
+            warn "Anyone with this text can open your device-mode .w6w files. Keep it secret."
+            printf '%s\n' "$W6W_DEVKEY";;
+    import) [[ ${2:-} =~ ^[0-9a-fA-F]{64}$ ]] || { err "Give the 64-character hex key."; return 1; }
+            mkdir -p "$CONF_DIR"
+            local had=0; [[ -s $CONF_DIR/w6w.key ]] && { had=1; cp -f -- "$CONF_DIR/w6w.key" "$CONF_DIR/w6w.key.bak"; }
+            ( umask 077; printf '%s' "${2,,}" > "$CONF_DIR/w6w.key" ); ok "Key imported.$( (( had )) && echo ' (the old one is kept as w6w.key.bak)')";;
+    new)    warn "A NEW key makes every device-mode .w6w made so far unreadable (unless you keep a backup)."
+            if [[ -t 0 ]] && ! yesno "Create a new key?" n; then return 1; fi
+            [[ -s $CONF_DIR/w6w.key ]] && cp -f -- "$CONF_DIR/w6w.key" "$CONF_DIR/w6w.key.bak"
+            ( umask 077; w6w_hex_rand 32 > "$CONF_DIR/w6w.key" ); ok "New key created (old one kept as w6w.key.bak).";;
+    *) err "Use: key show | export | import HEX | new"; return 1;;
+  esac
+}
+
+# ---------------------------------------------------------------- menus & CLI
+w6w_find_files() {   # newest .w6w files on the phone -> W_FOUND
+  local root line
+  W_FOUND=()
+  fv_root; root=$FV_ROOT
+  while IFS= read -r line; do [[ -n $line ]] && W_FOUND+=("${line#*$'\t'}"); done < <(find -H "$root" -maxdepth 9 \( -name '.*' -o -iname cache -o -path '*/Android/data' \) -prune -o -type f -iname '*.w6w' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -n 30)
+}
+w6w_pick_file() {   # -> PICK_RESULT
+  local i ans
+  PICK_RESULT=""
+  w6w_find_files
+  if (( ${#W_FOUND[@]} )); then
+    echo " .w6w files found on your phone:"
+    for i in "${!W_FOUND[@]}"; do printf ' %2d) %8s  %s\n' $(( i + 1 )) "$(human "$(fsize "${W_FOUND[i]}")")" "$(trunc "$(pretty "${W_FOUND[i]}")")"; done
+  else echo " (no .w6w file found - type a path)"; fi
+  ans=$(ask "Number or path" "")
+  [[ -n $ans ]] || return 1
+  if [[ $ans =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#W_FOUND[@]} )); then PICK_RESULT=${W_FOUND[ans-1]}
+  else ans=${ans/#\~/$HOME}; [[ -f $ans ]] && PICK_RESULT=$(readlink -f -- "$ans"); fi
+  [[ -n $PICK_RESULT ]] || { warn "Not found."; return 1; }
+}
+w6w_open_flow() {   # $1 file: look inside, then play / extract / convert
+  local f=$1 c a dest
+  w6w_unlock "$f" || return 1
+  w6w_load "$f" || return 1
+  while true; do
+    w6w_show "$f"
+    echo
+    echo " number = play / view that item     x = extract all"
+    echo " c = convert all (video->mp4 ...)   e N = extract item N     b = back"
+    read -r -p "> " c || return 0
+    case ${c,,} in
+      b|"") return 0;;
+      x) dest=$(ask "Extract into folder" "$(dirname -- "$f")/$(basename -- "${f%.*}")_extracted"); dest=${dest/#\~/$HOME}; w6w_extract "$f" "$dest"; pause;;
+      c) a=$(ask "Convert to (mp4 / mkv / webm, jpg / png / webp, mp3 / m4a / opus, srt / vtt - blank = natural)" "")
+         dest=$(ask "Write into folder" "$(dirname -- "$f")/$(basename -- "${f%.*}")_converted"); dest=${dest/#\~/$HOME}
+         w6w_convert "$f" "$dest" "$a"; pause;;
+      e\ *) a=${c#e }; if [[ $a =~ ^[0-9]+$ ]]; then dest=$(dirname -- "$f")/$(basename -- "${f%.*}")_extracted; w6w_extract "$f" "$dest" "$a"; fi; pause;;
+      *) if [[ $c =~ ^[0-9]+$ ]]; then w6w_play "$f" "$c"; fi;;
+    esac
+  done
+}
+w6w_pack_flow() {   # interactive: pick files, options, create
+  local out p ans first
+  local -a extra=()
+  w6w_have_tools || { pause; return 1; }
+  printf '\n%s== Pack into .w6w ==%s\n' "$C_B" "$C_0"
+  info "Pick videos below (a = all). Then you can add ANY other file or folder: pictures, text, scripts, subtitles ..."
+  find_videos multi
+  while true; do
+    p=$(ask "Add a file or folder (blank = done)" "")
+    [[ -n $p ]] || break
+    p=${p/#\~/$HOME}
+    if [[ -e $p ]]; then extra+=("$p"); ok "Added: $p"; else warn "Not found: $p"; fi
+  done
+  if (( ${#SELECTED[@]} + ${#extra[@]} == 0 )); then warn "Nothing chosen."; pause; return 1; fi
+  first=${SELECTED[0]:-${extra[0]}}
+  out=$(ask "Name of the .w6w file" "$(dirname -- "$first")/$(basename -- "${first%.*}").w6w")
+  out=${out/#\~/$HOME}
+  if yesno "Squeeze first (shrinks videos with your current preset, pictures to WebP, audio to Opus)?" n; then W6W_SQUEEZE=1; else W6W_SQUEEZE=0; fi
+  echo " 1) lock to THIS phone (device key - nothing else can open it)"
+  echo " 2) password (can be opened on another phone that has vc)"
+  ans=$(ask "Choose" "1")
+  [[ $ans == 2 ]] && W6W_PWMODE=1 || W6W_PWMODE=0
+  W6W_COMMENT=$(ask "Note inside the file (optional)" "")
+  w6w_pack "$out" "${SELECTED[@]}" "${extra[@]}"
+  pause
+}
+w6w_menu() {
+  local c f
+  while true; do
+    clear_screen
+    printf '%s== W6W vault ==%s\n' "$C_B" "$C_0"
+    printf '  %sOne encrypted file for videos, pictures, audio, text, scripts, subtitles...%s\n\n' "$C_D" "$C_0"
+    echo " 1) Pack files into a .w6w"
+    echo " 2) Open a .w6w (look inside, play, extract, convert)"
+    echo " 3) Key & security"
+    echo " b) Back"
+    read -r -p "> " c || return
+    case $c in
+      1) w6w_pack_flow;;
+      2) if w6w_pick_file; then w6w_open_flow "$PICK_RESULT"; fi;;
+      3) clear_screen; w6w_key_cmd show; echo
+         echo " e) export the key (backup)   n) create a NEW key   b) back"
+         read -r -p "> " c || return
+         case $c in e|E) w6w_key_cmd export;; n|N) w6w_key_cmd new;; esac
+         pause;;
+      b|B|"") return;;
+    esac
+  done
+}
+w6w_cli() {   # vc --w6w  pack|info|extract|convert|play|key|list ...
+  local cmd=${1:-} f dest idx
+  shift || true
+  dest=${OUTDIR:-}
+  case $cmd in
+    pack)    (( $# >= 2 )) || { err "Usage: vc --w6w pack OUT.w6w FILE|FOLDER ... [--squeeze] [--password] [--comment TEXT]"; return 1; }
+             w6w_pack "$@";;
+    info|ls) f=${1:-}; [[ -f $f ]] || { err "Usage: vc --w6w info FILE.w6w"; return 1; }
+             w6w_unlock "$f" noverify || return 1; w6w_load "$f" || return 1; w6w_show "$f";;
+    verify)  f=${1:-}; [[ -f $f ]] || { err "Usage: vc --w6w verify FILE.w6w"; return 1; }
+             w6w_unlock "$f" && ok "Integrity OK - key accepted, nothing was changed.";;
+    extract) f=${1:-}; [[ -f $f ]] || { err "Usage: vc --w6w extract FILE.w6w [-o DIR] [N ...]"; return 1; }
+             shift; w6w_unlock "$f" || return 1; w6w_load "$f" || return 1
+             [[ -n $dest ]] || dest=$(dirname -- "$f")/$(basename -- "${f%.*}")_extracted
+             w6w_extract "$f" "$dest" "$@";;
+    convert) f=${1:-}; [[ -f $f ]] || { err "Usage: vc --w6w convert FILE.w6w [--to FMT] [-o DIR] [N ...]"; return 1; }
+             shift; w6w_unlock "$f" || return 1; w6w_load "$f" || return 1
+             [[ -n $dest ]] || dest=$(dirname -- "$f")/$(basename -- "${f%.*}")_converted
+             w6w_convert "$f" "$dest" "$W6W_TO" "$@";;
+    play)    f=${1:-}; idx=${2:-1}; [[ -f $f ]] || { err "Usage: vc --w6w play FILE.w6w [N]"; return 1; }
+             w6w_unlock "$f" || return 1; w6w_load "$f" || return 1; w6w_play "$f" "$idx";;
+    key)     w6w_key_cmd "$@";;
+    list|find) w6w_find_files; printf '%s\n' "${W_FOUND[@]}";;
+    *)       err "Usage: vc --w6w pack | info | verify | extract | convert | play | key | list"; return 1;;
+  esac
+}
+
 main() {
-  local STUDIO=0 FRAMES_MODE=0 RACE_MODE=""
+  local STUDIO=0 FRAMES_MODE=0 RACE_MODE="" W6W_MODE=0 LAB_MODE=0
   refresh_cols; trap refresh_cols WINCH
   case ${1:-} in
-    --setup)   do_setup; exit;;
+    --setup)   case ${2:-} in core|w6w|perf|repair|extras|all) do_setup "$2"; exit $?;; *) do_setup all; exit $?;; esac;;
+    --doctor)  check_deps; exit 0;;
     --install) do_install; exit;;
     --version) echo "VidCompress $VERSION  by $CREATOR  ($WEBSITE)"; exit;;
     --help|-h) usage; exit;;
@@ -4349,7 +5484,9 @@ main() {
   # sanitize values loaded from an older config
   case $SUB_MODE in off|soft|burn) ;; *) SUB_MODE=soft;; esac
   case $FINISH_ACTION in summary|open) ;; *) FINISH_ACTION=menu;; esac
-  [[ $OUT_EXT == mkv ]] || OUT_EXT=mp4
+  case $OUT_EXT in mp4|mkv|webm|mov|avi|ts) ;; *) OUT_EXT=mp4;; esac
+  [[ $DEINT =~ ^[01]$ ]] || DEINT=1
+  [[ $AUTOCROP =~ ^[01]$ ]] || AUTOCROP=0
   [[ $KEEP_SUBS =~ ^[01]$ ]] || KEEP_SUBS=1
   [[ $PARALLEL_JOBS =~ ^[1-8]$ ]] || PARALLEL_JOBS=1
   [[ $SUB_SIZE =~ ^[0-9]+$ ]] || SUB_SIZE=24
@@ -4374,6 +5511,9 @@ main() {
       --keepsubs) KEEP_SUBS=1; shift;;
       --nosubs)   KEEP_SUBS=0; shift;;
       --mkv)      OUT_EXT=mkv; shift;;
+      --format)   if (( $# >= 2 )); then OUT_EXT=${2,,}; shift 2; else err "--format needs mp4 | mkv | webm | mov | avi | ts"; exit 1; fi;;
+      --no-deint) DEINT=0; shift;;
+      --autocrop) AUTOCROP=1; shift;;
       --repair)   REPAIR_ACTION=repair; shift;;
       --diagnose) REPAIR_ACTION=diagnose; shift;;
       --quickfix) REPAIR_ACTION=quickfix; shift;;
@@ -4393,6 +5533,14 @@ main() {
       --race-all)    RACE_MODE=all; shift;;
       --no-quality)  NOQUALITY=1; shift;;
       --cpu)         CPU_MODE=1; shift;;
+      --repair-lab)  LAB_MODE=1; shift;;
+      --ref)         if (( $# >= 2 )); then REPAIR_REF=$2; shift 2; else err "--ref needs a healthy video file"; exit 1; fi;;
+      --sample)      LAB_SAMPLE=1; shift;;
+      --w6w)         W6W_MODE=1; shift;;
+      --squeeze)     W6W_SQUEEZE=1; shift;;
+      --password)    W6W_PWMODE=1; shift;;
+      --to)          if (( $# >= 2 )); then W6W_TO=${2,,}; shift 2; else err "--to needs a format (mp4, png, mp3 ...)"; exit 1; fi;;
+      --comment)     if (( $# >= 2 )); then W6W_COMMENT=$2; shift 2; else err "--comment needs a text"; exit 1; fi;;
       --tune)        TUNE_MODE=1; shift;;
       --goal)        if (( $# >= 2 )); then TUNE_GOAL=${2,,}; shift 2; else err "--goal needs speed | balanced | size | quality"; exit 1; fi;;
       --cores)    if (( $# >= 2 )); then CORES=${2,,}; shift 2; else err "--cores needs auto | all | a list like 4-7"; exit 1; fi;;
@@ -4421,6 +5569,7 @@ main() {
     ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow) ;;
     *) err "Bad --repair-preset value."; exit 1;;
   esac
+  case $OUT_EXT in mp4|mkv|webm|mov|avi|ts) ;; *) err "--format must be mp4, mkv, webm, mov, avi or ts."; exit 1;; esac
   case $TUNE_GOAL in ""|speed|balanced|size|quality) ;; *) err "--goal must be speed, balanced, size or quality."; exit 1;; esac
   [[ $CORES == auto || $CORES == all || $CORES =~ ^[0-9]+([-,][0-9]+)*$ ]] || { err "--cores must be auto, all or a list like 4-7."; exit 1; }
   [[ $THREADS =~ ^[0-9]+$ ]] && (( THREADS <= 128 )) || { err "--threads must be 0-128."; exit 1; }
@@ -4474,7 +5623,7 @@ main() {
   apply_cores; calc_threads 1
   if (( CPU_MODE )); then device_report; exit 0; fi
   if [[ -n $PRESET_ARG ]]; then apply_preset "$PRESET_ARG" || { err "Unknown preset: $PRESET_ARG"; exit 1; }; fi
-  [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
+  [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|vp9|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
   [[ -n $OV_C ]] && { CRF=$OV_C; TARGET_MB=0; PRESET_NAME=custom; }
   [[ -n $OV_T ]] && { TARGET_MB=$OV_T; PRESET_NAME=custom; }
   [[ -n $OV_R ]] && { HEIGHT=$OV_R; PRESET_NAME=custom; }
@@ -4486,6 +5635,7 @@ main() {
     PRESET_NAME=custom
   fi
   [[ -n $OV_O ]] && OUTDIR=${OV_O/#\~/$HOME}
+  if (( W6W_MODE )); then w6w_cli "$@"; exit $?; fi
   if [[ -n $OV_TS ]]; then TRIM_START=$(to_sec "$OV_TS") || { err "Bad -S time"; exit 1; }; fi
   if [[ -n $OV_TE ]]; then
     if [[ $OV_TE == +* ]]; then      # +N = N seconds after the start
@@ -4539,6 +5689,11 @@ main() {
     if [[ -z $TRIM_START && -z $TRIM_END ]] && [[ -t 0 ]]; then frames_flow "${SELECTED[0]}"; exit $?; fi
     NONINTERACTIVE=1
     extract_frames "${SELECTED[0]}" "$TRIM_START" "$TRIM_END" 0 "$OUTDIR"
+    exit $?
+  fi
+  if (( LAB_MODE )); then
+    (( ${#SELECTED[@]} == 1 )) || { err "Usage: vc --repair-lab FILE [--ref HEALTHY_FILE] [--sample]"; exit 1; }
+    repair_lab "${SELECTED[0]}" "$REPAIR_REF"
     exit $?
   fi
   if [[ -n $REPAIR_ACTION ]]; then
