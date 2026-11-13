@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v3.1 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v3.0 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -17,18 +17,6 @@
 #     vc --tune               # AUTO-TUNE: test this phone, pick + save the fastest settings
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
-#
-#  What's new in 3.1:
-#   + REPAIR LAB (Repair menu 7, or vc --repair-lab FILE): runs every repair method on
-#     your video (quick remux, smart Auto-Repair, full rebuild, rescue, MP4Box and
-#     untrunc when installed), measures time + size, re-checks each result (does it
-#     play to the end, are problems left?) and keeps the fastest result that is
-#     completely fixed. Unreadable MP4s also get MP4Box / untrunc automatically.
-#   + AUTO-INSTALLER (vc --setup, Tools 8): installs ffmpeg and every helper the
-#     features need (openssl, xz, tar, gpac/MP4Box, util-linux, less, termux-api ...)
-#     one by one, with retries and a clear table of what worked. vc --doctor shows
-#     the status. Missing helpers are also offered on the spot when a feature needs one.
-#   + Fixed: -k vp9 was rejected on the command line.
 #
 #  What's new in 3.0:
 #   + FORMATS: reads far more video formats (MPEG/VOB/TS/M2TS, WMV/ASF, FLV, RM/RMVB,
@@ -160,7 +148,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="3.1"
+VERSION="3.0"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -231,7 +219,6 @@ NOQUALITY=0; SSIM_VAL=""; NOW_US=0; CPU_MODE=0
 declare -a CPU_CAP=() CPU_FREQ=() CPU_PART=() CPU_BIGIDX=()
 RACE_LEN=8; TUNE_GOAL=""; TUNE_PICK=""; TUNE_WHY=""; AGE_TXT=""; TUNE_MODE=0
 ASK_MEMO_DIR=""; FORCE_TARGET=""; QUEUE_MS=""; VERIFY_OK=1; VERIFY_NOTE=""; DIAG_NPROBS=-1
-REPAIR_FORCE=""; REPAIR_OUTDIR=""; REPAIR_REF=""; RM_OUT=""; SETUP_LOG=""; LAB_SAMPLE=0
 AENC_NAME=aac; CT_SUBS=mov_text; CT_FMT=mp4; CT_FAST=1; CT_STAGE=1; CT_HVC=1; CROP_VF=""; SRC_FIELD=""; D_FIELD=""
 FV_ROOT=""; FV_REAL=""
 declare -a PICKED=()
@@ -2572,177 +2559,6 @@ repair_rescue_run() {   # called from repair_file: re-encode video + audio clean
     "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
   run_ffmpeg "rescue" 1 1 "${rargs[@]}"
 }
-
-# ============================================================ REPAIR LAB (v3.1)
-repair_mp4box() {   # $1 src $2 outdir -> RM_OUT ; MP4Box rewrites the container (rebuilds index tables)
-  local src=$1 od=$2 base out
-  RM_OUT=""
-  tool_have MP4Box || return 1
-  base=${src##*/}; base=${base%.*}
-  mkdir -p -- "$od"; out=$(unique_file "$od" "${base}_mp4box" mp4)
-  MP4Box -add "$src" -new "$out" >>"${LOGF:-$LOG}" 2>&1
-  [[ -s $out ]] || { rm -f -- "$out"; return 1; }
-  RM_OUT=$out
-}
-repair_untrunc() {   # $1 broken $2 healthy reference (same camera/settings) $3 outdir -> RM_OUT
-  local src=$1 ref=$2 od=$3 base made out
-  RM_OUT=""
-  tool_have untrunc || return 1
-  [[ -f $ref ]] || return 1
-  base=${src##*/}; made="${src%.*}_fixed.${src##*.}"
-  mkdir -p -- "$od"
-  rm -f -- "$made"
-  ( cd "$(dirname -- "$src")" && untrunc "$ref" "$src" >>"${LOGF:-$LOG}" 2>&1 )
-  [[ -s $made ]] || return 1
-  out=$(unique_file "$od" "${base%.*}_untrunc" "${src##*.}")
-  mv -f -- "$made" "$out"
-  RM_OUT=$out
-}
-repair_structural() {   # $1 src $2 tag -> 0 when the file was rebuilt from its structure (results already recorded)
-  local src=$1 tag=${2:-} ext=${1##*.} od out in_sz name rd
-  ext=${ext,,}
-  case $ext in mp4|m4v|mov|qt|3gp|3g2) ;; *) return 1;; esac
-  tool_have MP4Box || tool_have untrunc || return 1
-  od=${REPAIR_OUTDIR:-$(dirname -- "$src")}; name=${src##*/}; in_sz=$(fsize "$src")
-  info "${tag}Cannot read it normally - trying the structure tools ..."
-  rd=$REPAIR_REF
-  if tool_have MP4Box && repair_mp4box "$src" "$od"; then out=$RM_OUT
-    if diag_probe "$out"; then repair_verify "$out" "$D_DUR"; else VERIFY_OK=0; fi
-    if (( VERIFY_OK )); then
-      keep_dates "$src" "$out"; LAST_OUT=$out
-      ok "${tag}Rebuilt with MP4Box: $(basename -- "$out")  ($(human "$in_sz") -> $(human "$(fsize "$out")"))"
-      add_result "$name" "$(human "$in_sz")" "$(human "$(fsize "$out")")" "-" "-" "REPAIRED (structure)" "$src" "$out"
-      tally ok "$in_sz" "$(fsize "$out")"; return 0
-    fi
-    rm -f -- "$out"
-  fi
-  if tool_have untrunc; then
-    if [[ -z $rd && $REPAIR_AUTO == 0 && -t 0 ]]; then rd=$(ask "A healthy video from the SAME camera/app (blank = skip untrunc)" ""); rd=${rd/#\~/$HOME}; fi
-    if [[ -n $rd && -f $rd ]] && repair_untrunc "$src" "$rd" "$od"; then out=$RM_OUT
-      if diag_probe "$out"; then repair_verify "$out" "$D_DUR"; else VERIFY_OK=0; fi
-      if (( VERIFY_OK )); then
-        keep_dates "$src" "$out"; LAST_OUT=$out
-        ok "${tag}Rebuilt with untrunc: $(basename -- "$out")  ($(human "$in_sz") -> $(human "$(fsize "$out")"))"
-        add_result "$name" "$(human "$in_sz")" "$(human "$(fsize "$out")")" "-" "-" "REPAIRED (untrunc)" "$src" "$out"
-        tally ok "$in_sz" "$(fsize "$out")"; return 0
-      fi
-      rm -f -- "$out"
-    fi
-  fi
-  return 1
-}
-repair_lab_methods() {   # $1 src $2 ref $3 readable(1|0) -> LAB_M (names)
-  LAB_M=()
-  local ext=${1##*.}; ext=${ext,,}
-  if (( $3 )); then LAB_M+=(quick auto rebuild rescue); fi
-  case $ext in mp4|m4v|mov|qt|3gp|3g2)
-    tool_have MP4Box && LAB_M+=(mp4box)
-    [[ -n $2 && -f $2 ]] && tool_have untrunc && LAB_M+=(untrunc);;
-  esac
-}
-repair_lab_label() { case $1 in
-  quick) echo "quick remux";; auto) echo "smart Auto-Repair";; rebuild) echo "full rebuild";; rescue) echo "rescue mode";;
-  mp4box) echo "MP4Box";; untrunc) echo "untrunc";; *) echo "$1";; esac; }
-repair_lab() {   # $1 video  $2 optional healthy reference file
-  local src=$(readlink -f -- "$1") ref=${2:-$REPAIR_REF} td m i readable=1 t0 t1 us out vok note np sz rows=0 win=-1 best_t=0 best_np=999 mt kept lbl exp full_src
-  local -a LAB_M=() r_out=() r_us=() r_sz=() r_np=() r_ok=() r_note=() r_ran=()
-  [[ -f $src ]] || { err "No such file: $1"; return 1; }
-  [[ -n $ref ]] && ref=$(readlink -f -- "$ref" 2>/dev/null)
-  full_src=$src
-  diag_probe "$src" || readable=0
-  repair_lab_methods "$src" "$ref" "$readable"
-  printf '\n%s== Repair lab ==%s\n' "$C_B" "$C_0"
-  printf '  %s\n' "$(trunc "$(basename -- "$src")")"
-  if (( readable )); then
-    info "Readable: $D_VCODEC${D_ACODEC:+ + $D_ACODEC}, $(fmt_time "$D_DUR"), $(human "$(fsize "$src")")"
-    if (( LAB_SAMPLE )) || { (( ${D_DUR%%.*} > 300 )) && [[ -t 0 ]] && yesno "This video is long (every re-encode method takes about as long as the video). Test on a 60 s sample first?" y; }; then
-      LAB_SAMPLE=1
-    fi
-  else
-    warn "ffmpeg cannot read this file (damaged headers) - only the structure tools can help."
-    (( ${#LAB_M[@]} )) || { err "No structure tool available. Install MP4Box:  vc --setup repair"; return 1; }
-  fi
-  td=$(mktemp -d) || return 1
-  if (( readable && LAB_SAMPLE )); then      # same problems, a fraction of the time: cut a 60 s piece from the middle
-    mt=$(awk -v d="$D_DUR" 'BEGIN{ s = (d - 60) / 2; if (s < 0) s = 0; printf "%.2f", s }')
-    ffmpeg -nostdin -v error -y -ss "$mt" -t 60 -i "$src" -c copy -map 0 -f mp4 "$td/sample.mp4" 2>>"$LOG" && [[ -s $td/sample.mp4 ]] && src="$td/sample.mp4" && info "Testing on a 60 s sample (from ${mt}s)."
-  fi
-  exp=$D_DUR; (( readable )) && { diag_probe "$src" && exp=$D_DUR; }
-  info "Methods: $(for m in "${LAB_M[@]}"; do printf '%s, ' "$(repair_lab_label "$m")"; done | sed 's/, $//')"
-  mkdir -p "$CONF_DIR"; : > "$LOG"
-  for i in "${!LAB_M[@]}"; do
-    m=${LAB_M[i]}
-    printf '  %-18s %srunning...%s' "$(repair_lab_label "$m")" "$C_D" "$C_0"
-    now_us; t0=$NOW_US
-    mkdir -p "$td/$m"
-    case $m in
-      mp4box)  ( LOGF="$td/$m.log"; repair_mp4box "$src" "$td/$m" ) >/dev/null 2>&1;;
-      untrunc) ( LOGF="$td/$m.log"; repair_untrunc "$src" "$ref" "$td/$m" ) >/dev/null 2>&1;;
-      *)       ( export SIMPLE=1 REPAIR_AUTO=1 REPAIR_OUTDIR="$td/$m" LOGF="$td/$m.log"
-                 case $m in rebuild) REPAIR_FORCE=rebuild;; rescue) REPAIR_FORCE=rescue;; *) REPAIR_FORCE="";; esac
-                 RESULT_FILE="$td/$m.results" STATS="$td/$m.stats"
-                 case $m in quick) quickfix_file "$src";; *) repair_file "$src";; esac ) >/dev/null 2>&1;;
-    esac
-    now_us; us=$(( NOW_US - t0 ))
-    out=$(ls -t "$td/$m"/*.mp4 "$td/$m"/*.mov 2>/dev/null | head -n1)
-    r_ran[i]=1; r_us[i]=$us; r_out[i]=$out; r_ok[i]=0; r_np[i]=-1; r_sz[i]=0; r_note[i]=""
-    if [[ -n $out && -s $out ]]; then
-      r_sz[i]=$(fsize "$out")
-      if diag_probe "$out"; then
-        repair_verify "$out" "$( (( readable )) && echo "$exp" || echo "$D_DUR" )"; r_ok[i]=$VERIFY_OK; r_note[i]=$VERIFY_NOTE
-        diag_report "$out" >/dev/null 2>&1; r_np[i]=$DIAG_NPROBS
-      else r_note[i]="result cannot be read"; fi
-    else r_note[i]="nothing produced"; fi
-    printf '\r\033[K'
-    if [[ -n $out && -s $out ]]; then
-      np=${r_np[i]}
-      printf '  %-18s %7s  %9s  %s  %s\n' "$(repair_lab_label "$m")" "$(fmt_time $(( us / 1000000 )))" "$(human "${r_sz[i]}")" \
-        "$( (( np == 0 )) && echo "no problems left" || { (( np > 0 )) && echo "$np problem(s) left" || echo "?"; } )" \
-        "$( (( r_ok[i] )) && echo "${C_G}plays OK${C_0}" || echo "${C_R}CHECK: ${r_note[i]}${C_0}" )"
-    else
-      printf '  %-18s %7s  %9s  %s\n' "$(repair_lab_label "$m")" "$(fmt_time $(( us / 1000000 )))" "-" "${C_D}${r_note[i]}${C_0}"
-    fi
-  done
-  # winner: plays OK AND no problems left, fastest; else plays OK with the fewest problems, fastest
-  for i in "${!LAB_M[@]}"; do
-    (( r_ok[i] )) || continue
-    np=${r_np[i]}; (( np < 0 )) && continue
-    if (( win < 0 )) || (( np < best_np )) || (( np == best_np && r_us[i] < best_t )); then win=$i; best_np=$np; best_t=${r_us[i]}; fi
-  done
-  if (( win < 0 )); then
-    printf '\n  %sNo method produced a file that plays cleanly.%s\n' "$C_R" "$C_0"
-    info "  Try again with a healthy reference video from the same camera (--ref FILE, needs untrunc), or keep the original."
-    rm -rf -- "$td"; return 1
-  fi
-  m=${LAB_M[win]}
-  printf '\n  %sBest:%s %s  (%s, %s)\n' "$C_G" "$C_0" "$(repair_lab_label "$m")" "$(fmt_time $(( best_t / 1000000 )))" \
-    "$( (( best_np == 0 )) && echo "completely fixed" || echo "$best_np problem(s) remain" )"
-  if (( LAB_SAMPLE )); then
-    info "  That was on a 60 s sample. Run the winner on the whole video?"
-    if [[ -t 0 ]] && yesno "Repair the whole video with '$(repair_lab_label "$m")' now?" y; then
-      rm -rf -- "$td"
-      mkdir -p "$CONF_DIR"
-      case $m in
-        quick)   REPAIR_AUTO=1 quickfix_file "$full_src";;
-        auto)    REPAIR_AUTO=1 repair_file "$full_src";;
-        rebuild) REPAIR_AUTO=1 REPAIR_FORCE=rebuild repair_file "$full_src";;
-        rescue)  REPAIR_AUTO=1 REPAIR_FORCE=rescue repair_file "$full_src";;
-        mp4box)  repair_mp4box "$full_src" "$(dirname -- "$full_src")" && ok "Saved: $(pretty "$RM_OUT")";;
-        untrunc) repair_untrunc "$full_src" "$ref" "$(dirname -- "$full_src")" && ok "Saved: $(pretty "$RM_OUT")";;
-      esac
-      return 0
-    fi
-    rm -rf -- "$td"; return 0
-  fi
-  # keep the winner next to the original
-  out=${r_out[win]}
-  kept=$(unique_file "$(dirname -- "$full_src")" "$(basename -- "${full_src%.*}")_repaired" "${out##*.}")
-  mv -f -- "$out" "$kept"; keep_dates "$full_src" "$kept"
-  ok "Kept: $(pretty "$kept")"
-  command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$kept" >/dev/null 2>&1 & }
-  rm -rf -- "$td"
-  return 0
-}
 repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   local src=$(readlink -f -- "$1") tag=${2:-}
   local name base dir out tmp rc t0=$SECONDS in_sz out_sz saved need tier
@@ -2752,8 +2568,6 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   local -a vreasons=() areasons=() fargs=() venc=() aargs=() fast=() meta=()
   name=$(basename -- "$src"); in_sz=$(fsize "$src")
   if ! diag_probe "$src"; then
-    # damaged headers: try the structure tools (MP4Box, untrunc) before giving up
-    if repair_structural "$src" "$tag"; then return 0; fi
     err "${tag}Cannot read this video (damaged or not a video): $name"
     add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (unreadable)" "$src" ""
     tally fail; return 1
@@ -2763,7 +2577,7 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
   case $D_TRC in smpte2084|arib-std-b67) warn "${tag}HDR video: converting to 8-bit SDR can look washed out. Keep the original if colours matter.";; esac
   vst=$(num_or0 "$D_VSTART"); ast=$(num_or0 "$D_ASTART")
-  dir=${REPAIR_OUTDIR:-$(dirname -- "$src")}; base=${name%.*}
+  dir=$(dirname -- "$src"); base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s fps, 1/%s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
     "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(frac2dec "$D_AFPS")" \
     "$( (( D_VTS > 0 )) && echo "$D_VTS" || echo "?" )" "$(fmt_time "$D_DUR")" \
@@ -2782,9 +2596,6 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
     (( D_ACH > 2 )) && abr=256
   fi
   [[ -n $REPAIR_FPS ]] && { vfix=1; vreasons+=("forced --fps"); }
-  case $REPAIR_FORCE in
-    rebuild|rescue) vfix=1; afix=$(( D_ANUM > 0 ? 1 : 0 )); vreasons+=("forced $REPAIR_FORCE");;
-  esac
   extra_audio=$(( D_ANUM > 1 ? D_ANUM - 1 : 0 ))
   nsubs=$D_NSUBS
   awk -v v="$vst" -v a="$ast" 'BEGIN{ if (v < -0.005 || a < -0.005) exit 1 }' || negts=1
@@ -2916,12 +2727,12 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   # 23.976 fps films, which itself caused gradual drift on TVs
   fargs+=(-sn -map_metadata -1 -map_chapters -1 "${meta[@]}" -muxdelay 0 -avoid_negative_ts make_zero \
     "${fast[@]}" -max_muxing_queue_size 4096 -f mp4 "$tmp")
-  if [[ $REPAIR_FORCE == rescue ]]; then rc=1
-  else run_ffmpeg "repair" 1 1 "${fargs[@]}"; rc=$?; fi
+  run_ffmpeg "repair" 1 1 "${fargs[@]}"
+  rc=$?
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     # ---- RESCUE MODE: damaged data -> skip it and rebuild video + audio cleanly
     rm -f -- "$tmp"
-    [[ $REPAIR_FORCE == rescue ]] || warn "${tag}First attempt failed - trying RESCUE mode (re-encodes everything, skips damaged data)."
+    warn "${tag}First attempt failed - trying RESCUE mode (re-encodes everything, skips damaged data)."
     rescued=1
     repair_rescue_run
     rc=$?
@@ -3002,7 +2813,6 @@ repair_file() {   # $1 src, $2 optional "[i/n] " tag -> TV-friendly MP4
   fi
   (( rescued )) && info "  Rescue mode skipped damaged data: a few frames may be missing - watch the result once."
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
-  LAST_OUT=$out
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "${saved}" "$(fmt_time $(( SECONDS - t0 )))" "$rstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
@@ -3024,7 +2834,7 @@ quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 
   src_dur=$D_DUR; nsubs=$D_NSUBS
   s_round=$D_ROUND; s_vfr=$D_VFR; s_vcodec=$D_VCODEC; s_acodec=$D_ACODEC; s_arate=$D_ARATE; s_anum=$D_ANUM
   [[ -n $D_CTIME ]] && meta=(-metadata "creation_time=$D_CTIME")
-  dir=${REPAIR_OUTDIR:-$(dirname -- "$src")}; base=${name%.*}
+  dir=$(dirname -- "$src"); base=${name%.*}
   printf '  %s%s%s %dx%d %s %s | %s | %s%s\n' "$tag" "$C_D" "$(trunc "$name")" \
     "$D_W" "$D_H" "$D_VCODEC" "$D_PIX" "$(fmt_time "$D_DUR")" "$(human "$in_sz")" "$C_0"
   out=$(unique_file "$dir" "${base}_fixed" "mp4")
@@ -3075,7 +2885,6 @@ quickfix_file() {   # $1 src, $2 optional tag -> remux to a clean faststart MP4 
     [[ $s_arate == 48000 ]] || warn "Audio kept at ${s_arate:-?} Hz - run Auto-Repair to resample to 48 kHz."
   fi
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
-  LAST_OUT=$out
   add_result "$name" "$(human "$in_sz")" "$(human "$out_sz")" "0%" "$(fmt_time $(( SECONDS - t0 )))" "$qstat" "$src" "$out"
   tally ok "$in_sz" "$out_sz"
   if (( REPAIR_AUTO == 0 )); then yesno "Open it now?" n && open_file "$out"; fi
@@ -3310,10 +3119,6 @@ run_on_picked() {   # $1 label, rest = command; runs it with the queue temporari
 }
 _rm_repair() { if (( ${#SELECTED[@]} == 1 )); then repair_file "${SELECTED[0]}"; else repair_batch; fi; }
 _rm_quick()  { if (( ${#SELECTED[@]} == 1 )); then REPAIR_AUTO=0 quickfix_file "${SELECTED[0]}"; else queue_run "Quick fix" quickfix_file; fi; }
-_rm_lab()    {
-  (( ${#SELECTED[@]} == 1 )) || { warn "The lab tests one video at a time - pick a single number."; return 1; }
-  repair_lab "${SELECTED[0]}"
-}
 _rm_shift()  {
   ask_shift_ms || return 1
   if (( ${#SELECTED[@]} == 1 )); then sync_shift_file "${SELECTED[0]}" "$QUEUE_MS"; else queue_run "Audio shift" q_shift; fi
@@ -3370,7 +3175,6 @@ repair_menu() {
     echo " 5) Shift audio by +/- milliseconds"
     echo "    (2-5 ask which of the queued videos: one, several or all)"
     echo " 6) View / edit the queue"
-    echo " 7) REPAIR LAB (test every repair method on one video, keep the best)"
     echo " b) back"
     read -r -p "> " c || return
     case $c in
@@ -3380,7 +3184,6 @@ repair_menu() {
       4) need_queue && { run_on_picked "Quick fix" _rm_quick; pause; };;
       5) need_queue && { run_on_picked "Shift audio" _rm_shift; pause; };;
       6) queue_menu;;
-      7) need_queue && { run_on_picked "Repair lab (pick ONE video)" _rm_lab; pause; };;
       b|B|"") return;;
     esac
   done
@@ -4144,148 +3947,22 @@ check_deps() {
   done
   fd=$(fonts_dir)
   if [[ -n $fd ]]; then ok "fonts directory (subtitle burn-in): $fd"; else warn "no fonts dir found - subtitle burn-in may fail"; fi
-  for c in termux-wake-lock termux-media-scan; do
+  for c in termux-wake-lock termux-notification termux-media-scan termux-open; do
     if command -v "$c" >/dev/null 2>&1; then ok "optional: $c"; else info "optional (Termux tools): $c not available"; fi
   done
   if [[ -d $HOME/storage/shared ]]; then ok "shared storage access OK"; else warn "no storage access - run: termux-setup-storage"; fi
-  setup_status all
-  if (( ${#SETUP_MISSING[@]} )) && [[ -t 0 ]] && yesno "Install the ${#SETUP_MISSING[@]} missing package(s) now (automatic)?" y; then setup_run all; fi
 }
-
-# ============================================================ AUTO-INSTALLER (v3.1)
-tool_have() { command -v "$1" >/dev/null 2>&1; }
-# group|command|package|what it is for|required(1/0)
-SETUP_TABLE=(
-  "core|ffmpeg|ffmpeg|the video engine (compress, repair, frames, everything)|1"
-  "core|ffprobe|ffmpeg|reads video information|1"
-  "core|awk|gawk|calculations in the progress bar and plans|1"
-  "core|find|findutils|finds your videos|1"
-  "w6w|openssl|openssl-tool|.w6w encryption|0"
-  "w6w|xz|xz-utils|.w6w text compression|0"
-  "w6w|tar|tar|.w6w container|0"
-  "w6w|less|less|reading long text inside a .w6w|0"
-  "perf|taskset|util-linux|pin work to the fast cores (optional speed-up)|0"
-  "repair|MP4Box|gpac|extra repair for broken MP4 files|0"
-  "repair|untrunc|untrunc|rebuild a cut-off MP4 from a healthy one (often not in the Termux repo)|0"
-  "extras|termux-notification|termux-api|notifications, gallery refresh (also needs the Termux:API app)|0"
-  "extras|termux-open|termux-tools|opens files with Android apps|0"
-  "extras|file|file|recognises file types|0"
-)
-is_termux() { [[ ${PREFIX:-} == *com.termux* || -n ${TERMUX_VERSION:-} ]]; }
-
-setup_status() {   # $1 group (all|core|w6w|perf|repair|extras) -> prints a table, SETUP_MISSING = packages still missing
-  local g=${1:-all} row grp cmd pk why req missing=0 shown=""
-  SETUP_MISSING=()
-  printf '\n%s== Tools ==%s\n' "$C_B" "$C_0"
-  for row in "${SETUP_TABLE[@]}"; do
-    IFS='|' read -r grp cmd pk why req <<<"$row"
-    [[ $g == all || $g == "$grp" ]] || continue
-    if tool_have "$cmd"; then
-      printf '  %s✔%s %-18s %s%s%s\n' "$C_G" "$C_0" "$cmd" "$C_D" "$why" "$C_0"
-    else
-      printf '  %s%s%s %-18s %s%s  [pkg: %s]%s\n' "$( [[ $req == 1 ]] && echo "$C_R" || echo "$C_Y" )" "$( [[ $req == 1 ]] && echo ✘ || echo - )" "$C_0" "$cmd" "$C_D" "$why" "$pk" "$C_0"
-      if [[ " ${SETUP_MISSING[*]-} " != *" $pk "* ]]; then SETUP_MISSING+=("$pk"); fi
+do_setup() {
+  if command -v pkg >/dev/null 2>&1; then
+    pkg install -y ffmpeg gawk openssl-tool || err "pkg install failed (try: pkg update)"
+    if [[ -t 0 ]] && yesno "Also install termux-api (notifications + gallery refresh; needs the Termux:API app)?" n; then
+      pkg install -y termux-api
     fi
-  done
-  return 0
-}
-pkg_install() {   # $1 package -> 0 installed, 1 failed, 2 not available in the repository
-  local p=$1 out rc
-  export DEBIAN_FRONTEND=noninteractive
-  mkdir -p "$CONF_DIR" 2>/dev/null; SETUP_LOG=${SETUP_LOG:-$CONF_DIR/setup.log}
-  if tool_have apt-get; then
-    out=$(apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef install "$p" 2>&1); rc=$?
-  elif tool_have pkg; then
-    out=$(pkg install -y "$p" 2>&1); rc=$?
   else
-    return 1
+    warn "'pkg' not found - install ffmpeg and gawk with your package manager."
   fi
-  printf '== install %s (rc=%s)\n%s\n' "$p" "$rc" "$out" >> "$SETUP_LOG" 2>/dev/null
-  (( rc == 0 )) && return 0
-  grep -qiE 'unable to locate package|has no installation candidate|no packages found' <<<"$out" && return 2
-  return 1
-}
-pkg_refresh() {   # update the package lists once (failure is not fatal)
-  local out rc
-  if tool_have apt-get; then out=$(apt-get -y update 2>&1); rc=$?
-  elif tool_have pkg; then out=$(pkg update -y 2>&1); rc=$?
-  else return 1; fi
-  printf '== update (rc=%s)\n%s\n' "$rc" "$out" >> "${SETUP_LOG:-/dev/null}" 2>/dev/null
-  return $rc
-}
-setup_storage() {   # shared-storage permission (Android shows a dialog the first time)
-  [[ -d $HOME/storage/shared ]] && return 0
-  tool_have termux-setup-storage || return 0
-  info "Allow storage access in the Android dialog that appears ..."
-  termux-setup-storage
-  local i
-  for (( i = 0; i < 20; i++ )); do [[ -d $HOME/storage/shared ]] && { ok "Storage access granted."; return 0; }; sleep 1; done
-  warn "Storage permission not seen yet. Accept the Android dialog, then run: vc --setup"
-  return 0
-}
-setup_run() {   # $1 group -> installs what is missing; never stops on optional failures. rc 1 only if a CORE tool is still missing
-  local g=${1:-all} pk i=0 n res fail=0 core_bad=0 row grp cmd p2 why req
-  local -a todo=() failed=() absent=()
-  mkdir -p "$CONF_DIR" 2>/dev/null; SETUP_LOG=$CONF_DIR/setup.log; : > "$SETUP_LOG"
-  if ! is_termux && ! tool_have pkg && [[ $(id -u 2>/dev/null) != 0 ]]; then
-    warn "Not running in Termux and not root - install these yourself with your package manager:"
-    setup_status "$g"; printf '  packages: %s\n' "${SETUP_MISSING[*]:-none}"; return 1
-  fi
-  setup_status "$g"
-  todo=("${SETUP_MISSING[@]}")
-  if (( ${#todo[@]} == 0 )); then ok "Everything for '$g' is already installed."; setup_storage; return 0; fi
-  info "Installing ${#todo[@]} package(s): ${todo[*]}   (log: $(pretty "$SETUP_LOG"))"
-  if ! pkg_refresh; then
-    warn "Could not refresh the package lists (internet? try again, or run: termux-change-repo). Trying to install anyway ..."
-  fi
-  n=${#todo[@]}
-  for pk in "${todo[@]}"; do
-    i=$(( i + 1 ))
-    printf '  [%d/%d] %s ... ' "$i" "$n" "$pk"
-    res=1
-    pkg_install "$pk"; res=$?
-    if (( res == 1 )); then            # one more try after refreshing (flaky mirrors are common)
-      pkg_refresh >/dev/null 2>&1; pkg_install "$pk"; res=$?
-    fi
-    case $res in
-      0) printf '%sinstalled%s\n' "$C_G" "$C_0";;
-      2) printf '%snot in the repository%s\n' "$C_Y" "$C_0"; absent+=("$pk");;
-      *) printf '%sfailed%s\n' "$C_R" "$C_0"; failed+=("$pk");;
-    esac
-  done
-  hash -r 2>/dev/null
-  setup_status "$g"
-  for row in "${SETUP_TABLE[@]}"; do
-    IFS='|' read -r grp cmd p2 why req <<<"$row"
-    [[ $g == all || $g == "$grp" ]] || continue
-    [[ $req == 1 ]] && ! tool_have "$cmd" && core_bad=1
-  done
-  (( ${#absent[@]} )) && info "Not available for this phone's repository: ${absent[*]} (optional - vc works without)."
-  (( ${#failed[@]} )) && warn "Could not install: ${failed[*]}  - see $(pretty "$SETUP_LOG"). Check your connection and run: vc --setup"
-  setup_storage
-  if [[ $g == all || $g == extras ]] && tool_have termux-notification && ! timeout 6 termux-battery-status >/dev/null 2>&1; then
-    info "termux-api is installed, but the Termux:API Android app is needed too (F-Droid / GitHub). Notifications work after you install it."
-  fi
-  if (( core_bad )); then err "A required tool is still missing."; return 1; fi
+  [[ -d $HOME/storage ]] || { command -v termux-setup-storage >/dev/null 2>&1 && termux-setup-storage; }
   ok "Setup finished."
-  return 0
-}
-ensure_tool() {   # $1 command $2 package $3 what it is for -> 0 when available (offers to install it on the spot)
-  tool_have "$1" && return 0
-  if [[ -t 0 && -t 1 ]]; then
-    warn "'$1' is needed for $3 and is not installed (package: $2)."
-    if yesno "Install it now?" y; then
-      pkg_refresh >/dev/null 2>&1; pkg_install "$2"; hash -r 2>/dev/null
-      tool_have "$1" && { ok "Installed $2."; return 0; }
-      err "Could not install $2 (see: vc --setup)."
-    fi
-    return 1
-  fi
-  err "'$1' is missing (package: $2). Install it with:  vc --setup"
-  return 1
-}
-do_setup() {   # $1 group: all (default) | core | w6w | perf | repair | extras
-  setup_run "${1:-all}"
 }
 do_install() {
   local dest="${PREFIX:-/usr/local}/bin/vc"
@@ -4589,7 +4266,7 @@ tools_menu() {
     echo " 5) Extract audio (MP3 / M4A)       (one or many)"
     echo " 6) Thumbnail / contact sheet       (one or many)"
     echo " 7) Check installation / encoders"
-    echo " 8) Install / fix all tools (automatic)"
+    echo " 8) Setup (install ffmpeg, storage access)"
     echo " 9) Install 'vc' command"
     echo "10) Show last log"
     echo "11) Extract frames (time range -> new folder)"
@@ -4604,7 +4281,7 @@ tools_menu() {
       5) tool_on_queue extract_audio "Extract audio"; pause;;
       6) tool_on_queue make_thumb "Thumbnail"; pause;;
       7) check_deps; pause;;
-      8) do_setup all; pause;;
+      8) do_setup; pause;;
       9) do_install; pause;;
       10) if [[ -s $LOG ]]; then tail -n 40 "$LOG"; else echo "(log is empty)"; fi; pause;;
       11) frames_flow; pause;;
@@ -4745,8 +4422,6 @@ Speed tools:
   --race-all FILE        all three (a few minutes); --no-quality skips the SSIM scoring
   --cpu                  show CPU layout (big/little), pinning and readable sensors
   --tune [FILE]          AUTO-TUNE: test this phone, pick + save the best preset and CPU setup
-  --repair-lab FILE      test EVERY repair method on a video (time, size, plays-to-the-end,
-                         problems left) and keep the best:  [--ref HEALTHY.mp4] [--sample]
   --w6w CMD ...          .w6w vault (encrypted container for video, pictures, audio, text, scripts):
                            pack OUT.w6w FILE|FOLDER ...  [--squeeze] [--password] [--comment TEXT]
                            info F.w6w | verify F.w6w | play F.w6w [N] | key show|export|import HEX|new
@@ -4776,9 +4451,7 @@ Repair & sync options:
   --stereo               downmix surround audio to stereo
 
 Other commands:
-  vc --setup [GROUP]  install everything the features need (ffmpeg, openssl, xz, tar, gpac ...);
-                      GROUP = all (default) | core | w6w | perf | repair | extras
-  vc --doctor     show which tools are installed (and offer to install the missing ones)
+  vc --setup      install ffmpeg and storage access
   vc --install    install this script as the 'vc' command
   vc --version
 
@@ -4852,26 +4525,25 @@ W6W_KEY=""; W6W_IV=""; W6W_MK=""; W6W_DEVKEY=""; W6W_PASSWORD=${W6W_PASSWORD:-};
 W_CREATED=""; W_COMMENT_TXT=""; W_N=0; WD_KIND=""; WD_EXT=""; WD_DETAIL=""; WD_DUR=""
 declare -a W_KIND=() W_EXT=() W_STORED=() W_SIZE=() W_DUR=() W_FOR=() W_MT=() W_DETAIL=() W_NAME=()
 
-w6w_have_tools() {
-  ensure_tool openssl openssl-tool ".w6w encryption" || return 1
-  ensure_tool tar tar "the .w6w container" || return 1
-  ensure_tool xz xz-utils ".w6w text compression" || return 1
-  tool_have od || { err "'od' (coreutils) is missing: pkg install coreutils"; return 1; }
-  return 0
-}
-w6w_read_secret() {   # $1 prompt -> REPLY_SECRET (every typed character shows as *, backspace works)
-  local prompt=$1 ch pw="" junk
-  printf '%s' "$prompt" >&2
-  while IFS= read -r -s -n1 ch; do
-    case $ch in
-      ""|$'\r') break;;                                             # Enter
-      $'\177'|$'\b') if [[ -n $pw ]]; then pw=${pw%?}; printf '\b \b' >&2; fi;;
-      $'\e') read -r -s -n2 -t 0.05 junk;;                          # arrow keys etc.: ignore
-      *) pw+=$ch; printf '*' >&2;;
-    esac
-  done
-  printf '\n' >&2
-  REPLY_SECRET=$pw
+w6w_have_tools() { command -v openssl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v od >/dev/null 2>&1 \
+  || { err ".w6w needs openssl, tar and od.  Install:  pkg install openssl-tool tar coreutils"; return 1; }; }
+w6w_hex_rand() { head -c "$1" /dev/urandom | od -An -v -tx1 | tr -d ' \n'; }
+w6w_hex2bin()  { local esc; esc=$(sed 's/../\\x&/g' <<<"$1"); printf '%b' "$esc"; }
+w6w_field()    { od -An -v -tx1 -j "$2" -N "$3" -- "$1" | tr -d ' \n'; }          # file offset length -> hex
+w6w_enc()      { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }   # every byte as %HH
+w6w_dec()      { local s=${1//%/\\x}; printf '%b' "$s"; }
+w6w_is()       { [[ $(head -c 4 -- "$1" 2>/dev/null) == W6W1 ]]; }
+w6w_fp()       { printf '%s' "$1" | sha256sum | cut -c1-12; }
+
+w6w_device_key() {   # W6W_DEVKEY = this install's random 256-bit key (created once, mode 600)
+  local kf="$CONF_DIR/w6w.key"
+  if [[ ! -s $kf ]]; then
+    mkdir -p "$CONF_DIR"
+    ( umask 077; w6w_hex_rand 32 > "$kf" )
+    W6W_DEVKEY=$(<"$kf")
+    warn "A new device key was created [$(w6w_fp "$W6W_DEVKEY")]. Back it up now: vc --w6w key export  (after a reinstall or data wipe, device-mode .w6w files cannot be opened without it)."
+  fi
+  W6W_DEVKEY=$(<"$kf")
 }
 w6w_secret_for() {   # $1 mode D|P  $2 "confirm" (ask twice when creating) -> W6W_SECRET
   local a b
@@ -4880,11 +4552,10 @@ w6w_secret_for() {   # $1 mode D|P  $2 "confirm" (ask twice when creating) -> W6
     P) if [[ -n $W6W_PASSWORD ]]; then W6W_SECRET=$W6W_PASSWORD
        else
          [[ -t 0 ]] || { err "Password needed: set W6W_PASSWORD or run in a terminal."; return 1; }
-         info "Type the password - each letter shows as *   (⌫ deletes, Enter finishes)"
-         w6w_read_secret "Password: "; a=$REPLY_SECRET
+         read -r -s -p "Password: " a; echo >&2
          if [[ ${2:-} == confirm ]]; then
-           w6w_read_secret "Repeat password: "; b=$REPLY_SECRET
-           [[ $a == "$b" ]] || { err "The two passwords differ."; return 1; }
+           read -r -s -p "Repeat password: " b; echo >&2
+           [[ $a == "$b" ]] || { err "Passwords differ."; return 1; }
          fi
          [[ -n $a ]] || { err "Empty password."; return 1; }
          W6W_SECRET=$a; W6W_PASSWORD=$a          # remembered for this run only
@@ -5467,11 +5138,10 @@ w6w_cli() {   # vc --w6w  pack|info|extract|convert|play|key|list ...
 }
 
 main() {
-  local STUDIO=0 FRAMES_MODE=0 RACE_MODE="" W6W_MODE=0 LAB_MODE=0
+  local STUDIO=0 FRAMES_MODE=0 RACE_MODE="" W6W_MODE=0
   refresh_cols; trap refresh_cols WINCH
   case ${1:-} in
-    --setup)   case ${2:-} in core|w6w|perf|repair|extras|all) do_setup "$2"; exit $?;; *) do_setup all; exit $?;; esac;;
-    --doctor)  check_deps; exit 0;;
+    --setup)   do_setup; exit;;
     --install) do_install; exit;;
     --version) echo "VidCompress $VERSION  by $CREATOR  ($WEBSITE)"; exit;;
     --help|-h) usage; exit;;
@@ -5533,9 +5203,6 @@ main() {
       --race-all)    RACE_MODE=all; shift;;
       --no-quality)  NOQUALITY=1; shift;;
       --cpu)         CPU_MODE=1; shift;;
-      --repair-lab)  LAB_MODE=1; shift;;
-      --ref)         if (( $# >= 2 )); then REPAIR_REF=$2; shift 2; else err "--ref needs a healthy video file"; exit 1; fi;;
-      --sample)      LAB_SAMPLE=1; shift;;
       --w6w)         W6W_MODE=1; shift;;
       --squeeze)     W6W_SQUEEZE=1; shift;;
       --password)    W6W_PWMODE=1; shift;;
@@ -5623,7 +5290,7 @@ main() {
   apply_cores; calc_threads 1
   if (( CPU_MODE )); then device_report; exit 0; fi
   if [[ -n $PRESET_ARG ]]; then apply_preset "$PRESET_ARG" || { err "Unknown preset: $PRESET_ARG"; exit 1; }; fi
-  [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|vp9|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
+  [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
   [[ -n $OV_C ]] && { CRF=$OV_C; TARGET_MB=0; PRESET_NAME=custom; }
   [[ -n $OV_T ]] && { TARGET_MB=$OV_T; PRESET_NAME=custom; }
   [[ -n $OV_R ]] && { HEIGHT=$OV_R; PRESET_NAME=custom; }
@@ -5689,11 +5356,6 @@ main() {
     if [[ -z $TRIM_START && -z $TRIM_END ]] && [[ -t 0 ]]; then frames_flow "${SELECTED[0]}"; exit $?; fi
     NONINTERACTIVE=1
     extract_frames "${SELECTED[0]}" "$TRIM_START" "$TRIM_END" 0 "$OUTDIR"
-    exit $?
-  fi
-  if (( LAB_MODE )); then
-    (( ${#SELECTED[@]} == 1 )) || { err "Usage: vc --repair-lab FILE [--ref HEALTHY_FILE] [--sample]"; exit 1; }
-    repair_lab "${SELECTED[0]}" "$REPAIR_REF"
     exit $?
   fi
   if [[ -n $REPAIR_ACTION ]]; then
