@@ -4224,6 +4224,9 @@ check_deps() {
   for e in libx265 libx264 libsvtav1 libmp3lame aac hevc_mediacodec h264_mediacodec; do
     if have_enc "$e"; then ok "encoder: $e"; else warn "encoder missing: $e"; fi
   done
+  for e in removelogo delogo tmedian sobel gblur alphamerge movie; do
+    if have_filter "$e"; then ok "filter: $e"; else warn "filter missing: $e (the logo remover needs it)"; fi
+  done
   fd=$(fonts_dir)
   if [[ -n $fd ]]; then ok "fonts directory (subtitle burn-in): $fd"; else warn "no fonts dir found - subtitle burn-in may fail"; fi
   for c in termux-wake-lock termux-media-scan; do
@@ -5638,16 +5641,23 @@ w6w_cli() {   # vc --w6w  pack|info|extract|convert|play|key|list ...
 LOGO_MODE=0; LOGO_SENS=normal; LOGO_FILL=smart; LOGO_PREVIEW=0; LOGO_DETECT_ONLY=0; LOGO_SAMPLES=21
 LOGO_CONFIRM=0; LOGO_TEX_CLIP=40; LOGO_TEX_K=1.0; LOGO_KEEPEXT=1
 declare -a LOGO_BOXES=()
-LGD=""; LG_N=0; LG_FW=0; LG_FH=0; LG_GOT=0; LG_SHAPE=mask; LOGO_GRAPH=""; LOGO_PREVIEW_FILE=""; FF_FILTERS=""
+LGD=""; LG_N=0; LG_FW=0; LG_FH=0; LG_GOT=0; LG_SHAPE=mask; LOGO_GRAPH=""; LOGO_PREVIEW_FILE=""
 declare -a LG_BX=() LG_BY=() LG_BW=() LG_BH=() LG_RX=() LG_RY=() LG_RW=() LG_RH=() LG_DX=() LG_DY=()
 
-have_filter() {   # $1 filter name -> 0 when this ffmpeg has it (list fetched once)
-  [[ -n $FF_FILTERS ]] || FF_FILTERS=$(ffmpeg -hide_banner -filters 2>/dev/null)
-  grep -qE "^ [A-Z.]{3} $1 " <<<"$FF_FILTERS"
+declare -A FF_FILT=()
+have_filter() {   # $1 filter name -> 0 when this ffmpeg has it. Asked directly (-h filter=NAME): the table printed by
+                  # "ffmpeg -filters" is laid out differently from one ffmpeg version to the next.
+  local n=$1
+  if [[ -z ${FF_FILT[$n]-} ]]; then
+    if ffmpeg -hide_banner -h "filter=$n" 2>&1 | grep -qE "^Filter $n( |$)"; then FF_FILT[$n]=1; else FF_FILT[$n]=0; fi
+  fi
+  [[ ${FF_FILT[$n]} == 1 ]]
 }
 logo_caps() {   # 0 = this ffmpeg can detect + remove logos
   local f miss=""
-  for f in crop overlay split lut dilation sobel tmedian extractplanes blend scale; do have_filter "$f" || miss+=" $f"; done
+  # safety net: if even "crop" is reported missing, the check itself does not work on this build - go on, ffmpeg will say what is really wrong
+  have_filter crop || { warn "Could not check this ffmpeg's filters - trying anyway."; return 0; }
+  for f in overlay split lut dilation sobel tmedian extractplanes blend scale; do have_filter "$f" || miss+=" $f"; done
   if [[ $LOGO_FILL == box ]]; then have_filter delogo || miss+=" delogo"
   else for f in removelogo alphamerge movie gblur; do have_filter "$f" || miss+=" $f"; done
        [[ $LOGO_FILL == smart ]] && { have_filter delogo || miss+=" delogo"; }; fi
