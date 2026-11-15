@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v3.2 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v3.3 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -15,8 +15,24 @@
 #     vc --race-all movie.mp4 # + CPU-core test + heat test (does speed drop while it runs?)
 #     vc --cpu                # CPU layout (big/little cores), pinning, sensors
 #     vc --tune               # AUTO-TUNE: test this phone, pick + save the fastest settings
+#     vc --delogo video.mp4   # find the logo / watermark by itself and paint it out (NEW)
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 3.3:
+#   + LOGO REMOVER (vc --delogo FILE, Tools 13, menu l): finds fixed logos / watermarks / TV bugs
+#     BY ITSELF (median of 21 frames -> edges of brightness + colour -> compact clusters), builds a
+#     mask that follows the logo's outline and paints it out: shape-following fill, light blur, then
+#     grain / texture copied from the same frame next to the logo, feathered in. Shows the places it
+#     found, saves a before/after preview, asks before it starts. Manual boxes: --logo-box X:Y:W:H.
+#     Honest limit: smooth / blurry / grainy backgrounds are near perfect; a big logo over sharp,
+#     detailed content cannot be rebuilt exactly (only AI inpainting does that).
+#   + FIXED: `vc --selftest full` stopped at "diagnose" and at "repair lab" until Enter was
+#     pressed: the tests inherited the terminal as their input, so a hidden question (output was
+#     captured) waited for a key. Tests now run with no input and a time limit, vc never waits for
+#     a key when its output is not a screen, and a question with no input takes its default.
+#   + Cleaned up: three leftover duplicate copies of five .w6w helper functions and five unused
+#     functions were removed; the encoder list is read once instead of at every check.
 #
 #  What's new in 3.2:
 #   + FIXED (serious, since 3.1): eight .w6w helper functions had been lost by a faulty edit,
@@ -184,7 +200,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="3.2"
+VERSION="3.3"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -268,9 +284,9 @@ fsize()     { stat -c %s -- "$1" 2>/dev/null || echo 0; }
 fsize_v()    { local f=$1; if [[ -z ${SZC[$f]-} ]]; then SZC[$f]=$(stat -c %s -- "$f" 2>/dev/null || echo 0); fi; FSZ=${SZC[$f]}; }
 sum_sizes()  { local f; SEL_BYTES=0; for f in "${SELECTED[@]}"; do fsize_v "$f"; SEL_BYTES=$(( SEL_BYTES + FSZ )); done; }
 clear_screen() { [[ -t 1 ]] && printf '\033[H\033[2J\033[3J'; return 0; }
-pause()     { if [[ -t 0 && $NONINTERACTIVE -eq 0 ]]; then read -r -p "Press Enter to continue..." _ || true; fi; }
+is_tty()    { [[ -t 0 && -t 1 ]]; }      # a real person at a real screen (never true for captured output or pipes)
+pause()     { if is_tty && (( NONINTERACTIVE == 0 )); then read -r -p "Press Enter to continue..." _ || true; fi; }
 refresh_cols() { local c; c=$(tput cols 2>/dev/null) || c=${COLUMNS:-44}; [[ $c =~ ^[0-9]+$ ]] || c=44; TERM_COLS=$c; }
-term_cols() { [[ -n $TERM_COLS ]] || refresh_cols; echo "$TERM_COLS"; }
 fonts_dir() {   # best directory of ttf fonts for subtitle burn-in
   if [[ -d /system/fonts ]]; then printf '%s' /system/fonts
   elif [[ -d /usr/share/fonts ]]; then printf '%s' /usr/share/fonts
@@ -337,7 +353,7 @@ ask() {
     if [[ -f $mk ]]; then printf '%s' "$(<"$mk")"; return 0; fi
   fi
   if [[ -n $d ]]; then
-    read -r -p "$p [$d]: " a || exit 0
+    read -r -p "$p [$d]: " a || { printf '%s' "$d"; return 0; }      # no input at all (EOF): take the default
     a=${a:-$d}
   else
     read -r -p "$p: " a || exit 0
@@ -663,9 +679,9 @@ calc_threads() {   # $1 = parallel jobs -> THREADS_PER_JOB (0 = encoder default)
   fi
   if (( c > 0 )); then THREADS_PER_JOB=$(( (c + n - 1) / n )); else THREADS_PER_JOB=0; fi
 }
-have_enc() { ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw -- "$1"; }
+FF_ENCODERS=""
+have_enc() { [[ -n $FF_ENCODERS ]] || FF_ENCODERS=$(ffmpeg -hide_banner -encoders 2>/dev/null); grep -qw -- "$1" <<<"$FF_ENCODERS"; }
 hw_encoder_name() { case $CODEC in hw265) echo hevc_mediacodec;; hw264) echo h264_mediacodec;; esac; }
-sel_size() { sum_sizes; echo "$SEL_BYTES"; }
 
 # ----------------------------------------------------------------- presets ---
 preset_desc() {
@@ -864,13 +880,6 @@ sub_codecs_ok() {   # 0 = all text-based (safe to copy), 1 = bitmap subs present
     esac
   done < <(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 -- "$1" 2>/dev/null)
   return $bad
-}
-list_sub_streams() {   # prints "relidx codec lang" lines
-  local i=0 codec lang
-  while IFS=, read -r codec lang; do
-    i=$(( i + 1 ))
-    printf '%d %s %s\n' "$i" "${codec:-?}" "${lang:--}"
-  done < <(ffprobe -v error -select_streams s -show_entries stream=codec_name:stream_tags=language -of csv=p=0 -- "$1" 2>/dev/null)
 }
 find_srt() {   # $1 video -> echo matching .srt path (asks if several)
   local dir base cands=() i c
@@ -1236,6 +1245,7 @@ build_vf() {
   [[ $SCALER == lanczos ]] && sf=":flags=lanczos"
   # interlaced sources (DVD, TV recordings): remove the comb lines first
   case $SRC_FIELD in tt|bb|tb|bt) (( DEINT )) && f+=("yadif=mode=0:parity=-1:deint=1");; esac
+  [[ -n $LOGO_GRAPH ]] && f+=("$LOGO_GRAPH")       # logo removal works on the untouched source picture
   [[ -n $CROP_VF ]] && f+=("$CROP_VF")
   # frame-rate limit FIRST: dropped frames are never scaled or denoised
   if (( FPS > 0 )) && awk -v s="$SRC_FPS" -v t="$FPS" 'BEGIN{ exit !(s > t+0.5) }'; then
@@ -1588,6 +1598,7 @@ compress_file() {
     tally fail; return 1
   fi
   ex_nsubs=$SRC_NSUBS; ex_bad=$SRC_SUBBAD     # one probe call gave us everything
+  (( LOGO_MODE )) && logo_pick_ext "$src"
   container_rules
   in_sz=$(fsize "$src")
   if ! calc_edur; then
@@ -1628,7 +1639,19 @@ compress_file() {
   audio_plan
   (( AUD_COPY )) && printf '  %sAudio: AAC %s kbps is already at/below the target - copied, no re-encode%s\n' "$C_D" "$SRC_ABR" "$C_0"
 
-  TMPD=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
+  if (( LOGO_MODE )); then          # find (or take) the logo areas BEFORE anything is built
+    local lrc
+    logo_prepare "$src"; lrc=$?
+    if (( lrc == 1 )); then
+      add_result "$name" "$(human "$in_sz")" "-" "-" "-" "SKIPPED (no logo removed)" "$src" ""
+      return 0
+    elif (( lrc != 0 )); then
+      add_result "$name" "$(human "$in_sz")" "-" "-" "-" "FAILED (logo)" "$src" ""
+      tally fail; return 1
+    fi
+  fi
+  TMPD=$(mktemp -d) || { err "Cannot create temp dir."; [[ -n $LGD ]] && rm -rf -- "$LGD"; return 1; }
+  (( LOGO_MODE )) && logo_install "$TMPD"
   dst=$(unique_out "$src")
   if (( CT_STAGE )); then
     out_tmp "$dst" "$in_sz"; tmp=$OT_TMP          # built locally, moved at the end
@@ -1710,7 +1733,7 @@ compress_file() {
       "${AENC[@]}" "${scodec[@]}" "${submeta[@]}" "${META[@]}" "${fast[@]}" "${fmt[@]}" -max_muxing_queue_size 2048 "$tmp" )
     rc=$?
   fi
-  rm -rf "$TMPD"; TMPD=""
+  rm -rf "$TMPD"; TMPD=""; LOGO_GRAPH=""
 
   if (( rc != 0 )) || [[ ! -s $tmp ]]; then
     err "ffmpeg failed (exit $rc). Last log lines:"
@@ -1767,7 +1790,7 @@ done_output() {   # $1 src -> echo the finished output of an earlier run (needs 
 is_vc_output() {   # 0 = this file name looks like something vc itself produced
   local b=${1##*/}; b=${b%.*}
   [[ -n $SUFFIX && $b == *"$SUFFIX" ]] && return 0
-  case $b in *_repaired|*_fixed|*_shifted|*_subbed|*_burned|*_nosub|*_compare|*_compressed) return 0;; esac
+  case $b in *_repaired|*_fixed|*_shifted|*_subbed|*_burned|*_nosub|*_compare|*_compressed|*_nologo) return 0;; esac
   return 1
 }
 
@@ -2199,28 +2222,6 @@ find_videos() {   # $1 = multi (default: add to the queue) | one (sets PICK_RESU
         else
           q=$ans; page=0
         fi;;
-    esac
-  done
-}
-quick_locations() {
-  local cands=() d ans s="$HOME/storage/shared"
-  if [[ ! -d $HOME/storage ]]; then warn "No storage access yet. Run: termux-setup-storage  (or: vc --setup)"; fi
-  for d in "$s/DCIM/Camera" "$s/Download" "$s/Movies" "$s/DCIM" "$s/Pictures/Screenshots" \
-           "$s/Telegram/Telegram Video" "$s/Android/media/org.telegram.messenger/Telegram/Telegram Video" \
-           "$s/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video" "$s" "$PWD"; do
-    [[ -d $d ]] && cands+=("$d")
-  done
-  while true; do
-    printf '\n%sQuick locations%s\n' "$C_B" "$C_0"
-    local i
-    for i in "${!cands[@]}"; do printf ' %2d) %s\n' $(( i + 1 )) "$(trunc "$(pretty "${cands[i]}")")"; done
-    echo "  p) type/paste a path (file or folder)     b) back"
-    read -r -p "> " ans || return 1
-    case $ans in
-      b|B|"") return 1;;
-      p|P) ans=$(ask "Path" ""); [[ -n $ans ]] && add_path "$ans"; return;;
-      *[!0-9]*) add_path "$ans"; return;;
-      *) if (( ans >= 1 && ans <= ${#cands[@]} )); then pick_from_dir "${cands[ans-1]}" && return; fi;;
     esac
   done
 }
@@ -2717,7 +2718,7 @@ repair_structural() {   # $1 src $2 tag -> 0 when the file was rebuilt from its 
     rm -f -- "$out"
   fi
   if tool_have untrunc; then
-    if [[ -z $rd && $REPAIR_AUTO == 0 && -t 0 ]]; then rd=$(ask "A healthy video from the SAME camera/app (blank = skip untrunc)" ""); rd=${rd/#\~/$HOME}; fi
+    if [[ -z $rd && $REPAIR_AUTO == 0 ]] && is_tty; then rd=$(ask "A healthy video from the SAME camera/app (blank = skip untrunc)" ""); rd=${rd/#\~/$HOME}; fi
     if [[ -n $rd && -f $rd ]] && repair_untrunc "$src" "$rd" "$od"; then out=$RM_OUT
       if diag_probe "$out"; then repair_verify "$out" "$D_DUR"; else VERIFY_OK=0; fi
       if (( VERIFY_OK )); then
@@ -2755,7 +2756,7 @@ repair_lab() {   # $1 video  $2 optional healthy reference file
   printf '  %s\n' "$(trunc "$(basename -- "$src")")"
   if (( readable )); then
     info "Readable: $D_VCODEC${D_ACODEC:+ + $D_ACODEC}, $(fmt_time "$D_DUR"), $(human "$(fsize "$src")")"
-    if (( LAB_SAMPLE )) || { (( ${D_DUR%%.*} > 300 )) && [[ -t 0 ]] && yesno "This video is long (every re-encode method takes about as long as the video). Test on a 60 s sample first?" y; }; then
+    if (( LAB_SAMPLE )) || { (( ${D_DUR%%.*} > 300 )) && is_tty && yesno "This video is long (every re-encode method takes about as long as the video). Test on a 60 s sample first?" y; }; then
       LAB_SAMPLE=1
     fi
   else
@@ -2819,7 +2820,7 @@ repair_lab() {   # $1 video  $2 optional healthy reference file
     "$( (( best_np == 0 )) && echo "completely fixed" || echo "$best_np problem(s) remain" )"
   if (( LAB_SAMPLE )); then
     info "  That was on a 60 s sample. Run the winner on the whole video?"
-    if [[ -t 0 ]] && yesno "Repair the whole video with '$(repair_lab_label "$m")' now?" y; then
+    if is_tty && yesno "Repair the whole video with '$(repair_lab_label "$m")' now?" y; then
       rm -rf -- "$td"
       mkdir -p "$CONF_DIR"
       case $m in
@@ -3257,15 +3258,6 @@ sync_shift_file() {   # $1 src  $2 milliseconds (positive = delay the audio)
   return 0
 }
 
-shift_audio_dialog() {   # $1 video
-  local ms
-  echo " Positive = delay the audio (sound is too early)."
-  echo " Negative = advance the audio (sound is too late)."
-  echo " Example: 250    or    -250"
-  ms=$(ask "Shift audio by (ms)" "")
-  [[ -n $ms ]] && sync_shift_file "$1" "$ms"
-  return 0
-}
 
 queue_run() {   # $1 label  $2 function(src, tag): runs it over the WHOLE queue, one after another (or -j in parallel)
   local label=$1 fn=$2
@@ -3342,7 +3334,7 @@ diag_queue() {   # diagnose every queued video; offers to repair exactly the one
     fi
   done
   (( n > 1 )) && printf '\n%s== Diagnosis finished ==%s  %d ok, %d need repair, %d unreadable\n' "$C_B" "$C_0" "$good" "$bad" "$unread"
-  if (( bad > 0 )) && [[ -t 0 ]] && yesno "Auto-repair the $bad video(s) with problems now, one after another?" y; then
+  if (( bad > 0 )) && is_tty && yesno "Auto-repair the $bad video(s) with problems now, one after another?" y; then
     saved=("${SELECTED[@]}"); SELECTED=("${fix[@]}")
     repair_batch
     SELECTED=("${saved[@]}")
@@ -3798,7 +3790,7 @@ extract_frames() {   # $1 video  $2 start  $3 end ("" = to the end, +N = N s aft
   info "  $(human "$(du -sk -- "$out" 2>/dev/null | awk '{printf "%d", $1 * 1024}')") in $(fmt_time $(( SECONDS - t0 )))  |  first: $first"
   FRAMES_OUT=$out
   command -v termux-media-scan >/dev/null 2>&1 && { timeout 60 termux-media-scan -r "$out" >/dev/null 2>&1 & }
-  if (( confirm )) && [[ -t 0 ]]; then yesno "Open the first frame?" n && open_file "$out/$first"; fi
+  if (( confirm )) && is_tty; then yesno "Open the first frame?" n && open_file "$out/$first"; fi
   return 0
 }
 
@@ -3990,7 +3982,7 @@ cores_race() {   # $1 optional video, $2 = "apply" -> switch to a clearly better
     if [[ $mode == apply ]]; then
       CORES=${cs[best]%%|*}; THREADS=${cs[best]##*|}
       reapply_cores; ok "CPU setup switched to: ${cn[best]}"
-    elif [[ -t 0 ]] && yesno "Make this your default CPU setup?" n; then
+    elif is_tty && yesno "Make this your default CPU setup?" n; then
       CORES=${cs[best]%%|*}; THREADS=${cs[best]##*|}
       save_settings; reapply_cores; ok "Saved (CORES=$CORES, THREADS=$THREADS)."
     fi
@@ -4239,7 +4231,7 @@ check_deps() {
   done
   if [[ -d $HOME/storage/shared ]]; then ok "shared storage access OK"; else warn "no storage access - run: termux-setup-storage"; fi
   setup_status all
-  if (( ${#SETUP_MISSING[@]} )) && [[ -t 0 ]] && yesno "Install the ${#SETUP_MISSING[@]} missing package(s) now (automatic)?" y; then setup_run all; fi
+  if (( ${#SETUP_MISSING[@]} )) && is_tty && yesno "Install the ${#SETUP_MISSING[@]} missing package(s) now (automatic)?" y; then setup_run all; fi
 }
 
 # ============================================================ AUTO-INSTALLER (v3.1)
@@ -4684,6 +4676,7 @@ tools_menu() {
     echo "10) Show last log"
     echo "11) Extract frames (time range -> new folder)"
     echo "12) Speed lab (preset race, CPU test, heat test)"
+    echo "13) Remove logo / watermark (finds it by itself)"
     echo " b) back"
     read -r -p "> " c || exit 0
     case $c in
@@ -4699,6 +4692,7 @@ tools_menu() {
       10) if [[ -s $LOG ]]; then tail -n 40 "$LOG"; else echo "(log is empty)"; fi; pause;;
       11) frames_flow; pause;;
       12) race_menu;;
+      13) tool_on_queue logo_tool_one "Remove logo"; pause;;
       b|B|"") return;;
     esac
   done
@@ -4754,6 +4748,7 @@ main_menu() {
     echo " 8) Tools (info, estimate, GIF, audio, thumbs)"
     echo " 9) START compression"
     echo " f) Extract frames (time range -> new folder)"
+    echo " l) Remove logo / watermark (finds it by itself)"
     echo " t) Speed lab & AUTO-TUNE (fastest settings for this phone)"
     echo " w) W6W vault (encrypted .w6w: video, pictures, text, audio ...)"
     echo " r) Results & compare (last batch)"
@@ -4771,6 +4766,7 @@ main_menu() {
       8) tools_menu;;
       9) start_flow;;
       f|F) frames_flow; pause;;
+      l|L) tool_on_queue logo_tool_one "Remove logo"; pause;;
       t|T) race_menu;;
       w|W) w6w_menu;;
       r|R) results_menu;;
@@ -4865,6 +4861,17 @@ Repair & sync options:
   --oldtv                ultra compatibility: Main profile, no B-frames, <=30 fps
   --stereo               downmix surround audio to stereo
 
+Logo remover (finds fixed logos / watermarks by itself and paints them out):
+  --delogo FILE|DIR ...  detect + remove. Keeps the quality: x264 CRF 17, audio copied, same size
+                         and container (any normal option such as -p / -c / -r overrides that)
+  --logo-detect FILE     only show WHERE the logos are (+ a preview picture), encode nothing
+  --logo-box X:Y:W:H     give the logo's place yourself (pixels, repeat for several logos)
+  --logo-sens S          low | normal (default) | high  - how easily faint logos are accepted
+  --logo-fill M          smart (default: outline-following fill + grain/texture) | simple | box
+  --logo-preview         save a before/after picture next to the video
+  -y with --delogo       no questions: whatever is found is removed. Without -y vc shows the
+                         places it found and asks first.
+
 Other commands:
   vc --setup [GROUP]  install everything the features need (ffmpeg, openssl, xz, tar, gpac ...);
                       GROUP = all (default) | core | w6w | perf | repair | extras
@@ -4891,6 +4898,9 @@ Examples:
   vc --race movie.mp4                         # which preset suits this phone?
   vc movie.mp4 -p turbo -y                    # options may follow the file
   vc movie.mkv -p web -y                      # VP9 + Opus in WebM (websites)
+  vc --delogo movie.mp4                       # finds the logo, shows it, asks, removes it
+  vc --delogo -y --logo-sens high clip.mp4    # no questions, also catches faint logos
+  vc --delogo --logo-box 1500:40:360:120 -y clip.mp4   # logo at x=1500 y=40, 360x120 px
   vc --w6w pack trip.w6w movie.mp4 movie.srt cover.jpg notes.txt   # one encrypted file
   vc --w6w info trip.w6w ;  vc --w6w convert trip.w6w --to mp4
   vc old_dvd.vob --format mp4 --autocrop -y   # DVD rip: deinterlaced, bars removed
@@ -4939,7 +4949,7 @@ W6W_REQUIRED=(w6w_hex_rand w6w_hex2bin w6w_field w6w_enc w6w_dec w6w_is w6w_fp w
 #     iv                      16-31  16 random bytes (AES-CBC)
 #     ciphertext              32-... AES-256-CBC( tar( W6W.MANIFEST, e001, e002 ... ) )
 #     HMAC-SHA256             last 32 bytes, over everything before it (encrypt-then-MAC)
-#   keys: PBKDF2-HMAC-SHA256, 200000 rounds; separate keys for encryption and MAC.
+#   keys: PBKDF2-HMAC-SHA256 (600000 rounds in password mode, 200000 for older files); separate keys for encryption and MAC.
 W6W_ITER=200000
 W6W_SQUEEZE=0; W6W_PWMODE=0; W6W_TO=""; W6W_COMMENT=""; W6W_SECRET=""; W6W_MAC_SECRET=""
 W6W_KEY=""; W6W_IV=""; W6W_MK=""; W6W_DEVKEY=""; W6W_PASSWORD=${W6W_PASSWORD:-}; LAST_OUT=""
@@ -4965,34 +4975,6 @@ w6w_dec()      { local s=${1//%/\\x}; printf '%b' "$s"; }
 w6w_is()       { [[ $(head -c 4 -- "$1" 2>/dev/null) == W6W1 ]]; }
 w6w_fp()       { printf '%s' "$1" | sha256sum | cut -c1-12; }
 
-w6w_device_key() {   # W6W_DEVKEY = this install's random 256-bit key (created once, mode 600)
-  local kf="$CONF_DIR/w6w.key"
-  if [[ ! -s $kf ]]; then
-    mkdir -p "$CONF_DIR"
-    ( umask 077; w6w_hex_rand 32 > "$kf" )
-    W6W_DEVKEY=$(<"$kf")
-    warn "A new device key was created [$(w6w_fp "$W6W_DEVKEY")]. Back it up now: vc --w6w key export  (after a reinstall or data wipe, device-mode .w6w files cannot be opened without it)."
-  fi
-  W6W_DEVKEY=$(<"$kf")
-}
-w6w_enc()      { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }   # every byte as %HH
-w6w_dec()      { local s=${1//%/\\x}; printf '%b' "$s"; }
-w6w_is()       { [[ $(head -c 4 -- "$1" 2>/dev/null) == W6W1 ]]; }
-w6w_fp()       { printf '%s' "$1" | sha256sum | cut -c1-12; }
-
-w6w_device_key() {   # W6W_DEVKEY = this install's random 256-bit key (created once, mode 600)
-  local kf="$CONF_DIR/w6w.key"
-  if [[ ! -s $kf ]]; then
-    mkdir -p "$CONF_DIR"
-    ( umask 077; w6w_hex_rand 32 > "$kf" )
-    W6W_DEVKEY=$(<"$kf")
-    warn "A new device key was created [$(w6w_fp "$W6W_DEVKEY")]. Back it up now: vc --w6w key export  (after a reinstall or data wipe, device-mode .w6w files cannot be opened without it)."
-  fi
-  W6W_DEVKEY=$(<"$kf")
-}
-w6w_dec()      { local s=${1//%/\\x}; printf '%b' "$s"; }
-w6w_is()       { [[ $(head -c 4 -- "$1" 2>/dev/null) == W6W1 ]]; }
-w6w_fp()       { printf '%s' "$1" | sha256sum | cut -c1-12; }
 w6w_device_key() {   # W6W_DEVKEY = this install's random 256-bit key (created once, mode 600)
   local kf="$CONF_DIR/w6w.key"
   if [[ ! -s $kf ]]; then
@@ -5517,7 +5499,7 @@ w6w_key_cmd() {   # show | export | import HEX | new
             local had=0; [[ -s $CONF_DIR/w6w.key ]] && { had=1; cp -f -- "$CONF_DIR/w6w.key" "$CONF_DIR/w6w.key.bak"; }
             ( umask 077; printf '%s' "${2,,}" > "$CONF_DIR/w6w.key" ); ok "Key imported.$( (( had )) && echo ' (the old one is kept as w6w.key.bak)')";;
     new)    warn "A NEW key makes every device-mode .w6w made so far unreadable (unless you keep a backup)."
-            if [[ -t 0 ]] && ! yesno "Create a new key?" n; then return 1; fi
+            if is_tty && ! yesno "Create a new key?" n; then return 1; fi
             [[ -s $CONF_DIR/w6w.key ]] && cp -f -- "$CONF_DIR/w6w.key" "$CONF_DIR/w6w.key.bak"
             ( umask 077; w6w_hex_rand 32 > "$CONF_DIR/w6w.key" ); ok "New key created (old one kept as w6w.key.bak).";;
     *) err "Use: key show | export | import HEX | new"; return 1;;
@@ -5643,20 +5625,400 @@ w6w_cli() {   # vc --w6w  pack|info|extract|convert|play|key|list ...
 }
 
 
-# ================================================================ SELF-TEST (v3.2)
+# ================================================================ LOGO REMOVER (v3.3)
+# vc --delogo FILE ...    finds FIXED logos / watermarks / TV bugs by itself and paints them out.
+#   1. DETECT  21 frames spread over the video -> per-pixel MEDIAN (the moving picture melts away,
+#              a fixed logo stays sharp) -> edges of brightness AND colour -> compact clusters of
+#              strong edges = logos -> a mask that follows the logo's real outline.
+#   2. FILL    removelogo (follows the outline) -> light blur (no streaks) -> grain / texture copied
+#              from the SAME frame right next to the logo -> feathered blend. Only the small logo
+#              areas are processed, so encoding speed stays the same.
+# Honest limit: smooth / blurry / grainy backgrounds come out (almost) perfect; a big logo over
+# sharp, detailed content cannot be rebuilt exactly by any filter (only AI inpainting can).
+LOGO_MODE=0; LOGO_SENS=normal; LOGO_FILL=smart; LOGO_PREVIEW=0; LOGO_DETECT_ONLY=0; LOGO_SAMPLES=21
+LOGO_CONFIRM=0; LOGO_TEX_CLIP=40; LOGO_TEX_K=1.0; LOGO_KEEPEXT=1
+declare -a LOGO_BOXES=()
+LGD=""; LG_N=0; LG_FW=0; LG_FH=0; LG_GOT=0; LG_SHAPE=mask; LOGO_GRAPH=""; LOGO_PREVIEW_FILE=""; FF_FILTERS=""
+declare -a LG_BX=() LG_BY=() LG_BW=() LG_BH=() LG_RX=() LG_RY=() LG_RW=() LG_RH=() LG_DX=() LG_DY=()
+
+have_filter() {   # $1 filter name -> 0 when this ffmpeg has it (list fetched once)
+  [[ -n $FF_FILTERS ]] || FF_FILTERS=$(ffmpeg -hide_banner -filters 2>/dev/null)
+  grep -qE "^ [A-Z.]{3} $1 " <<<"$FF_FILTERS"
+}
+logo_caps() {   # 0 = this ffmpeg can detect + remove logos
+  local f miss=""
+  for f in crop overlay split lut dilation sobel tmedian extractplanes blend scale; do have_filter "$f" || miss+=" $f"; done
+  if [[ $LOGO_FILL == box ]]; then have_filter delogo || miss+=" delogo"
+  else for f in removelogo alphamerge movie gblur; do have_filter "$f" || miss+=" $f"; done
+       [[ $LOGO_FILL == smart ]] && { have_filter delogo || miss+=" delogo"; }; fi
+  if [[ -n $miss ]]; then err "This ffmpeg build lacks the filter(s):${miss}  -  try: pkg upgrade ffmpeg"; return 1; fi
+  return 0
+}
+logo_dims() {   # $1 src -> LG_FW LG_FH = frame size as the filters see it (rotation applied)
+  local o k v w="" h="" rot=0
+  o=$(ffprobe -v error -select_streams v:0 -show_entries 'stream=width,height:stream_tags=rotate:stream_side_data=rotation' -of default=nw=1 -- "$1" 2>/dev/null) || return 1
+  while IFS='=' read -r k v; do
+    case $k in
+      width) w=$v;; height) h=$v;;
+      rotation|TAG:rotate) v=${v%%.*}; [[ $v =~ ^-?[0-9]+$ ]] && rot=$v;;
+    esac
+  done <<<"$o"
+  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] || return 1
+  rot=${rot#-}; rot=$(( rot % 180 ))
+  if (( rot == 90 )); then LG_FW=$h; LG_FH=$w; else LG_FW=$w; LG_FH=$h; fi
+  (( LG_FW >= 64 && LG_FH >= 64 ))
+}
+logo_sample() {   # $1 src $2 from $3 to $4 count $5 AW $6 AH $7 out.raw -> LG_GOT frames of yuv444p (rc 0 when enough)
+  local src=$1 a=$2 b=$3 n=$4 aw=$5 ah=$6 out=$7 i t
+  : > "$out"
+  for (( i = 0; i < n; i++ )); do
+    t=$(awk -v a="$a" -v b="$b" -v i="$i" -v n="$n" 'BEGIN{ printf "%.3f", a + (b - a) * (0.03 + 0.94 * i / (n - 1)) }')
+    ffmpeg -nostdin -v error -noaccurate_seek -ss "$t" -i "$src" -frames:v 1 -an -sn -dn \
+      -vf "scale=${aw}:${ah}:flags=area,format=yuv444p" -f rawvideo - >> "$out" 2>>"$LOG" || true
+  done
+  LG_GOT=$(( $(fsize "$out") / (aw * ah * 3) ))
+  (( LG_GOT >= 9 ))
+}
+logo_awk() {   # the connected-component finder (plain POSIX awk, also fine for mawk / gawk / busybox)
+  cat <<'AWK'
+{
+  y = NR - 1
+  if (y < AH) { for (x = 1; x <= AW; x++) if ($x > 0) { B[y * AW + x - 1] = 1; nb++ } }
+  else        { yy = y - AH; for (x = 1; x <= AW; x++) if ($x > 0) D[yy * AW + x - 1] = 1 }
+}
+END {
+  tot = AW * AH
+  if (nb / tot > MAXON) { printf "STATIC %.3f\n", nb / tot; exit }
+  minpix = tot * 0.0004; if (minpix < 18) minpix = 18
+  n = 0; k = 0
+  for (i = 0; i < tot; i++) {
+    if (!(i in D) || (i in L)) continue
+    n++; sp = 0; stk[sp++] = i; L[i] = n
+    x0 = AW; y0 = AH; x1 = -1; y1 = -1; cnt = 0
+    while (sp > 0) {
+      p = stk[--sp]; px = p % AW; py = int(p / AW)
+      if (p in B) { cnt++; if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py }
+      for (dy = -1; dy <= 1; dy++) {
+        ny = py + dy; if (ny < 0 || ny >= AH) continue
+        for (dx = -1; dx <= 1; dx++) {
+          nx = px + dx; if (nx < 0 || nx >= AW) continue
+          q = ny * AW + nx
+          if ((q in D) && !(q in L)) { L[q] = n; stk[sp++] = q }
+        }
+      }
+    }
+    if (cnt < minpix || x1 < 0) continue
+    w = x1 - x0 + 1; h = y1 - y0 + 1
+    if (w > 0.6 * AW || h > 0.6 * AH || w * h > 0.22 * tot) continue
+    if ((w > 0.30 * AW && h < 0.045 * AH) || (h > 0.30 * AH && w < 0.045 * AW)) continue   # long thin line: letterbox / UI border
+    if (cnt / (w * h) < 0.07) continue                                                       # too sparse: noise, not a logo
+    k++; KC[k] = cnt; KX0[k] = x0; KY0[k] = y0; KX1[k] = x1; KY1[k] = y1; KL[k] = n
+  }
+  nk = 0
+  for (r = 1; r <= MAXL; r++) {
+    best = 0
+    for (j = 1; j <= k; j++) if (!(j in used) && (best == 0 || KC[j] > KC[best])) best = j
+    if (best == 0) break
+    used[best] = 1; order[r] = best; nk = r
+  }
+  # shaped mask: fill every row between the first and last edge pixel of the logo
+  for (r = 1; r <= nk; r++) {
+    c = order[r]
+    for (y = KY0[c]; y <= KY1[c]; y++) {
+      mn = -1; mx = -1
+      for (x = KX0[c]; x <= KX1[c]; x++) { p = y * AW + x; if ((p in B) && L[p] == KL[c]) { if (mn < 0) mn = x; mx = x } }
+      if (mn >= 0) for (x = mn; x <= mx; x++) M[y * AW + x] = 1
+    }
+  }
+  printf "P2\n%d %d\n255\n", AW, AH > PGM
+  for (y = 0; y < AH; y++) {
+    s = ""
+    for (x = 0; x < AW; x++) s = s (((y * AW + x) in M) ? "255 " : "0 ")
+    print s > PGM
+  }
+  close(PGM)
+  if (nk == 0) print "NONE"
+  for (r = 1; r <= nk; r++) { c = order[r]; printf "BOX %d %d %d %d %d\n", KX0[c], KY0[c], KX1[c], KY1[c], KC[c] }
+}
+AWK
+}
+logo_detect() {   # $1 src $2 workdir -> LG_N + tight boxes LG_B*, shaped mask $2/mask_full.png ; rc 0 found, 1 none, 2 error
+  local src=$1 wd=$2 aw ah got R T fb a b fg kind x0 y0 x1 y1 cnt fg sx sy bx by bw bh fw=$LG_FW fh=$LG_FH rc
+  aw=$fw; (( aw > 320 )) && aw=320
+  ah=$(( (fh * aw + fw / 2) / fw )); (( aw % 2 )) && aw=$(( aw - 1 )); (( ah % 2 )) && ah=$(( ah + 1 ))
+  a=${TRIM_START:-0}; b=${TRIM_END:-$DUR}
+  awk -v a="$a" -v b="$b" 'BEGIN{ exit !(b - a >= 1) }' || { b=$DUR; a=0; }
+  info "  Looking for fixed logos ($LOGO_SAMPLES frames, sensitivity: $LOGO_SENS) ..."
+  logo_sample "$src" "$a" "$b" "$LOGO_SAMPLES" "$aw" "$ah" "$wd/s.raw" || { err "Could not read enough frames from the video."; return 2; }
+  got=$LG_GOT; (( got % 2 == 0 )) && got=$(( got - 1 ))
+  fb=$(( aw * ah * 3 )); head -c $(( got * fb )) "$wd/s.raw" > "$wd/s2.raw" && mv -f "$wd/s2.raw" "$wd/s.raw"
+  R=$(( (got - 1) / 2 ))
+  # stage 1: edge strength of the median picture (brightness + both colour planes, strongest wins)
+  fg="[0:v]tmedian=radius=$R,format=yuv444p,extractplanes=y+u+v[y][u][v];"   # N=2R+1 frames in -> the first output frame is the median of ALL of them
+  fg+="[y]sobel,format=gray[ys];[u]sobel,format=gray[us];[v]sobel,format=gray[vs];"
+  fg+="[ys][us]blend=all_mode=lighten[t];[t][vs]blend=all_mode=lighten,format=gray[ee]"
+  ffmpeg -nostdin -v error -y -f rawvideo -pixel_format yuv444p -video_size "${aw}x${ah}" -framerate 1 -i "$wd/s.raw" \
+    -filter_complex "$fg" -map "[ee]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/e.raw" 2>>"$LOG" || { err "Edge analysis failed (see the log)."; return 2; }
+  [[ $(fsize "$wd/e.raw") -eq $(( aw * ah )) ]] || { err "Edge analysis produced no picture."; return 2; }
+  # the threshold follows THIS video's own noise level (smooth picture -> sensitive, noisy / detailed -> strict)
+  T=$(od -An -v -tu1 -w"$aw" "$wd/e.raw" | awk -v S="$LOGO_SENS" '
+    { for (i = 1; i <= NF; i++) { h[$i + 0]++; n++ } }
+    END { c = 0; p = 0; for (v = 0; v <= 255; v++) { c += h[v]; if (c >= 0.95 * n) { p = v; break } }
+          t = 2 * p + 25; if (S == "low") t *= 1.3; else if (S == "high") t *= 0.75
+          if (t < 50) t = 50; if (t > 240) t = 240; printf "%d", t }')
+  [[ $T =~ ^[0-9]+$ ]] || T=170
+  # stage 2: threshold -> edge pixels (B) and their dilated cousins (D, which glue letters of one logo together)
+  ffmpeg -nostdin -v error -y -f rawvideo -pixel_format gray -video_size "${aw}x${ah}" -framerate 1 -i "$wd/e.raw" \
+    -filter_complex "[0:v]lut=y='if(gt(val\\,$T)\\,255\\,0)',split[bb][cc];[cc]dilation,dilation,dilation[dd]" \
+    -map "[bb]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/b.raw" -map "[dd]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/d.raw" 2>>"$LOG" \
+    || { err "Edge analysis failed (see the log)."; return 2; }
+  [[ $(fsize "$wd/b.raw") -eq $(( aw * ah )) && $(fsize "$wd/d.raw") -eq $(( aw * ah )) ]] || { err "Edge analysis produced no picture."; return 2; }
+  logo_awk > "$wd/find.awk"
+  LG_N=0
+  while IFS=' ' read -r kind x0 y0 x1 y1 cnt; do
+    case $kind in
+      STATIC) warn "  The picture is mostly static (a still camera, slides, a screen recording): a fixed logo cannot be told apart from the scene."
+              warn "  Give the logo's place yourself:  vc --delogo --logo-box X:Y:W:H FILE"; return 1;;
+      BOX)    sx=$(( fw * 1000 / aw )); sy=$(( fh * 1000 / ah ))
+              bx=$(( x0 * sx / 1000 )); by=$(( y0 * sy / 1000 ))
+              bw=$(( (x1 + 1) * sx / 1000 - bx )); bh=$(( (y1 + 1) * sy / 1000 - by ))
+              LG_BX[LG_N]=$bx; LG_BY[LG_N]=$by; LG_BW[LG_N]=$bw; LG_BH[LG_N]=$bh; LG_N=$(( LG_N + 1 ));;
+    esac
+  done < <( { cat "$wd/b.raw" "$wd/d.raw"; } | od -An -v -tu1 -w"$aw" | awk -v AW="$aw" -v AH="$ah" -v MAXON=0.12 -v MAXL=4 -v PGM="$wd/small.pgm" -f "$wd/find.awk" )
+  (( LG_N > 0 )) || return 1
+  ffmpeg -nostdin -v error -y -i "$wd/small.pgm" \
+    -vf "dilation,scale=${fw}:${fh}:flags=bilinear,lut=y='if(gt(val\\,64)\\,255\\,0)',format=gray" -frames:v 1 "$wd/mask_full.png" 2>>"$LOG" \
+    && [[ -s $wd/mask_full.png ]] || { err "Could not build the logo mask."; return 2; }
+  return 0
+}
+logo_manual() {   # manual boxes "x:y:w:h" (source pixels) -> LG_B* ; rc 0 = at least one valid box
+  local s x y w h fw=$LG_FW fh=$LG_FH
+  LG_N=0
+  for s in "${LOGO_BOXES[@]}"; do
+    s=${s//,/:}
+    [[ $s =~ ^([0-9]+):([0-9]+):([0-9]+):([0-9]+)$ ]] || { warn "Bad box '$s' (use X:Y:W:H in pixels)"; continue; }
+    x=${BASH_REMATCH[1]}; y=${BASH_REMATCH[2]}; w=${BASH_REMATCH[3]}; h=${BASH_REMATCH[4]}
+    (( x >= fw || y >= fh )) && { warn "Box '$s' is outside the ${fw}x${fh} picture."; continue; }
+    (( x + w > fw )) && w=$(( fw - x )); (( y + h > fh )) && h=$(( fh - y ))
+    (( w >= 8 && h >= 8 )) || { warn "Box '$s' is too small."; continue; }
+    LG_BX[LG_N]=$x; LG_BY[LG_N]=$y; LG_BW[LG_N]=$w; LG_BH[LG_N]=$h; LG_N=$(( LG_N + 1 ))
+  done
+  LG_SHAPE=rect
+  (( LG_N > 0 ))
+}
+logo_regions() {   # tight boxes -> padded regions (even-aligned), donor patches, per-region masks lm<i>.png in $1
+  local wd=$1 i pad fw=$LG_FW fh=$LG_FH x y x2 y2 w h j k cx cy rw rh dx dy ok g=4 vfirst hfirst
+  local -a cand=()
+  pad=$(( fw / 80 )); (( pad < 6 )) && pad=6
+  for (( i = 0; i < LG_N; i++ )); do
+    x=$(( LG_BX[i] - pad )); y=$(( LG_BY[i] - pad )); x2=$(( LG_BX[i] + LG_BW[i] + pad )); y2=$(( LG_BY[i] + LG_BH[i] + pad ))
+    (( x < 0 )) && x=0; (( y < 0 )) && y=0; (( x2 > fw )) && x2=$fw; (( y2 > fh )) && y2=$fh
+    x=$(( x / 2 * 2 )); y=$(( y / 2 * 2 )); x2=$(( (x2 + 1) / 2 * 2 )); y2=$(( (y2 + 1) / 2 * 2 ))
+    (( x2 > fw )) && x2=$(( fw / 2 * 2 )); (( y2 > fh )) && y2=$(( fh / 2 * 2 ))
+    LG_RX[i]=$x; LG_RY[i]=$y; LG_RW[i]=$(( x2 - x )); LG_RH[i]=$(( y2 - y ))
+  done
+  for (( i = 0; i < LG_N; i++ )); do
+    x=${LG_RX[i]}; y=${LG_RY[i]}; w=${LG_RW[i]}; h=${LG_RH[i]}
+    if [[ $LG_SHAPE == mask ]]; then
+      ffmpeg -nostdin -v error -y -i "$wd/mask_full.png" -vf "crop=$w:$h:$x:$y,format=gray" -frames:v 1 "$wd/lm$i.png" 2>>"$LOG"
+    else   # manual box: white inside the user's box, black ring around it (the ring is what removelogo reads from)
+      ffmpeg -nostdin -v error -y -f lavfi -i "color=c=black:s=${w}x${h},format=gray,drawbox=x=$(( LG_BX[i] - x )):y=$(( LG_BY[i] - y )):w=${LG_BW[i]}:h=${LG_BH[i]}:color=white:t=fill" \
+        -frames:v 1 "$wd/lm$i.png" 2>>"$LOG"
+    fi
+    [[ -s $wd/lm$i.png ]] || { err "Could not build mask $((i + 1))."; return 1; }
+    # donor patch: same size, from just outside the logo, never overlapping any logo area. Prefer the side towards the picture centre.
+    cx=$(( x + w / 2 )); cy=$(( y + h / 2 ))
+    if (( cy < fh / 2 )); then vfirst="below above"; else vfirst="above below"; fi
+    if (( cx < fw / 2 )); then hfirst="right left"; else hfirst="left right"; fi
+    if (( w >= h )); then cand=($vfirst $hfirst); else cand=($hfirst $vfirst); fi
+    LG_DX[i]=-1; LG_DY[i]=-1
+    for k in "${cand[@]}"; do
+      case $k in
+        below) dx=$x; dy=$(( y + h + g ));; above) dx=$x; dy=$(( y - h - g ));;
+        right) dx=$(( x + w + g )); dy=$y;;  left) dx=$(( x - w - g )); dy=$y;;
+      esac
+      (( dx < 0 || dy < 0 || dx + w > fw || dy + h > fh )) && continue
+      ok=1
+      for (( j = 0; j < LG_N; j++ )); do
+        if (( dx < LG_RX[j] + LG_RW[j] + 2 && dx + w + 2 > LG_RX[j] && dy < LG_RY[j] + LG_RH[j] + 2 && dy + h + 2 > LG_RY[j] )); then ok=0; break; fi
+      done
+      (( ok )) && { LG_DX[i]=$dx; LG_DY[i]=$dy; break; }
+    done
+  done
+  return 0
+}
+logo_graph() {   # $1 in-label ("" = chain input)  $2 out-label ("" = unlabeled)  -> LOGO_GRAPH (mask files lm<i>.png are read from the ffmpeg working directory)
+  local ins="" outl="" g="" i n=$LG_N nsplit cur tx S smart=0 bx by bw bh fw=$LG_FW fh=$LG_FH dwl dhl dxl dyl
+  [[ -n $1 ]] && ins="[$1]"; [[ -n $2 ]] && outl="[$2]"
+  if [[ $LOGO_FILL == box ]]; then
+    for (( i = 0; i < n; i++ )); do
+      bx=${LG_BX[i]}; by=${LG_BY[i]}; bw=${LG_BW[i]}; bh=${LG_BH[i]}
+      (( bx < 1 )) && { bw=$(( bw - 1 + bx )); bx=1; }; (( by < 1 )) && { bh=$(( bh - 1 + by )); by=1; }
+      (( bx + bw > fw - 1 )) && bw=$(( fw - 1 - bx )); (( by + bh > fh - 1 )) && bh=$(( fh - 1 - by ))
+      g+="${g:+,}delogo=x=$bx:y=$by:w=$bw:h=$bh"
+    done
+    LOGO_GRAPH="${ins}${g}${outl}"; return 0
+  fi
+  [[ $LOGO_FILL == smart ]] && smart=1
+  nsplit=$(( 1 + n ))
+  for (( i = 0; i < n; i++ )); do (( smart && LG_DX[i] >= 0 )) && nsplit=$(( nsplit + 1 )); done
+  g="${ins}split=${nsplit}[base]"
+  for (( i = 0; i < n; i++ )); do
+    g+="[r$i]"; (( smart && LG_DX[i] >= 0 )) && g+="[d$i]"
+  done
+  g+=";"
+  for (( i = 0; i < n; i++ )); do
+    S=$(( (LG_RW[i] < LG_RH[i] ? LG_RW[i] : LG_RH[i]) / 20 )); (( S < 2 )) && S=2; (( S > 6 )) && S=6
+    # smooth base fill: "smart" = delogo's edge-to-edge interpolation (most accurate on gradients / grain),
+    # "simple" = removelogo (follows the outline). Either way only the logo's own pixels are used later (mask).
+    g+="[r$i]crop=${LG_RW[i]}:${LG_RH[i]}:${LG_RX[i]}:${LG_RY[i]},"
+    dwl=${LG_BW[i]}; dhl=${LG_BH[i]}; dxl=$(( LG_BX[i] - LG_RX[i] )); dyl=$(( LG_BY[i] - LG_RY[i] ))
+    (( dxl < 1 )) && { dwl=$(( dwl - 1 + dxl )); dxl=1; }; (( dyl < 1 )) && { dhl=$(( dhl - 1 + dyl )); dyl=1; }
+    (( dxl + dwl > LG_RW[i] - 1 )) && dwl=$(( LG_RW[i] - 1 - dxl )); (( dyl + dhl > LG_RH[i] - 1 )) && dhl=$(( LG_RH[i] - 1 - dyl ))
+    if (( smart && dwl >= 4 && dhl >= 4 )); then g+="delogo=x=$dxl:y=$dyl:w=$dwl:h=$dhl,gblur=sigma=1.5"
+    elif (( smart )); then g+="removelogo=f=lm$i.png,gblur=sigma=$S"
+    else g+="removelogo=f=lm$i.png"; fi
+    g+="[lf$i];"
+    tx="[lf$i]"
+    if (( smart && LG_DX[i] >= 0 )); then
+      g+="[d$i]crop=${LG_RW[i]}:${LG_RH[i]}:${LG_DX[i]}:${LG_DY[i]},split[p$i][q$i];[q$i]gblur=sigma=$S[pb$i];"
+      g+="[p$i][pb$i]blend=all_expr='128+clip(A-B\\,-$LOGO_TEX_CLIP\\,$LOGO_TEX_CLIP)'[hp$i];"
+      g+="[lf$i][hp$i]blend=all_expr='clip(A+(B-128)*$LOGO_TEX_K\\,0\\,255)'[tx$i];"
+      tx="[tx$i]"
+    fi
+    g+="movie=lm$i.png,format=gray,gblur=sigma=1[m$i];${tx}format=yuva420p[tf$i];[tf$i][m$i]alphamerge[ta$i];"
+  done
+  cur=base
+  for (( i = 0; i < n; i++ )); do
+    if (( i == n - 1 )); then g+="[$cur][ta$i]overlay=${LG_RX[i]}:${LG_RY[i]}:format=auto${outl}"
+    else g+="[$cur][ta$i]overlay=${LG_RX[i]}:${LG_RY[i]}:format=auto[o$i];"; cur="o$i"; fi
+  done
+  LOGO_GRAPH=$g
+}
+logo_preview() {   # $1 src $2 out.png -> left: where the logos were found, right: after removal (run with $LGD as working dir)
+  local src=$1 out=$2 t box="" i th a b
+  [[ $out == /* ]] || out="$PWD/$out"        # the preview is written from inside the working dir
+  [[ $src == /* ]] || src="$PWD/$src"
+  a=${TRIM_START:-0}; b=${TRIM_END:-$DUR}
+  awk -v a="$a" -v b="$b" 'BEGIN{ exit !(b > a) }' || { a=0; b=$DUR; }
+  t=$(awk -v a="$a" -v b="$b" 'BEGIN{ printf "%.2f", a + (b - a) * 0.35 }')
+  th=$(( LG_FW / 400 + 2 ))
+  for (( i = 0; i < LG_N; i++ )); do box+=",drawbox=x=${LG_BX[i]}:y=${LG_BY[i]}:w=${LG_BW[i]}:h=${LG_BH[i]}:color=red@0.9:t=$th"; done
+  logo_graph "w" "r"
+  ( cd "$LGD" && ffmpeg -nostdin -v error -y -ss "$t" -i "$src" -frames:v 1 \
+      -filter_complex "[0:v]split=2[o][w];[o]null${box}[l];${LOGO_GRAPH};[l]scale=-2:540[l2];[r]scale=-2:540[r2];[l2][r2]hstack" "$out" 2>>"$LOG" )
+  [[ -s $out ]]
+}
+logo_where() {   # $1 index -> "top-left" ...
+  local cx=$(( LG_BX[$1] + LG_BW[$1] / 2 )) cy=$(( LG_BY[$1] + LG_BH[$1] / 2 )) v h
+  if (( cy * 3 < LG_FH )); then v=top; elif (( cy * 3 > LG_FH * 2 )); then v=bottom; else v=middle; fi
+  if (( cx * 3 < LG_FW )); then h=left; elif (( cx * 3 > LG_FW * 2 )); then h=right; else h=centre; fi
+  printf '%s-%s' "$v" "$h"
+}
+logo_prepare() {   # $1 src -> LGD with masks, LG_* filled. rc 0 = go, 1 = nothing to do (message shown), 2 = error
+  local src=$1 rc ans i dir base prev="" man tries=0
+  LG_N=0; LGD=""; LOGO_GRAPH=""
+  logo_caps || return 2
+  logo_dims "$src" || { err "Cannot read the picture size of: $(basename -- "$src")"; return 2; }
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  LGD=$(mktemp -d) || { err "Cannot create temp dir."; return 2; }
+  local -a keep=("${LOGO_BOXES[@]}")
+  while true; do
+    tries=$(( tries + 1 ))
+    if (( ${#LOGO_BOXES[@]} )); then
+      if ! logo_manual; then err "No valid box given."; rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 2; fi
+    else
+      LG_SHAPE=mask
+      logo_detect "$src" "$LGD"; rc=$?
+      if (( rc == 2 )); then rm -rf -- "$LGD"; LGD=""; return 2; fi
+      if (( rc == 1 )); then
+        warn "  No fixed logo found in $(basename -- "$src")."
+        if (( LOGO_CONFIRM )) && (( tries < 3 )); then
+          info "  Frame size: ${LG_FW}x${LG_FH}.  Type the logo's box as X:Y:W:H in pixels (blank = skip this video)."
+          man=$(ask "Box" "")
+          if [[ -n $man ]]; then LOGO_BOXES=("$man"); continue; fi
+        fi
+        rm -rf -- "$LGD"; LGD=""; return 1
+      fi
+    fi
+    logo_regions "$LGD" || { rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 2; }
+    info "  Logo area(s) to remove:"
+    for (( i = 0; i < LG_N; i++ )); do
+      printf '    %d) %-13s x=%s y=%s  %sx%s px%s\n' $(( i + 1 )) "$(logo_where "$i")" "${LG_BX[i]}" "${LG_BY[i]}" "${LG_BW[i]}" "${LG_BH[i]}" \
+        "$( (( LG_DX[i] >= 0 )) || printf '   (no texture donor next to it)' )"
+    done
+    dir=${OUTDIR:-$(dirname -- "$src")}; base=$(basename -- "$src"); base=${base%.*}
+    prev=""
+    if (( LOGO_PREVIEW || LOGO_CONFIRM )); then
+      prev=$(unique_file "$dir" "${base}_logo_preview" png)
+      if logo_preview "$src" "$prev"; then LOGO_PREVIEW_FILE=$prev; info "  Preview (left: found, right: after removal): $(pretty "$prev")"
+      else rm -f -- "$prev"; prev=""; warn "  Could not make the preview picture."; fi
+    fi
+    if (( LOGO_CONFIRM )) && (( ${#LOGO_BOXES[@]} == 0 )); then
+      ans=$(ask "Remove these?  y = yes   n = skip this video   m = type the box by hand   p = open the preview" "y")
+      case ${ans,,} in
+        n*) rm -rf -- "$LGD"; LGD=""; return 1;;
+        m*) man=$(ask "Box X:Y:W:H (frame is ${LG_FW}x${LG_FH})" ""); [[ -n $man ]] && LOGO_BOXES=("$man"); continue;;
+        p*) [[ -n $prev ]] && open_file "$prev"; ans=$(ask "Remove these? (y/n)" "y"); [[ ${ans,,} == y* ]] || { rm -rf -- "$LGD"; LGD=""; return 1; };;
+      esac
+    fi
+    break
+  done
+  LOGO_BOXES=("${keep[@]}")
+  return 0
+}
+logo_install() {   # $1 = the encoder's working dir -> copies the masks in, builds LOGO_GRAPH, removes $LGD
+  local i
+  for (( i = 0; i < LG_N; i++ )); do cp -f -- "$LGD/lm$i.png" "$1/lm$i.png"; done
+  rm -rf -- "$LGD"; LGD=""
+  logo_graph "" ""
+}
+logo_defaults() {   # the dedicated tool keeps the picture quality (explicit options still win)
+  CODEC=x264; CRF=17; SPEED=fast; HEIGHT=0; FPS=0; AUDIO=copy; TARGET_MB=0; SUFFIX="_nologo"; PRESET_NAME="logo-removal"
+  [[ -z $SUB_FILE ]] && SUB_MODE=off      # no hunting for a matching .srt (an explicit --srt FILE still works)
+}
+logo_detect_report() {   # vc --delogo --logo-detect FILE: shows where the logos are, writes the preview, encodes nothing
+  local f rc
+  for f in "$@"; do
+    printf '\n%s== Logo finder: %s ==%s\n' "$C_B" "$(basename -- "$f")" "$C_0"
+    probe "$f" || continue
+    LOGO_PREVIEW=1
+    logo_prepare "$f"; rc=$?
+    (( rc == 0 )) && { ok "Found $LG_N logo area(s)."; rm -rf -- "$LGD"; LGD=""; }
+  done
+}
+logo_tool_one() {   # menu tool: one video (pick_target / FORCE_TARGET) with questions
+  local src sv_c sv_q sv_s sv_h sv_f sv_a sv_t sv_x sv_n sv_pn sv_p sv_cf
+  pick_target || return 1; src=$PICK_RESULT
+  sv_c=$CODEC; sv_q=$CRF; sv_s=$SPEED; sv_h=$HEIGHT; sv_f=$FPS; sv_a=$AUDIO; sv_t=$TARGET_MB; sv_x=$SUFFIX; sv_pn=$PRESET_NAME; sv_p=$PARALLEL_JOBS; sv_cf=$LOGO_CONFIRM
+  logo_defaults; PARALLEL_JOBS=1; LOGO_MODE=1; LOGO_CONFIRM=1
+  local -a saved=("${SELECTED[@]}")
+  SELECTED=("$src"); run_batch; sv_n=$?
+  SELECTED=("${saved[@]}")
+  LOGO_MODE=0; LOGO_CONFIRM=$sv_cf; PARALLEL_JOBS=$sv_p
+  CODEC=$sv_c; CRF=$sv_q; SPEED=$sv_s; HEIGHT=$sv_h; FPS=$sv_f; AUDIO=$sv_a; TARGET_MB=$sv_t; SUFFIX=$sv_x; PRESET_NAME=$sv_pn
+  return $sv_n
+}
+
+logo_pick_ext() { local e=${1##*.}; e=${e,,}; (( LOGO_KEEPEXT )) || return 0; case $e in mp4|mkv|mov) OUT_EXT=$e;; esac; }   # the logo tool keeps the container of the source
+
+# ================================================================ SELF-TEST (v3.3)
 # vc --selftest [full]   Tests vc on THIS phone with tiny synthetic files (nothing of yours is touched;
 # its own temporary home/config is used). Quick = core features (~1 min), full = also parallel +
 # screen-rotation signal, repair lab and the installer logic.
 SELF=$(readlink -f -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null)
-_stv() { env HOME="$ST_H" XDG_CONFIG_HOME="$ST_C" TERM="${TERM:-xterm}" bash "$SELF" "$@"; }
-_stv2() { env HOME="$ST_H" XDG_CONFIG_HOME="$ST_C2" TERM="${TERM:-xterm}" bash "$SELF" "$@"; }
+# Every test command gets NO input (</dev/null) and a time limit: a question can never wait for a key.
+_stv()  { local t=(); tool_have timeout && t=(timeout -k 5 "${ST_TMO:-300}"); "${t[@]}" env HOME="$ST_H" XDG_CONFIG_HOME="$ST_C" TERM="${TERM:-xterm}" bash "$SELF" "$@" </dev/null; }
+_stv2() { local t=(); tool_have timeout && t=(timeout -k 5 "${ST_TMO:-300}"); "${t[@]}" env HOME="$ST_H" XDG_CONFIG_HOME="$ST_C2" TERM="${TERM:-xterm}" bash "$SELF" "$@" </dev/null; }
+ST_NOTE=""
 _st() {   # _st "name" function [args]  (function returns 0 = pass, 99 = skipped, else fail)
   local name=$1 s=$SECONDS rc
   shift
   printf '  %-44s ' "$name"
-  { echo "=== $name"; "$@"; } >>"$ST_LOG" 2>&1; rc=$?
+  ST_NOTE=""
+  { echo "=== $name"; "$@"; } >>"$ST_LOG" 2>&1 </dev/null; rc=$?
   case $rc in
-    0)  printf '%sPASS%s  %ds\n' "$C_G" "$C_0" $(( SECONDS - s )); ST_OK=$(( ST_OK + 1 ));;
+    0)  printf '%sPASS%s  %ds%s\n' "$C_G" "$C_0" $(( SECONDS - s )) "${ST_NOTE:+   ($ST_NOTE)}"; ST_OK=$(( ST_OK + 1 ));;
     99) printf '%sskip%s\n' "$C_Y" "$C_0"; ST_SKIP=$(( ST_SKIP + 1 ));;
     *)  printf '%sFAIL%s  %ds\n' "$C_R" "$C_0" $(( SECONDS - s )); ST_BAD=$(( ST_BAD + 1 )); ST_FAILED+=("$name");;
   esac
@@ -5665,7 +6027,8 @@ _stc_syntax()  { bash -n "$SELF"; }
 _stc_funcs()   {
   local f miss=0
   for f in "${W6W_REQUIRED[@]}" compress_file repair_file quickfix_file run_batch par_batch queue_run find_videos extract_frames \
-           preset_race repair_lab setup_run auto_tune probe diag_probe build_vf build_venc build_aenc selftest; do
+           preset_race repair_lab setup_run auto_tune probe diag_probe build_vf build_venc build_aenc selftest \
+           have_filter logo_caps logo_detect logo_regions logo_graph logo_prepare logo_install; do
     declare -F "$f" >/dev/null || { echo "MISSING function: $f"; miss=1; }
   done
   (( miss == 0 ))
@@ -5694,6 +6057,22 @@ _stc_frames() {
   want=$(ffprobe -v error -select_streams v:0 -show_entries frame=pts_time -of csv=p=0 "$ST_S/v.mp4" | awk -F, '$1>=0 && $1<1' | wc -l)
   echo "frames written: $n, frames in range: $want"
   (( n == want && n > 0 ))
+}
+_stc_logo()    {
+  have_filter removelogo && have_filter tmedian && have_filter alphamerge && have_filter movie && have_filter geq || return 99
+  local c="$ST_S/lg_clean.mp4" l="$ST_S/lg_logo.mp4" out v
+  # a smooth, slowly moving, slightly grainy picture + a fixed "logo" (square + two bars, 100 % white)
+  ffmpeg -nostdin -v error -y -f lavfi -i "color=c=gray:s=640x360:r=25:d=6,format=yuv420p,geq=lum='128+70*sin(X/90+T*0.9)+30*sin(Y/40-T*1.3)':cb='128+40*sin(Y/70-T*0.7)':cr='128+40*sin((X+Y)/120+T)',noise=alls=2:allf=t" \
+    -c:v libx264 -crf 8 -preset ultrafast -pix_fmt yuv420p "$c" || return 1
+  ffmpeg -nostdin -v error -y -i "$c" -vf "drawbox=x=470:y=24:w=26:h=26:color=white:t=fill,drawbox=x=506:y=26:w=100:h=6:color=white:t=fill,drawbox=x=506:y=38:w=100:h=6:color=white:t=fill" \
+    -c:v libx264 -crf 8 -preset ultrafast -pix_fmt yuv420p "$l" || return 1
+  _stv --delogo -y -o "$ST_O/lg" "$l" || return 1
+  out=$ST_O/lg/lg_logo_nologo.mp4
+  [[ -s $out ]] || { echo "no output file"; return 1; }
+  v=$(ffmpeg -nostdin -v info -i "$out" -i "$c" -filter_complex "[0:v]crop=170:44:458:20[a];[1:v]crop=170:44:458:20[b];[a][b]ssim" -f null - 2>&1 | grep -o 'All:[0-9.]*' | tail -n1)
+  v=${v#All:}; ST_NOTE="SSIM $v"
+  echo "similarity of the logo area to the logo-free original (SSIM): $v"
+  awk -v s="${v:-0}" 'BEGIN{ exit !(s >= 0.90) }'
 }
 _stc_diag()    { local o; o=$(_stv --diagnose "$ST_S/v.mp4" 2>&1); echo "$o"; [[ $o == *"Frame"* || $o == *"problem"* || $o == *"No sync"* || $o == *"Audio"* ]]; }
 _stc_quickfix() { cp "$ST_S/v.mp4" "$ST_S/q.mp4"; local o; o=$(_stv --quickfix "$ST_S/q.mp4" 2>&1); echo "$o"; [[ $o == *"verified"* ]]; }
@@ -5780,6 +6159,7 @@ selftest() {   # $1 quick (default) | full
   _st "compress -> MKV"                     _stc_compress mkv
   _st "compress -> WebM (VP9 + Opus)"       _stc_compress webm
   _st "extract frames = exact frame count"  _stc_frames
+  _st "logo removal (find + paint out)"     _stc_logo
   _st "diagnose"                            _stc_diag
   _st "quick fix (verified)"                _stc_quickfix
   _st "auto-repair (verified)"              _stc_repair
@@ -5850,8 +6230,14 @@ main() {
       --nosrt)    SUB_MODE=off; shift;;
       --keepsubs) KEEP_SUBS=1; shift;;
       --nosubs)   KEEP_SUBS=0; shift;;
-      --mkv)      OUT_EXT=mkv; shift;;
-      --format)   if (( $# >= 2 )); then OUT_EXT=${2,,}; shift 2; else err "--format needs mp4 | mkv | webm | mov | avi | ts"; exit 1; fi;;
+      --mkv)      OUT_EXT=mkv; LOGO_KEEPEXT=0; shift;;
+      --delogo)        LOGO_MODE=1; shift;;
+      --logo-detect)   LOGO_MODE=1; LOGO_DETECT_ONLY=1; shift;;
+      --logo-box)      if (( $# >= 2 )); then LOGO_BOXES+=("$2"); LOGO_MODE=1; shift 2; else err "--logo-box needs X:Y:W:H"; exit 1; fi;;
+      --logo-sens)     if (( $# >= 2 )); then LOGO_SENS=${2,,}; shift 2; else err "--logo-sens needs low | normal | high"; exit 1; fi;;
+      --logo-fill)     if (( $# >= 2 )); then LOGO_FILL=${2,,}; shift 2; else err "--logo-fill needs smart | simple | box"; exit 1; fi;;
+      --logo-preview)  LOGO_PREVIEW=1; shift;;
+      --format)   if (( $# >= 2 )); then OUT_EXT=${2,,}; LOGO_KEEPEXT=0; shift 2; else err "--format needs mp4 | mkv | webm | mov | avi | ts"; exit 1; fi;;
       --no-deint) DEINT=0; shift;;
       --autocrop) AUTOCROP=1; shift;;
       --repair)   REPAIR_ACTION=repair; shift;;
@@ -5910,6 +6296,8 @@ main() {
     *) err "Bad --repair-preset value."; exit 1;;
   esac
   case $OUT_EXT in mp4|mkv|webm|mov|avi|ts) ;; *) err "--format must be mp4, mkv, webm, mov, avi or ts."; exit 1;; esac
+  case $LOGO_SENS in low|normal|high) ;; *) err "--logo-sens must be low, normal or high."; exit 1;; esac
+  case $LOGO_FILL in smart|simple|box) ;; *) err "--logo-fill must be smart, simple or box."; exit 1;; esac
   case $TUNE_GOAL in ""|speed|balanced|size|quality) ;; *) err "--goal must be speed, balanced, size or quality."; exit 1;; esac
   [[ $CORES == auto || $CORES == all || $CORES =~ ^[0-9]+([-,][0-9]+)*$ ]] || { err "--cores must be auto, all or a list like 4-7."; exit 1; }
   [[ $THREADS =~ ^[0-9]+$ ]] && (( THREADS <= 128 )) || { err "--threads must be 0-128."; exit 1; }
@@ -5954,7 +6342,7 @@ main() {
 
   if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
     err "ffmpeg/ffprobe not found."
-    if [[ -t 0 ]] && yesno "Install now?" y; then do_setup; else echo "Run: vc --setup   (or: pkg install ffmpeg)"; exit 1; fi
+    if is_tty && yesno "Install now?" y; then do_setup; else echo "Run: vc --setup   (or: pkg install ffmpeg)"; exit 1; fi
     command -v ffmpeg >/dev/null 2>&1 || exit 1
   fi
 
@@ -5962,6 +6350,7 @@ main() {
   NCPU=$(nproc --all 2>/dev/null || nproc 2>/dev/null || echo 4)
   apply_cores; calc_threads 1
   if (( CPU_MODE )); then device_report; exit 0; fi
+  (( LOGO_MODE )) && logo_defaults        # quality-keeping base; explicit options below still win
   if [[ -n $PRESET_ARG ]]; then apply_preset "$PRESET_ARG" || { err "Unknown preset: $PRESET_ARG"; exit 1; }; fi
   [[ -n $OV_K ]] && { case $OV_K in x265|x264|av1|vp9|hw265|hw264) CODEC=$OV_K;; *) err "Unknown codec: $OV_K"; exit 1;; esac; PRESET_NAME=custom; }
   [[ -n $OV_C ]] && { CRF=$OV_C; TARGET_MB=0; PRESET_NAME=custom; }
@@ -6003,6 +6392,15 @@ main() {
   trap on_int INT TERM
   trap cleanup EXIT
 
+  if (( LOGO_MODE )); then
+    (( ${#SELECTED[@]} )) || { err "Usage: vc --delogo FILE ... [--logo-box X:Y:W:H] [--logo-sens low|normal|high] [--logo-fill smart|simple|box] [--logo-preview] [--logo-detect]"; exit 1; }
+    mkdir -p "$CONF_DIR"; : > "$LOG"
+    if (( LOGO_DETECT_ONLY )); then LOGO_CONFIRM=0; logo_detect_report "${SELECTED[@]}"; exit 0; fi
+    if (( AUTO )); then NONINTERACTIVE=1; LOGO_CONFIRM=0
+    else PARALLEL_JOBS=1; is_tty && LOGO_CONFIRM=1; fi
+    run_batch
+    exit $?
+  fi
   if (( TUNE_MODE )); then
     if (( ${#SELECTED[@]} )); then auto_tune "${SELECTED[0]}"; exit $?
     elif [[ -t 0 ]]; then auto_tune ""; exit $?
