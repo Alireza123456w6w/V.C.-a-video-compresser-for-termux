@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v3.3 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v3.5 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -18,6 +18,26 @@
 #     vc --delogo video.mp4   # find the logo / watermark by itself and paint it out (NEW)
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 3.5:
+#   + SUBTITLE FINDER: attaching an .srt no longer means typing a path. Subtitle Studio (embed / burn) and
+#     Settings 17 now open a finder like the video finder: the newest .srt files of the whole phone, the ones
+#     named like the video first (marked *), type a word to search, a number to pick, p to type a path.
+#   + FIXED: when several .srt files sat next to a video, the list was captured instead of shown (the choice
+#     could not work) and a compress run could wait unseen for an answer. Without a screen the exact-name
+#     file now wins; with a screen you get a numbered list.
+#
+#  What's new in 3.4:
+#   + MOVING LOGOS (--logo-mode moving, menu l asks: fixed or moving): hopping / coming-and-going
+#     watermarks are found window by window, grouped by place, each with its own time spans
+#     (jump times refined by a presence test, about 0.2 s accurate in the test).
+#   + NUMBERED PREVIEW + EDITOR: every logo gets a red box and a number on the preview picture. Type the
+#     number to grow / shrink / move the box (or one edge), set its time span, delete it, add a box, or let
+#     vc look again, finer, around it. The preview is redrawn and opened after every change.
+#   + FIXED: "This ffmpeg build lacks the filter(s) ..." on ffmpeg 8.x - the filter check parsed the
+#     layout of `ffmpeg -filters`, which differs between versions; it now asks ffmpeg directly.
+#   + New options: --logo-mode, --logo-window, --logo-windows, --logo-no-open; --logo-box accepts @a-b time spans;
+#     LOGO_DEBUG=1 prints what every scanning window found.
 #
 #  What's new in 3.3:
 #   + LOGO REMOVER (vc --delogo FILE, Tools 13, menu l): finds fixed logos / watermarks / TV bugs
@@ -200,7 +220,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="3.3"
+VERSION="3.5"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -881,26 +901,118 @@ sub_codecs_ok() {   # 0 = all text-based (safe to copy), 1 = bitmap subs present
   done < <(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 -- "$1" 2>/dev/null)
   return $bad
 }
-find_srt() {   # $1 video -> echo matching .srt path (asks if several)
+find_srt() {   # $1 video [$2 "ask"] -> echoes the .srt that sits next to it (exact name first). With "ask" and several, shows a numbered list.
   local dir base cands=() i c
   dir=$(dirname -- "$1"); base=$(basename -- "$1"); base=${base%.*}
   mapfile -t cands < <(find "$dir" -maxdepth 1 -type f \( -iname "$base.srt" -o -iname "$base.*.srt" \) -printf '%p\n' 2>/dev/null | sort)
   (( ${#cands[@]} == 0 )) && return 1
   (( ${#cands[@]} == 1 )) && { printf '%s' "${cands[0]}"; return 0; }
-  echo "  Multiple subtitle files found:"
-  for i in "${!cands[@]}"; do printf ' %2d) %s\n' $(( i + 1 )) "$(basename -- "${cands[i]}")"; done
+  if [[ ${2:-} != ask ]] || ! is_tty; then   # no questions where nobody can answer: the exact-name file wins, else the first
+    for c in "${cands[@]}"; do [[ ${c,,} == "${dir,,}/${base,,}.srt" ]] && { printf '%s' "$c"; return 0; }; done
+    printf '%s' "${cands[0]}"; return 0
+  fi
+  echo "  Several subtitle files sit next to the video:" >&2
+  for i in "${!cands[@]}"; do printf ' %2d) %s\n' $(( i + 1 )) "$(basename -- "${cands[i]}")" >&2; done
   c=$(ask "Number" "1")
   if [[ $c =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#cands[@]} )); then printf '%s' "${cands[c-1]}"; return 0; fi
   return 1
 }
-resolve_srt() {   # SUB_FILE (or 'auto') > find_srt > ask ; echoes path
+
+# ---------------------------------------------------------------- subtitle finder (like the video finder)
+FS_ALL=()
+fs_scan() {   # one pass over the phone's shared storage -> FS_ALL ("epoch<TAB>size<TAB>path", newest first)
+  local line
+  fv_root
+  FS_ALL=()
+  printf '  %sLooking for subtitle files on your phone...%s' "$C_D" "$C_0"
+  while IFS= read -r line; do
+    [[ -n $line ]] && FS_ALL+=("$line")
+  done < <(timeout 120 find -H "$FV_ROOT" -maxdepth 9 \
+      \( -name '.*' -o -iname cache -o -iname thumbnails -o -path '*/Android/data' -o -path '*/Android/obb' \) -prune -o \
+      -type f -iname '*.srt' -size +10c -printf '%T@\t%s\t%p\n' 2>/dev/null | sort -rn)
+  printf '\r\033[K'
+}
+find_subs() {   # $1 = the video the subtitle is for (optional) -> PICK_RESULT ; rc 1 = cancelled
+  # newest .srt files of the whole phone, the ones named like the video first (marked *); type a word to search
+  local vid=${1:-} nb="" page=0 per=8 q="" ans i tot first last line mt rest size path nm nn lbl dir mark
+  local -a view=() top=() others=()
+  PICK_RESULT=""
+  if [[ -n $vid ]]; then nb=${vid##*/}; nb=${nb%.*}; nb=${nb,,}; nb=${nb//[^[:alnum:]]/}; fi
+  (( ${#FS_ALL[@]} )) || fs_scan
+  while true; do
+    top=(); others=()
+    for line in "${FS_ALL[@]}"; do
+      rest=${line#*$'\t'}; path=${rest#*$'\t'}
+      if [[ -n $q ]]; then [[ ${path,,} == *"${q,,}"* ]] || continue; fi
+      nn=${path##*/}; nn=${nn,,}; nn=${nn//[^[:alnum:]]/}
+      if [[ -n $nb ]] && { [[ $nn == "$nb"* ]] || { (( ${#nb} >= 6 )) && [[ $nn == *"$nb"* ]]; }; }; then top+=("$line"); else others+=("$line"); fi
+    done
+    view=("${top[@]}" "${others[@]}")
+    tot=${#view[@]}
+    (( page * per >= tot )) && page=0
+    first=$(( page * per )); last=$(( first + per )); (( last > tot )) && last=$tot
+    clear_screen
+    printf '%sPick a subtitle (.srt)%s' "$C_B" "$C_0"
+    [[ -n $vid ]] && printf '   for: %s' "$(trunc "${vid##*/}")"
+    printf '\n %d found%s' "$tot" "${q:+ for \"$q\"}"
+    (( ${#top[@]} )) && [[ -z $q ]] && printf '   (* = named like the video)'
+    printf '\n\n'
+    (( tot == 0 )) && printf '  Nothing found. Try another word, r = scan again, p = type a path.\n'
+    for (( i = first; i < last; i++ )); do
+      line=${view[i]}; mt=${line%%$'\t'*}; rest=${line#*$'\t'}; size=${rest%%$'\t'*}; path=${rest#*$'\t'}
+      fv_age "$mt"
+      dir=${path%/*}; lbl=${dir##*/}; dir=${dir%/*}
+      case ${dir##*/} in shared|0|emulated|storage|sdcard|"") ;; *) lbl="${dir##*/}/$lbl";; esac
+      mark=" "; (( i < ${#top[@]} )) && [[ -z $q ]] && mark="*"
+      printf ' %s%2d) %8s  %s  %s\n' "$mark" $(( i + 1 )) "$(human "$size")" "$AGE_TXT" "$(trunc "$lbl")"
+      printf '        %s\n' "$(trunc "${path##*/}")"
+    done
+    (( tot > last )) && printf '\n  %s...%d more: type m%s\n' "$C_D" $(( tot - last )) "$C_0"
+    printf '\n number = pick     word = search     m = more\n r = scan again   p = type a path   b = cancel\n'
+    read -r -p "> " ans || return 1
+    case ${ans,,} in
+      b|"") return 1;;
+      m) page=$(( page + 1 ));;
+      r) fs_scan; q=""; page=0;;
+      p) ans=$(ask "Path to the .srt" "")
+         ans=${ans#[\'\"]}; ans=${ans%[\'\"]}; ans=${ans/#\~/$HOME}
+         if [[ -f $ans ]]; then PICK_RESULT=$(readlink -f -- "$ans"); return 0; fi
+         [[ -n $ans ]] && { warn "Not found: $ans"; sleep 1; };;
+      /*) q=${ans#/}; page=0;;
+      *)
+        if [[ $ans =~ ^[0-9]+$ ]]; then
+          if (( ans >= 1 && ans <= tot )); then
+            line=${view[ans-1]}; PICK_RESULT=${line#*$'\t'*$'\t'}; return 0
+          fi
+        else q=$ans; page=0; fi;;
+    esac
+  done
+}
+resolve_srt() {   # SUB_FILE > a .srt next to the video > the finder over the whole phone  -> SRT_OUT ; rc 1 = cancelled
+  SRT_OUT=""
   local p
-  if [[ -n $SUB_FILE && -f $SUB_FILE ]]; then printf '%s' "$SUB_FILE"; return 0; fi
-  if p=$(find_srt "$1"); then printf '%s' "$p"; return 0; fi
+  if [[ -n $SUB_FILE && -f $SUB_FILE ]]; then SRT_OUT=$SUB_FILE; return 0; fi
+  if p=$(find_srt "$1" ask); then SRT_OUT=$p; return 0; fi
+  if is_tty; then
+    info "No .srt next to the video - pick one from your phone (or search by name):"; sleep 1
+    find_subs "$1" && { SRT_OUT=$PICK_RESULT; return 0; }
+    return 1
+  fi
   warn "No .srt found next to the video."
   p=$(ask "Path to .srt (blank = cancel)" "")
-  [[ -n $p && -f $p ]] && { printf '%s' "$p"; return 0; }
+  [[ -n $p && -f $p ]] && { SRT_OUT=$p; return 0; }
   return 1
+}
+set_subfile() {
+  local p
+  echo " Current: ${SUB_FILE:-auto-find (same name as the video)}"
+  echo " Enter = auto-find   f = find / pick a file from the phone   or type a path"
+  p=$(ask "Subtitle file" "")
+  case $p in
+    f|F) find_subs "" && SUB_FILE=$PICK_RESULT;;
+    "")  SUB_FILE="";;
+    *)   SUB_FILE=${p/#\~/$HOME};;
+  esac
 }
 make_sub_filter() {   # $1 size  $2 color -> subtitles filter (needs ./sub.srt in cwd)
   local f="subtitles=sub.srt" fd
@@ -2420,7 +2532,8 @@ pick_target() {   # sets PICK_RESULT (prints prompts to stdout, not the result)
 # =========================================================== SUBTITLE STUDIO
 sub_embed_soft() {   # $1 video -> embed SRT as a selectable track (no re-encode)
   local vid=$(readlink -f -- "$1") srt lang ext scodec fmt existing keepmaps subidx out rc base aenc tmp
-  srt=$(resolve_srt "$vid") || { warn "Cancelled."; return 1; }
+  resolve_srt "$vid" || { warn "Cancelled."; return 1; }
+  srt=$SRT_OUT
   lang=$(ask "Language code (fa, en, ar, ...)" "$SUB_LANG")
   ext="mp4"; scodec=(-c:s mov_text)
   case ${vid##*.} in mkv|MKV) ext="mkv"; scodec=(-c:s srt);; esac
@@ -2466,7 +2579,8 @@ sub_embed_soft() {   # $1 video -> embed SRT as a selectable track (no re-encode
 sub_burn() {   # $1 video -> burn SRT permanently into the picture (re-encode)
   local vid=$(readlink -f -- "$1") srt style mode sz col out base venc aenc tmp rc
   local -a bfast=()
-  srt=$(resolve_srt "$vid") || { warn "Cancelled."; return 1; }
+  resolve_srt "$vid" || { warn "Cancelled."; return 1; }
+  srt=$SRT_OUT
   echo " 1) Small white    2) Medium white (default)   3) Medium yellow   4) Large white"
   style=$(ask "Style" "2")
   case $style in
@@ -4519,12 +4633,6 @@ set_submode() {
   c=$(ask "Choose" "")
   case $c in 1) SUB_MODE=off;; 2) SUB_MODE=soft;; 3) SUB_MODE=burn;; esac
 }
-set_subfile() {
-  local p
-  echo " Current: ${SUB_FILE:-auto-find (same name as the video)}"
-  p=$(ask "Path to .srt (blank = auto-find)" "")
-  SUB_FILE=${p/#\~/$HOME}
-}
 set_sublang() { SUB_LANG=$(ask "Language code for embedded subtitles (fa, en, ...)" "$SUB_LANG"); }
 set_substyle() {
   local c
@@ -4868,10 +4976,17 @@ Logo remover (finds fixed logos / watermarks by itself and paints them out):
   --delogo FILE|DIR ...  detect + remove. Keeps the quality: x264 CRF 17, audio copied, same size
                          and container (any normal option such as -p / -c / -r overrides that)
   --logo-detect FILE     only show WHERE the logos are (+ a preview picture), encode nothing
-  --logo-box X:Y:W:H     give the logo's place yourself (pixels, repeat for several logos)
+  --logo-box X:Y:W:H     give the logo's place yourself (pixels, repeat for several logos;
+                         add @5-12,30-41 to remove it only in those seconds)
   --logo-sens S          low | normal (default) | high  - how easily faint logos are accepted
+  --logo-mode T          fixed (default) | moving  - moving = hops between places / comes and goes
+                         (scans window by window, finds each place and WHEN it is there; slower)
+  --logo-window S        moving: length of one scanning window in seconds (default 5, try 3 for fast hops)
+  --logo-windows N       moving: at most N windows over the video (default 36; more = finer timeline, slower)
+  --logo-no-open         do not open the preview picture automatically
   --logo-fill M          smart (default: outline-following fill + grain/texture) | simple | box
-  --logo-preview         save a before/after picture next to the video
+  --logo-preview         save a before/after picture next to the video (every logo is boxed in red and
+                         NUMBERED; in the question step type a number to resize / move / re-check it)
   -y with --delogo       no questions: whatever is found is removed. Without -y vc shows the
                          places it found and asks first.
 
@@ -4904,6 +5019,7 @@ Examples:
   vc --delogo movie.mp4                       # finds the logo, shows it, asks, removes it
   vc --delogo -y --logo-sens high clip.mp4    # no questions, also catches faint logos
   vc --delogo --logo-box 1500:40:360:120 -y clip.mp4   # logo at x=1500 y=40, 360x120 px
+  vc --delogo --logo-mode moving clip.mp4     # a watermark that hops between corners
   vc --w6w pack trip.w6w movie.mp4 movie.srt cover.jpg notes.txt   # one encrypted file
   vc --w6w info trip.w6w ;  vc --w6w convert trip.w6w --to mp4
   vc old_dvd.vob --format mp4 --autocrop -y   # DVD rip: deinterlaced, bars removed
@@ -5629,22 +5745,32 @@ w6w_cli() {   # vc --w6w  pack|info|extract|convert|play|key|list ...
 
 
 # ================================================================ LOGO REMOVER (v3.3)
-# vc --delogo FILE ...    finds FIXED logos / watermarks / TV bugs by itself and paints them out.
-#   1. DETECT  21 frames spread over the video -> per-pixel MEDIAN (the moving picture melts away,
-#              a fixed logo stays sharp) -> edges of brightness AND colour -> compact clusters of
-#              strong edges = logos -> a mask that follows the logo's real outline.
-#   2. FILL    removelogo (follows the outline) -> light blur (no streaks) -> grain / texture copied
-#              from the SAME frame right next to the logo -> feathered blend. Only the small logo
-#              areas are processed, so encoding speed stays the same.
+# vc --delogo FILE ...    finds logos / watermarks by itself and paints them out.
+#   TYPE fixed   (default) the logo never moves.
+#   TYPE moving  the logo changes place or comes and goes (hops between corners, shows up now and then).
+#                The video is scanned window by window; places that repeat become numbered logos,
+#                each with the time spans in which it is there (jump times are refined by testing).
+#                Honest limit: a logo has to stay put for a couple of seconds at a time. One that
+#                glides continuously across the picture cannot be separated from the scene by this method.
+#   1. DETECT  frames -> per-pixel MEDIAN (the moving picture melts away, a fixed logo stays sharp)
+#              -> edges of brightness AND colour -> compact clusters of strong edges -> a mask
+#              that follows the logo's real outline.
+#   2. FILL    delogo-style interpolation -> light blur -> grain / texture copied from the SAME
+#              frame right next to the logo -> feathered blend. Only small areas are processed.
+#   3. REVIEW  the preview picture marks every logo with a red box and a NUMBER. Type the number
+#              to grow / shrink / move the box, re-check that spot finer, set its time span or delete it.
 # Honest limit: smooth / blurry / grainy backgrounds come out (almost) perfect; a big logo over
 # sharp, detailed content cannot be rebuilt exactly by any filter (only AI inpainting can).
 LOGO_MODE=0; LOGO_SENS=normal; LOGO_FILL=smart; LOGO_PREVIEW=0; LOGO_DETECT_ONLY=0; LOGO_SAMPLES=21
 LOGO_CONFIRM=0; LOGO_TEX_CLIP=40; LOGO_TEX_K=1.0; LOGO_KEEPEXT=1
+LOGO_DEBUG=${LOGO_DEBUG:-0}; LOGO_TYPE=fixed; LOGO_WINDOW=5; LOGO_MAXWIN=36; LOGO_AUTOOPEN=1; LOGO_FINE=0
 declare -a LOGO_BOXES=()
-LGD=""; LG_N=0; LG_FW=0; LG_FH=0; LG_GOT=0; LG_SHAPE=mask; LOGO_GRAPH=""; LOGO_PREVIEW_FILE=""
-declare -a LG_BX=() LG_BY=() LG_BW=() LG_BH=() LG_RX=() LG_RY=() LG_RW=() LG_RH=() LG_DX=() LG_DY=()
-
+LGD=""; LG_N=0; LG_FW=0; LG_FH=0; LG_GOT=0; LOGO_GRAPH=""; LOGO_PREVIEW_FILE=""; LG_PV=0; LG_FROM=0; LG_TO=0; LG_PREV=""
 declare -A FF_FILT=()
+declare -a LG_BX=() LG_BY=() LG_BW=() LG_BH=() LG_MODE=() LG_SRC=() LG_T=() LG_EF=() LG_AB=() LG_RX=() LG_RY=() LG_RW=() LG_RH=() LG_DX=() LG_DY=() LG_USE=()
+declare -a DT_X0=() DT_Y0=() DT_X1=() DT_Y1=() DT_C=()
+DT_N=0; DT_T=0
+
 have_filter() {   # $1 filter name -> 0 when this ffmpeg has it. Asked directly (-h filter=NAME): the table printed by
                   # "ffmpeg -filters" is laid out differently from one ffmpeg version to the next.
   local n=$1
@@ -5657,7 +5783,7 @@ logo_caps() {   # 0 = this ffmpeg can detect + remove logos
   local f miss=""
   # safety net: if even "crop" is reported missing, the check itself does not work on this build - go on, ffmpeg will say what is really wrong
   have_filter crop || { warn "Could not check this ffmpeg's filters - trying anyway."; return 0; }
-  for f in overlay split lut dilation sobel tmedian extractplanes blend scale; do have_filter "$f" || miss+=" $f"; done
+  for f in overlay split lut dilation sobel tmedian extractplanes blend scale drawbox hstack vstack; do have_filter "$f" || miss+=" $f"; done
   if [[ $LOGO_FILL == box ]]; then have_filter delogo || miss+=" delogo"
   else for f in removelogo alphamerge movie gblur; do have_filter "$f" || miss+=" $f"; done
        [[ $LOGO_FILL == smart ]] && { have_filter delogo || miss+=" delogo"; }; fi
@@ -5678,16 +5804,38 @@ logo_dims() {   # $1 src -> LG_FW LG_FH = frame size as the filters see it (rota
   if (( rot == 90 )); then LG_FW=$h; LG_FH=$w; else LG_FW=$w; LG_FH=$h; fi
   (( LG_FW >= 64 && LG_FH >= 64 ))
 }
-logo_sample() {   # $1 src $2 from $3 to $4 count $5 AW $6 AH $7 out.raw -> LG_GOT frames of yuv444p (rc 0 when enough)
-  local src=$1 a=$2 b=$3 n=$4 aw=$5 ah=$6 out=$7 i t
+logo_adims() {   # -> AW AH (even) : the size the detector works at
+  local lim=320
+  (( LOGO_FINE )) && lim=480
+  AW=$LG_FW; (( AW > lim )) && AW=$lim
+  AH=$(( (LG_FH * AW + LG_FW / 2) / LG_FW )); (( AW % 2 )) && AW=$(( AW - 1 )); (( AH % 2 )) && AH=$(( AH + 1 ))
+}
+logo_times() {   # $1 n  $2 spec ("" = the whole range, or "a-b,c-d" seconds) -> n times spread over it, one per line
+  awk -v n="$1" -v spec="$2" -v a="$LG_FROM" -v b="$LG_TO" 'BEGIN{
+    if (spec == "") { segs = 1; sa[1] = a; sb[1] = b }
+    else { segs = split(spec, parts, ","); for (i = 1; i <= segs; i++) { split(parts[i], ab, "-"); sa[i] = ab[1] + 0; sb[i] = ab[2] + 0 } }
+    tot = 0; for (i = 1; i <= segs; i++) tot += sb[i] - sa[i]
+    if (tot <= 0) exit 1
+    for (k = 0; k < n; k++) {
+      u = (0.03 + 0.94 * k / (n - 1)) * tot
+      for (i = 1; i <= segs; i++) { l = sb[i] - sa[i]; if (u <= l || i == segs) { if (u > l) u = l; printf "%.3f\n", sa[i] + u; break } u -= l }
+    }
+  }'
+}
+logo_sample_at() {   # $1 src $2 out.raw $3 aw $4 ah $5 filter-prefix ("" or "crop=...,") ; times on stdin -> LG_GOT frames of yuv444p
+  local src=$1 out=$2 aw=$3 ah=$4 pre=$5 t
   : > "$out"
-  for (( i = 0; i < n; i++ )); do
-    t=$(awk -v a="$a" -v b="$b" -v i="$i" -v n="$n" 'BEGIN{ printf "%.3f", a + (b - a) * (0.03 + 0.94 * i / (n - 1)) }')
+  while read -r t; do
     ffmpeg -nostdin -v error -noaccurate_seek -ss "$t" -i "$src" -frames:v 1 -an -sn -dn \
-      -vf "scale=${aw}:${ah}:flags=area,format=yuv444p" -f rawvideo - >> "$out" 2>>"$LOG" || true
+      -vf "${pre}scale=${aw}:${ah}:flags=area,format=yuv444p" -f rawvideo - >> "$out" 2>>"$LOG" || true
   done
   LG_GOT=$(( $(fsize "$out") / (aw * ah * 3) ))
-  (( LG_GOT >= 9 ))
+}
+logo_odd() {   # $1 raw $2 aw $3 ah -> keeps an ODD number of frames (the median needs it), LG_GOT = how many
+  local fb=$(( $2 * $3 * 3 ))
+  LG_GOT=$(( $(fsize "$1") / fb ))
+  (( LG_GOT % 2 == 0 )) && LG_GOT=$(( LG_GOT - 1 ))
+  (( LG_GOT >= 1 )) && head -c $(( LG_GOT * fb )) "$1" > "$1.t" && mv -f "$1.t" "$1"
 }
 logo_awk() {   # the connected-component finder (plain POSIX awk, also fine for mawk / gawk / busybox)
   cat <<'AWK'
@@ -5698,7 +5846,7 @@ logo_awk() {   # the connected-component finder (plain POSIX awk, also fine for 
 }
 END {
   tot = AW * AH
-  if (nb / tot > MAXON) { printf "STATIC %.3f\n", nb / tot; exit }
+  if (FILT == 1 && nb / tot > MAXON) { printf "STATIC %.3f\n", nb / tot; exit }
   minpix = tot * 0.0004; if (minpix < 18) minpix = 18
   n = 0; k = 0
   for (i = 0; i < tot; i++) {
@@ -5719,9 +5867,11 @@ END {
     }
     if (cnt < minpix || x1 < 0) continue
     w = x1 - x0 + 1; h = y1 - y0 + 1
-    if (w > 0.6 * AW || h > 0.6 * AH || w * h > 0.22 * tot) continue
-    if ((w > 0.30 * AW && h < 0.045 * AH) || (h > 0.30 * AH && w < 0.045 * AW)) continue   # long thin line: letterbox / UI border
-    if (cnt / (w * h) < 0.07) continue                                                       # too sparse: noise, not a logo
+    if (FILT == 1) {
+      if (w > 0.6 * AW || h > 0.6 * AH || w * h > 0.22 * tot) continue
+      if ((w > 0.30 * AW && h < 0.045 * AH) || (h > 0.30 * AH && w < 0.045 * AW)) continue   # long thin line: letterbox / UI border
+      if (cnt / (w * h) < 0.07) continue                                                       # too sparse: noise, not a logo
+    }
     k++; KC[k] = cnt; KX0[k] = x0; KY0[k] = y0; KX1[k] = x1; KY1[k] = y1; KL[k] = n
   }
   nk = 0
@@ -5752,72 +5902,226 @@ END {
 }
 AWK
 }
-logo_detect() {   # $1 src $2 workdir -> LG_N + tight boxes LG_B*, shaped mask $2/mask_full.png ; rc 0 found, 1 none, 2 error
-  local src=$1 wd=$2 aw ah got R T fb a b fg kind x0 y0 x1 y1 cnt fg sx sy bx by bw bh fw=$LG_FW fh=$LG_FH rc
-  aw=$fw; (( aw > 320 )) && aw=320
-  ah=$(( (fh * aw + fw / 2) / fw )); (( aw % 2 )) && aw=$(( aw - 1 )); (( ah % 2 )) && ah=$(( ah + 1 ))
-  a=${TRIM_START:-0}; b=${TRIM_END:-$DUR}
-  awk -v a="$a" -v b="$b" 'BEGIN{ exit !(b - a >= 1) }' || { b=$DUR; a=0; }
-  info "  Looking for fixed logos ($LOGO_SAMPLES frames, sensitivity: $LOGO_SENS) ..."
-  logo_sample "$src" "$a" "$b" "$LOGO_SAMPLES" "$aw" "$ah" "$wd/s.raw" || { err "Could not read enough frames from the video."; return 2; }
-  got=$LG_GOT; (( got % 2 == 0 )) && got=$(( got - 1 ))
-  fb=$(( aw * ah * 3 )); head -c $(( got * fb )) "$wd/s.raw" > "$wd/s2.raw" && mv -f "$wd/s2.raw" "$wd/s.raw"
+logo_detect_core() {   # $1 tag $2 wd $3 raw (an ODD number of yuv444p frames) $4 frames $5 aw $6 ah [$7 filters 1|0] [$8 max logos]
+  # -> DT_N + DT_X0/Y0/X1/Y1/C (analysis coordinates, strongest first), $wd/$tag.pgm (mask), $wd/$tag.e (edge picture), DT_T
+  # rc 0 found, 1 none, 3 mostly static scene, 2 error
+  local tag=$1 wd=$2 raw=$3 got=$4 aw=$5 ah=$6 filt=${7:-1} maxl=${8:-4} R fg T kind x0 y0 x1 y1 cnt
+  DT_N=0; DT_X0=(); DT_Y0=(); DT_X1=(); DT_Y1=(); DT_C=()
   R=$(( (got - 1) / 2 ))
   # stage 1: edge strength of the median picture (brightness + both colour planes, strongest wins)
   fg="[0:v]tmedian=radius=$R,format=yuv444p,extractplanes=y+u+v[y][u][v];"   # N=2R+1 frames in -> the first output frame is the median of ALL of them
   fg+="[y]sobel,format=gray[ys];[u]sobel,format=gray[us];[v]sobel,format=gray[vs];"
   fg+="[ys][us]blend=all_mode=lighten[t];[t][vs]blend=all_mode=lighten,format=gray[ee]"
-  ffmpeg -nostdin -v error -y -f rawvideo -pixel_format yuv444p -video_size "${aw}x${ah}" -framerate 1 -i "$wd/s.raw" \
-    -filter_complex "$fg" -map "[ee]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/e.raw" 2>>"$LOG" || { err "Edge analysis failed (see the log)."; return 2; }
-  [[ $(fsize "$wd/e.raw") -eq $(( aw * ah )) ]] || { err "Edge analysis produced no picture."; return 2; }
+  ffmpeg -nostdin -v error -y -f rawvideo -pixel_format yuv444p -video_size "${aw}x${ah}" -framerate 1 -i "$raw" \
+    -filter_complex "$fg" -map "[ee]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/$tag.e" 2>>"$LOG" || return 2
+  [[ $(fsize "$wd/$tag.e") -eq $(( aw * ah )) ]] || return 2
   # the threshold follows THIS video's own noise level (smooth picture -> sensitive, noisy / detailed -> strict)
-  T=$(od -An -v -tu1 -w"$aw" "$wd/e.raw" | awk -v S="$LOGO_SENS" '
+  T=$(od -An -v -tu1 -w"$aw" "$wd/$tag.e" | awk -v S="$LOGO_SENS" '
     { for (i = 1; i <= NF; i++) { h[$i + 0]++; n++ } }
     END { c = 0; p = 0; for (v = 0; v <= 255; v++) { c += h[v]; if (c >= 0.95 * n) { p = v; break } }
           t = 2 * p + 25; if (S == "low") t *= 1.3; else if (S == "high") t *= 0.75
           if (t < 50) t = 50; if (t > 240) t = 240; printf "%d", t }')
   [[ $T =~ ^[0-9]+$ ]] || T=170
-  # stage 2: threshold -> edge pixels (B) and their dilated cousins (D, which glue letters of one logo together)
-  ffmpeg -nostdin -v error -y -f rawvideo -pixel_format gray -video_size "${aw}x${ah}" -framerate 1 -i "$wd/e.raw" \
+  DT_T=$T
+  # stage 2: threshold -> edge pixels (B) and their dilated cousins (D, which glue the letters of one logo together)
+  ffmpeg -nostdin -v error -y -f rawvideo -pixel_format gray -video_size "${aw}x${ah}" -framerate 1 -i "$wd/$tag.e" \
     -filter_complex "[0:v]lut=y='if(gt(val\\,$T)\\,255\\,0)',split[bb][cc];[cc]dilation,dilation,dilation[dd]" \
-    -map "[bb]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/b.raw" -map "[dd]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/d.raw" 2>>"$LOG" \
-    || { err "Edge analysis failed (see the log)."; return 2; }
-  [[ $(fsize "$wd/b.raw") -eq $(( aw * ah )) && $(fsize "$wd/d.raw") -eq $(( aw * ah )) ]] || { err "Edge analysis produced no picture."; return 2; }
-  logo_awk > "$wd/find.awk"
-  LG_N=0
+    -map "[bb]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/$tag.b" -map "[dd]" -frames:v 1 -f rawvideo -pix_fmt gray "$wd/$tag.d" 2>>"$LOG" || return 2
+  [[ $(fsize "$wd/$tag.b") -eq $(( aw * ah )) && $(fsize "$wd/$tag.d") -eq $(( aw * ah )) ]] || return 2
+  [[ -s $wd/find.awk ]] || logo_awk > "$wd/find.awk"
   while IFS=' ' read -r kind x0 y0 x1 y1 cnt; do
     case $kind in
-      STATIC) warn "  The picture is mostly static (a still camera, slides, a screen recording): a fixed logo cannot be told apart from the scene."
-              warn "  Give the logo's place yourself:  vc --delogo --logo-box X:Y:W:H FILE"; return 1;;
-      BOX)    sx=$(( fw * 1000 / aw )); sy=$(( fh * 1000 / ah ))
-              bx=$(( x0 * sx / 1000 )); by=$(( y0 * sy / 1000 ))
-              bw=$(( (x1 + 1) * sx / 1000 - bx )); bh=$(( (y1 + 1) * sy / 1000 - by ))
-              LG_BX[LG_N]=$bx; LG_BY[LG_N]=$by; LG_BW[LG_N]=$bw; LG_BH[LG_N]=$bh; LG_N=$(( LG_N + 1 ));;
+      STATIC) rm -f -- "$wd/$tag.b" "$wd/$tag.d"; return 3;;
+      BOX)    DT_X0[DT_N]=$x0; DT_Y0[DT_N]=$y0; DT_X1[DT_N]=$x1; DT_Y1[DT_N]=$y1; DT_C[DT_N]=$cnt; DT_N=$(( DT_N + 1 ));;
     esac
-  done < <( { cat "$wd/b.raw" "$wd/d.raw"; } | od -An -v -tu1 -w"$aw" | awk -v AW="$aw" -v AH="$ah" -v MAXON=0.12 -v MAXL=4 -v PGM="$wd/small.pgm" -f "$wd/find.awk" )
-  (( LG_N > 0 )) || return 1
-  ffmpeg -nostdin -v error -y -i "$wd/small.pgm" \
-    -vf "dilation,scale=${fw}:${fh}:flags=bilinear,lut=y='if(gt(val\\,64)\\,255\\,0)',format=gray" -frames:v 1 "$wd/mask_full.png" 2>>"$LOG" \
-    && [[ -s $wd/mask_full.png ]] || { err "Could not build the logo mask."; return 2; }
+  done < <( { cat "$wd/$tag.b" "$wd/$tag.d"; } | od -An -v -tu1 -w"$aw" | awk -v AW="$aw" -v AH="$ah" -v MAXON=0.12 -v MAXL="$maxl" -v FILT="$filt" -v PGM="$wd/$tag.pgm" -f "$wd/find.awk" )
+  rm -f -- "$wd/$tag.b" "$wd/$tag.d"
+  (( DT_N > 0 ))
+}
+logo_map() {   # analysis box ($1 x0 $2 y0 $3 x1 $4 y1, picture $5 aw $6 ah) inside the source region ($7 ox $8 oy $9 rw ${10} rh) -> MP_X MP_Y MP_W MP_H
+  MP_X=$(( $7 + $1 * $9 / $5 )); MP_Y=$(( $8 + $2 * ${10} / $6 ))
+  MP_W=$(( $7 + ($3 + 1) * $9 / $5 - MP_X )); MP_H=$(( $8 + ($4 + 1) * ${10} / $6 - MP_Y ))
+  (( MP_W < 4 )) && MP_W=4; (( MP_H < 4 )) && MP_H=4
+}
+logo_add() {   # x y w h mode src times edgefile abox -> appends one logo
+  local n=$LG_N
+  LG_BX[n]=$1; LG_BY[n]=$2; LG_BW[n]=$3; LG_BH[n]=$4; LG_MODE[n]=$5; LG_SRC[n]=$6; LG_T[n]=$7; LG_EF[n]=${8:-}; LG_AB[n]=${9:-}
+  LG_N=$(( n + 1 ))
+}
+logo_del() {   # $1 index
+  local i
+  for (( i = $1; i < LG_N - 1; i++ )); do
+    LG_BX[i]=${LG_BX[i+1]}; LG_BY[i]=${LG_BY[i+1]}; LG_BW[i]=${LG_BW[i+1]}; LG_BH[i]=${LG_BH[i+1]}
+    LG_MODE[i]=${LG_MODE[i+1]}; LG_SRC[i]=${LG_SRC[i+1]}; LG_T[i]=${LG_T[i+1]}; LG_EF[i]=${LG_EF[i+1]}; LG_AB[i]=${LG_AB[i+1]}
+  done
+  LG_N=$(( LG_N - 1 ))
+}
+logo_detect_fixed() {   # $1 src $2 wd -> instances ; rc 0 found, 1 none, 2 error
+  local src=$1 wd=$2 i rc AW AH
+  logo_adims
+  info "  Looking for fixed logos ($LOGO_SAMPLES frames, sensitivity: $LOGO_SENS) ..."
+  logo_sample_at "$src" "$wd/s.raw" "$AW" "$AH" "" < <(logo_times "$LOGO_SAMPLES" "")
+  (( LG_GOT >= 9 )) || { err "Could not read enough frames from the video."; return 2; }
+  logo_odd "$wd/s.raw" "$AW" "$AH"
+  logo_detect_core f "$wd" "$wd/s.raw" "$LG_GOT" "$AW" "$AH" 1 6; rc=$?
+  case $rc in
+    2) err "Edge analysis failed (see the log)."; return 2;;
+    3) warn "  The picture is mostly static (a still camera, slides, a screen recording): a fixed logo cannot be told apart from the scene."
+       warn "  Give the logo's place yourself:  vc --delogo --logo-box X:Y:W:H FILE"; return 1;;
+    1) return 1;;
+  esac
+  for (( i = 0; i < DT_N; i++ )); do
+    logo_map "${DT_X0[i]}" "${DT_Y0[i]}" "${DT_X1[i]}" "${DT_Y1[i]}" "$AW" "$AH" 0 0 "$LG_FW" "$LG_FH"
+    logo_add "$MP_X" "$MP_Y" "$MP_W" "$MP_H" shape "$wd/f.pgm" "" "$wd/f.e" "${DT_X0[i]} ${DT_Y0[i]} ${DT_X1[i]} ${DT_Y1[i]} $AW $AH"
+  done
+  rm -f -- "$wd/s.raw"
   return 0
 }
-logo_manual() {   # manual boxes "x:y:w:h" (source pixels) -> LG_B* ; rc 0 = at least one valid box
-  local s x y w h fw=$LG_FW fh=$LG_FH
+
+# ------------------------------------------------------------ moving logos
+logo_present() {   # $1 index $2 time -> 0 when logo $1 is on the picture at that time (edge-pattern correlation inside its box, one frame)
+  local i=$1 t=$2 x0 y0 x1 y1 aw ah v
+  read -r x0 y0 x1 y1 aw ah <<<"${LG_AB[i]}"
+  [[ -n ${LG_EF[i]} && -s ${LG_EF[i]} ]] || return 1
+  rm -f -- "$LGD/pt.raw"
+  ffmpeg -nostdin -v error -y -ss "$t" -i "$LG_SRCVID" -frames:v 1 -an -sn -dn \
+    -vf "scale=${aw}:${ah}:flags=area,format=gray,sobel" -f rawvideo -pix_fmt gray "$LGD/pt.raw" 2>>"$LOG" || return 1
+  [[ $(fsize "$LGD/pt.raw") -eq $(( aw * ah )) ]] || return 1
+  v=$( { od -An -v -tu1 -w"$aw" "${LG_EF[i]}"; od -An -v -tu1 -w"$aw" "$LGD/pt.raw"; } | awk -v AW="$aw" -v AH="$ah" -v X0="$(( x0 - 1 ))" -v Y0="$(( y0 - 1 ))" -v X1="$(( x1 + 1 ))" -v Y1="$(( y1 + 1 ))" '
+    { y = NR - 1; if (y >= AH) { yy = y - AH; src = 2 } else { yy = y; src = 1 }
+      if (yy < Y0 || yy > Y1) next
+      for (x = X0 + 1; x <= X1 + 1; x++) { if (x - 1 < 0 || x > AW) continue
+        if (src == 1) A[yy, x] = $x + 0; else Bv[yy, x] = $x + 0 } }
+    END { n = 0; sa = 0; sb = 0
+      for (k in A) { n++; sa += A[k]; sb += Bv[k] }
+      if (n < 4) { print 0; exit }
+      ma = sa / n; mb = sb / n; saa = 0; sbb = 0; sab = 0
+      for (k in A) { da = A[k] - ma; db = Bv[k] - mb; saa += da * da; sbb += db * db; sab += da * db }
+      if (saa <= 0 || sbb <= 0) { print 0; exit }
+      printf "%.3f", sab / sqrt(saa * sbb) }')
+  LG_NCC=${v:-0}
+  awk -v v="${v:-0}" -v th="$LOGO_NCC" 'BEGIN{ exit !(v >= th) }'
+}
+LOGO_NCC=0.35; LG_NCC=0; LG_SRCVID=""
+logo_bisect() {   # $1 index $2 time where it IS there $3 time where it is NOT -> LG_EDGE = the switch time (about)
+  local i=$1 lo=$2 hi=$3 n mid
+  for (( n = 0; n < 6; n++ )); do
+    awk -v a="$lo" -v b="$hi" 'BEGIN{ d = b - a; if (d < 0) d = -d; exit !(d > 0.35) }' || break
+    mid=$(awk -v a="$lo" -v b="$hi" 'BEGIN{ printf "%.3f", (a + b) / 2 }')
+    if logo_present "$i" "$mid"; then lo=$mid; else hi=$mid; fi
+  done
+  LG_EDGE=$(awk -v a="$lo" -v b="$hi" 'BEGIN{ printf "%.2f", (a + b) / 2 }')
+}
+logo_boxes_alike() {   # box1 x y w h  box2 x y w h -> 0 when they are the same logo place
+  local ix iy inter un
+  ix=$(( ( $1 + $3 < $5 + $7 ? $1 + $3 : $5 + $7 ) - ( $1 > $5 ? $1 : $5 ) )); iy=$(( ( $2 + $4 < $6 + $8 ? $2 + $4 : $6 + $8 ) - ( $2 > $6 ? $2 : $6 ) ))
+  (( ix > 0 && iy > 0 )) || return 1
+  inter=$(( ix * iy )); un=$(( $3 * $4 + $7 * $8 - inter ))
+  (( inter * 100 >= un * 40 ))
+}
+logo_detect_moving() {   # $1 src $2 wd -> instances (one per place, with time spans) ; rc 0 found, 1 none, 2 error
+  local src=$1 wd=$2 AW AH range Lw nw k s fb got i j rc a b K=11 minw nsk=0 nst=0
+  local -a WS=() WIDX=() CX=() CY=() CW=() CH=() CC=() CWIN=() CBEST=() CAB=() CEF=() CPG=() WCL=()
+  local -a PX=() PY=() PW=() PH=() PC=() PK=() PA=() PE=() PP=()   # every box found in every window
+  local np=0 nc=0
+  logo_adims
+  a=$LG_FROM; b=$LG_TO; range=$(awk -v a="$a" -v b="$b" 'BEGIN{ printf "%.3f", b - a }')
+  Lw=$LOGO_WINDOW
+  awk -v r="$range" -v l="$Lw" 'BEGIN{ exit !(r < 2 * l) }' && Lw=$(awk -v r="$range" 'BEGIN{ l = r / 3; if (l < 1.5) l = 1.5; printf "%.2f", l }')
+  nw=$(awk -v r="$range" -v l="$Lw" -v m="$LOGO_MAXWIN" 'BEGIN{ n = int(r / l + 0.999); if (n > m) n = m; if (n < 1) n = 1; print n }')
+  for (( k = 0; k < nw; k++ )); do
+    WS[k]=$(awk -v a="$a" -v r="$range" -v l="$Lw" -v n="$nw" -v k="$k" 'BEGIN{ if (n == 1) printf "%.3f", a; else printf "%.3f", a + (r - l) * k / (n - 1) }')
+  done
+  info "  Scanning for moving logos: $nw window(s) of ${Lw}s (sensitivity: $LOGO_SENS) - this takes a while ..."
+  fb=$(( AW * AH * 3 ))
+  for (( k = 0; k < nw; k++ )); do
+    printf '\r  window %d/%d ' $(( k + 1 )) "$nw"
+    rm -f -- "$wd/w.raw"
+    ffmpeg -nostdin -v error -y -ss "${WS[k]}" -t "$Lw" -i "$src" -an -sn -dn \
+      -vf "fps=$K/$Lw,scale=${AW}:${AH}:flags=area,format=yuv444p" -f rawvideo "$wd/w.raw" 2>>"$LOG" || { nsk=$(( nsk + 1 )); continue; }
+    logo_odd "$wd/w.raw" "$AW" "$AH"
+    if (( LG_GOT < 7 )); then nsk=$(( nsk + 1 )); continue; fi
+    logo_detect_core "w$k" "$wd" "$wd/w.raw" "$LG_GOT" "$AW" "$AH" 1 4; rc=$?
+    (( rc == 3 )) && nst=$(( nst + 1 ))
+    (( LOGO_DEBUG )) && printf '\n[debug] window %d start %ss rc=%d frames=%d T=%s boxes=%d:' "$k" "${WS[k]}" "$rc" "$LG_GOT" "$DT_T" "$DT_N" >&2 \
+      && for (( i = 0; i < DT_N; i++ )); do printf ' (%s,%s-%s,%s n=%s)' "${DT_X0[i]}" "${DT_Y0[i]}" "${DT_X1[i]}" "${DT_Y1[i]}" "${DT_C[i]}" >&2; done
+    (( rc == 0 )) || continue
+    for (( i = 0; i < DT_N; i++ )); do
+      logo_map "${DT_X0[i]}" "${DT_Y0[i]}" "${DT_X1[i]}" "${DT_Y1[i]}" "$AW" "$AH" 0 0 "$LG_FW" "$LG_FH"
+      PX[np]=$MP_X; PY[np]=$MP_Y; PW[np]=$MP_W; PH[np]=$MP_H; PC[np]=${DT_C[i]}; PK[np]=$k
+      PA[np]="${DT_X0[i]} ${DT_Y0[i]} ${DT_X1[i]} ${DT_Y1[i]} $AW $AH"; PE[np]="$wd/w$k.e"; PP[np]="$wd/w$k.pgm"; np=$(( np + 1 ))
+    done
+  done
+  printf '\r\033[K'
+  (( nst > 0 )) && info "  ($nst window(s) were mostly static scenes and were left out.)"
+  rm -f -- "$wd/w.raw"
+  (( np > 0 )) || return 1
+  # group the boxes into places (clusters)
+  for (( i = 0; i < np; i++ )); do
+    for (( j = 0; j < nc; j++ )); do
+      if logo_boxes_alike "${PX[i]}" "${PY[i]}" "${PW[i]}" "${PH[i]}" "${CX[j]}" "${CY[j]}" "${CW[j]}" "${CH[j]}"; then break; fi
+    done
+    if (( j == nc )); then
+      CX[nc]=${PX[i]}; CY[nc]=${PY[i]}; CW[nc]=${PW[i]}; CH[nc]=${PH[i]}; CC[nc]=${PC[i]}; CBEST[nc]=$i; CWIN[nc]=" ${PK[i]} "; nc=$(( nc + 1 ))
+    else
+      [[ ${CWIN[j]} == *" ${PK[i]} "* ]] || CWIN[j]+="${PK[i]} "
+      if (( PC[i] > CC[j] )); then CX[j]=${PX[i]}; CY[j]=${PY[i]}; CW[j]=${PW[i]}; CH[j]=${PH[i]}; CC[j]=${PC[i]}; CBEST[j]=$i; fi
+    fi
+  done
+  case $LOGO_SENS in low) minw=3;; high) minw=1;; *) minw=2;; esac
+  (( nw <= 3 )) && minw=1
+  LG_SRCVID=$src
+  local kk first last p lst ra rb t1 t2 spec raw_s raw_e tpres tabs gapmid idx cnt bst
+  for (( j = 0; j < nc; j++ )); do
+    cnt=$(wc -w <<<"${CWIN[j]}")
+    (( cnt >= minw )) || continue
+    bst=${CBEST[j]}
+    logo_add "${CX[j]}" "${CY[j]}" "${CW[j]}" "${CH[j]}" shape "${PP[bst]}" "" "${PE[bst]}" "${PA[bst]}"
+    idx=$(( LG_N - 1 ))
+    # runs of consecutive windows where this place is on -> time spans
+    spec=""; first=-1; last=-1
+    for (( k = 0; k <= nw; k++ )); do
+      if (( k < nw )) && [[ ${CWIN[j]} == *" $k "* ]]; then
+        (( first < 0 )) && first=$k
+        last=$k
+      elif (( first >= 0 )); then
+        # run first..last ended: refine both edges with the presence test
+        if (( first == 0 )); then raw_s=$a
+        else tabs=$(awk -v s="${WS[first-1]}" -v l="$Lw" 'BEGIN{ printf "%.3f", s + l / 2 }'); tpres=$(awk -v s="${WS[first]}" -v l="$Lw" 'BEGIN{ printf "%.3f", s + l / 2 }')
+             logo_bisect "$idx" "$tpres" "$tabs"; raw_s=$LG_EDGE; fi
+        if (( last == nw - 1 )); then raw_e=$b
+        else tpres=$(awk -v s="${WS[last]}" -v l="$Lw" 'BEGIN{ printf "%.3f", s + l / 2 }'); tabs=$(awk -v s="${WS[last+1]}" -v l="$Lw" 'BEGIN{ printf "%.3f", s + l / 2 }')
+             logo_bisect "$idx" "$tpres" "$tabs"; raw_e=$LG_EDGE; fi
+        spec+="${spec:+,}$(awk -v a="$raw_s" -v b="$raw_e" 'BEGIN{ a -= 0.15; b += 0.15; if (a < 0) a = 0; printf "%.2f-%.2f", a, b }')"
+        first=-1; last=-1
+      fi
+    done
+    # one span that covers (nearly) the whole range = always there
+    ra=${spec%%-*}; rb=${spec##*-}
+    if [[ $spec != *,* ]] && awk -v ra="$ra" -v rb="$rb" -v a="$a" -v b="$b" 'BEGIN{ exit !(ra <= a + 0.5 && rb >= b - 0.5) }'; then spec=""; fi
+    LG_T[idx]=$spec
+  done
+  (( LG_N > 0 ))
+}
+
+# ------------------------------------------------------------ manual boxes, regions, masks
+logo_manual() {   # LOGO_BOXES "x:y:w:h[@a-b,c-d]" (source pixels / seconds) -> instances ; rc 0 = at least one valid box
+  local s spec x y w h fw=$LG_FW fh=$LG_FH
   LG_N=0
   for s in "${LOGO_BOXES[@]}"; do
+    spec=""; [[ $s == *@* ]] && { spec=${s#*@}; s=${s%%@*}; }
     s=${s//,/:}
     [[ $s =~ ^([0-9]+):([0-9]+):([0-9]+):([0-9]+)$ ]] || { warn "Bad box '$s' (use X:Y:W:H in pixels)"; continue; }
     x=${BASH_REMATCH[1]}; y=${BASH_REMATCH[2]}; w=${BASH_REMATCH[3]}; h=${BASH_REMATCH[4]}
     (( x >= fw || y >= fh )) && { warn "Box '$s' is outside the ${fw}x${fh} picture."; continue; }
     (( x + w > fw )) && w=$(( fw - x )); (( y + h > fh )) && h=$(( fh - y ))
     (( w >= 8 && h >= 8 )) || { warn "Box '$s' is too small."; continue; }
-    LG_BX[LG_N]=$x; LG_BY[LG_N]=$y; LG_BW[LG_N]=$w; LG_BH[LG_N]=$h; LG_N=$(( LG_N + 1 ))
+    logo_add "$x" "$y" "$w" "$h" rect "" "$spec" "" ""
   done
-  LG_SHAPE=rect
   (( LG_N > 0 ))
 }
-logo_regions() {   # tight boxes -> padded regions (even-aligned), donor patches, per-region masks lm<i>.png in $1
-  local wd=$1 i pad fw=$LG_FW fh=$LG_FH x y x2 y2 w h j k cx cy rw rh dx dy ok g=4 vfirst hfirst
+logo_regions() {   # tight boxes -> padded regions (even-aligned), donor patches, region masks lm<i>.png inside $LGD
+  local wd=$LGD i pad fw=$LG_FW fh=$LG_FH x y x2 y2 w h j k cx cy dx dy ok g=4 vfirst hfirst
   local -a cand=()
   pad=$(( fw / 80 )); (( pad < 6 )) && pad=6
   for (( i = 0; i < LG_N; i++ )); do
@@ -5829,9 +6133,12 @@ logo_regions() {   # tight boxes -> padded regions (even-aligned), donor patches
   done
   for (( i = 0; i < LG_N; i++ )); do
     x=${LG_RX[i]}; y=${LG_RY[i]}; w=${LG_RW[i]}; h=${LG_RH[i]}
-    if [[ $LG_SHAPE == mask ]]; then
-      ffmpeg -nostdin -v error -y -i "$wd/mask_full.png" -vf "crop=$w:$h:$x:$y,format=gray" -frames:v 1 "$wd/lm$i.png" 2>>"$LOG"
-    else   # manual box: white inside the user's box, black ring around it (the ring is what removelogo reads from)
+    rm -f -- "$wd/lm$i.png"
+    if [[ ${LG_MODE[i]} == shape && -s ${LG_SRC[i]} ]]; then
+      ffmpeg -nostdin -v error -y -i "${LG_SRC[i]}" \
+        -vf "dilation,scale=${fw}:${fh}:flags=bilinear,lut=y='if(gt(val\\,64)\\,255\\,0)',format=gray,crop=$w:$h:$x:$y" -frames:v 1 "$wd/lm$i.png" 2>>"$LOG"
+    fi
+    if [[ ! -s $wd/lm$i.png ]]; then   # rectangle: white inside the box, black ring around it (the ring is what the fill reads from)
       ffmpeg -nostdin -v error -y -f lavfi -i "color=c=black:s=${w}x${h},format=gray,drawbox=x=$(( LG_BX[i] - x )):y=$(( LG_BY[i] - y )):w=${LG_BW[i]}:h=${LG_BH[i]}:color=white:t=fill" \
         -frames:v 1 "$wd/lm$i.png" 2>>"$LOG"
     fi
@@ -5857,27 +6164,43 @@ logo_regions() {   # tight boxes -> padded regions (even-aligned), donor patches
   done
   return 0
 }
-logo_graph() {   # $1 in-label ("" = chain input)  $2 out-label ("" = unlabeled)  -> LOGO_GRAPH (mask files lm<i>.png are read from the ffmpeg working directory)
-  local ins="" outl="" g="" i n=$LG_N nsplit cur tx S smart=0 bx by bw bh fw=$LG_FW fh=$LG_FH dwl dhl dxl dyl
+logo_enable() {   # $1 index -> LG_EN = timeline expression for the overlay ("" = always on); times are shifted to the start of the trimmed clip
+  local s=${LG_T[$1]} seg a b ts=${TRIM_START:-0} e="" out
+  LG_EN=""
+  [[ -z $s || $LG_PV == 1 ]] && return 0
+  IFS=',' read -ra segs <<<"$s"
+  for seg in "${segs[@]}"; do
+    a=${seg%-*}; b=${seg#*-}
+    out=$(awk -v a="$a" -v b="$b" -v ts="$ts" 'BEGIN{ a -= ts; b -= ts; if (b <= 0) exit 1; if (a < 0) a = 0; printf "between(t\\,%.2f\\,%.2f)", a, b }') || continue
+    e+="${e:+ + }$out"
+  done
+  [[ -n $e ]] && LG_EN=":enable='$e'"
+  return 0
+}
+logo_graph() {   # $1 in-label ("" = chain input)  $2 out-label ("" = unlabeled) -> LOGO_GRAPH, for the logos listed in LG_USE
+  local ins="" outl="" g="" i n=${#LG_USE[@]} nsplit cur tx S smart=0 bx by bw bh fw=$LG_FW fh=$LG_FH dwl dhl dxl dyl u k
+  LG_EN=""
   [[ -n $1 ]] && ins="[$1]"; [[ -n $2 ]] && outl="[$2]"
+  if (( n == 0 )); then LOGO_GRAPH=""; return 1; fi
   if [[ $LOGO_FILL == box ]]; then
-    for (( i = 0; i < n; i++ )); do
+    for i in "${LG_USE[@]}"; do
       bx=${LG_BX[i]}; by=${LG_BY[i]}; bw=${LG_BW[i]}; bh=${LG_BH[i]}
       (( bx < 1 )) && { bw=$(( bw - 1 + bx )); bx=1; }; (( by < 1 )) && { bh=$(( bh - 1 + by )); by=1; }
       (( bx + bw > fw - 1 )) && bw=$(( fw - 1 - bx )); (( by + bh > fh - 1 )) && bh=$(( fh - 1 - by ))
-      g+="${g:+,}delogo=x=$bx:y=$by:w=$bw:h=$bh"
+      logo_enable "$i"
+      g+="${g:+,}delogo=x=$bx:y=$by:w=$bw:h=$bh${LG_EN}"
     done
     LOGO_GRAPH="${ins}${g}${outl}"; return 0
   fi
   [[ $LOGO_FILL == smart ]] && smart=1
   nsplit=$(( 1 + n ))
-  for (( i = 0; i < n; i++ )); do (( smart && LG_DX[i] >= 0 )) && nsplit=$(( nsplit + 1 )); done
+  for i in "${LG_USE[@]}"; do (( smart && LG_DX[i] >= 0 )) && nsplit=$(( nsplit + 1 )); done
   g="${ins}split=${nsplit}[base]"
-  for (( i = 0; i < n; i++ )); do
+  for i in "${LG_USE[@]}"; do
     g+="[r$i]"; (( smart && LG_DX[i] >= 0 )) && g+="[d$i]"
   done
   g+=";"
-  for (( i = 0; i < n; i++ )); do
+  for i in "${LG_USE[@]}"; do
     S=$(( (LG_RW[i] < LG_RH[i] ? LG_RW[i] : LG_RH[i]) / 20 )); (( S < 2 )) && S=2; (( S > 6 )) && S=6
     # smooth base fill: "smart" = delogo's edge-to-edge interpolation (most accurate on gradients / grain),
     # "simple" = removelogo (follows the outline). Either way only the logo's own pixels are used later (mask).
@@ -5898,25 +6221,88 @@ logo_graph() {   # $1 in-label ("" = chain input)  $2 out-label ("" = unlabeled)
     fi
     g+="movie=lm$i.png,format=gray,gblur=sigma=1[m$i];${tx}format=yuva420p[tf$i];[tf$i][m$i]alphamerge[ta$i];"
   done
-  cur=base
-  for (( i = 0; i < n; i++ )); do
-    if (( i == n - 1 )); then g+="[$cur][ta$i]overlay=${LG_RX[i]}:${LG_RY[i]}:format=auto${outl}"
-    else g+="[$cur][ta$i]overlay=${LG_RX[i]}:${LG_RY[i]}:format=auto[o$i];"; cur="o$i"; fi
+  cur=base; k=0
+  for i in "${LG_USE[@]}"; do
+    k=$(( k + 1 )); logo_enable "$i"
+    if (( k == n )); then g+="[$cur][ta$i]overlay=${LG_RX[i]}:${LG_RY[i]}:format=auto${LG_EN}${outl}"
+    else g+="[$cur][ta$i]overlay=${LG_RX[i]}:${LG_RY[i]}:format=auto${LG_EN}[o$i];"; cur="o$i"; fi
   done
   LOGO_GRAPH=$g
 }
-logo_preview() {   # $1 src $2 out.png -> left: where the logos were found, right: after removal (run with $LGD as working dir)
-  local src=$1 out=$2 t box="" i th a b
-  [[ $out == /* ]] || out="$PWD/$out"        # the preview is written from inside the working dir
-  [[ $src == /* ]] || src="$PWD/$src"
-  a=${TRIM_START:-0}; b=${TRIM_END:-$DUR}
-  awk -v a="$a" -v b="$b" 'BEGIN{ exit !(b > a) }' || { a=0; b=$DUR; }
-  t=$(awk -v a="$a" -v b="$b" 'BEGIN{ printf "%.2f", a + (b - a) * 0.35 }')
-  th=$(( LG_FW / 400 + 2 ))
-  for (( i = 0; i < LG_N; i++ )); do box+=",drawbox=x=${LG_BX[i]}:y=${LG_BY[i]}:w=${LG_BW[i]}:h=${LG_BH[i]}:color=red@0.9:t=$th"; done
+
+# ------------------------------------------------------------ preview with numbers
+logo_badge() {   # $1 number (0-9) $2 x $3 y $4 cell -> drawbox filters (with leading comma): a red badge with a white digit
+  local n=$(( $1 % 10 )) x=$2 y=$3 c=$4 pat r col s
+  case $n in
+    0) pat=111101101101111;; 1) pat=010110010010111;; 2) pat=111001111100111;; 3) pat=111001111001111;; 4) pat=101101111001001;;
+    5) pat=111100111001111;; 6) pat=111100111101111;; 7) pat=111001001001001;; 8) pat=111101111101111;; *) pat=111101111001111;;
+  esac
+  s=",drawbox=x=$x:y=$y:w=$(( 5 * c )):h=$(( 7 * c )):color=red:t=fill"
+  for (( r = 0; r < 5; r++ )); do
+    for (( col = 0; col < 3; col++ )); do
+      [[ ${pat:$(( r * 3 + col )):1} == 1 ]] && s+=",drawbox=x=$(( x + c + col * c )):y=$(( y + c + r * c )):w=$c:h=$c:color=white:t=fill"
+    done
+  done
+  printf '%s' "$s"
+}
+logo_active_at() {   # $1 index $2 time -> 0 when that logo is on at that time
+  local s=${LG_T[$1]} seg a b
+  [[ -z $s ]] && return 0
+  IFS=',' read -ra segs <<<"$s"
+  for seg in "${segs[@]}"; do
+    a=${seg%-*}; b=${seg#*-}
+    awk -v t="$2" -v a="$a" -v b="$b" 'BEGIN{ exit !(t >= a && t <= b) }' && return 0
+  done
+  return 1
+}
+logo_t_mid() {   # $1 index -> a time at which that logo is there (middle of its longest span; 35 % of the range for always-on logos)
+  local s=${LG_T[$1]}
+  awk -v s="$s" -v a="$LG_FROM" -v b="$LG_TO" 'BEGIN{
+    if (s == "") { printf "%.2f", a + (b - a) * 0.35; exit }
+    n = split(s, p, ","); best = -1; bl = -1
+    for (i = 1; i <= n; i++) { split(p[i], ab, "-"); l = ab[2] - ab[1]; if (l > bl) { bl = l; best = (ab[1] + ab[2]) / 2 } }
+    printf "%.2f", best }'
+}
+logo_row() {   # $1 src $2 time $3 out.png $4.. logo indexes -> left: red numbered boxes, right: after removal
+  local src=$1 t=$2 out=$3 i box="" th c bx by
+  shift 3
+  LG_USE=("$@"); LG_PV=1
+  th=$(( LG_FW / 400 + 2 )); c=$(( LG_FH / 90 )); (( c < 3 )) && c=3
+  for i in "$@"; do
+    box+=",drawbox=x=${LG_BX[i]}:y=${LG_BY[i]}:w=${LG_BW[i]}:h=${LG_BH[i]}:color=red@0.9:t=$th"
+    by=$(( LG_BY[i] - 7 * c )); (( by < 0 )) && by=${LG_BY[i]}
+    box+=$(logo_badge $(( i + 1 )) "${LG_BX[i]}" "$by" "$c")
+  done
   logo_graph "w" "r"
   ( cd "$LGD" && ffmpeg -nostdin -v error -y -ss "$t" -i "$src" -frames:v 1 \
-      -filter_complex "[0:v]split=2[o][w];[o]null${box}[l];${LOGO_GRAPH};[l]scale=-2:540[l2];[r]scale=-2:540[r2];[l2][r2]hstack" "$out" 2>>"$LOG" )
+      -filter_complex "[0:v]split=2[o][w];[o]null${box}[l];${LOGO_GRAPH};[l]scale=-2:360[l2];[r]scale=-2:360[r2];[l2][r2]hstack" "$out" 2>>"$LOG" )
+  LG_PV=0
+  [[ -s $out ]]
+}
+logo_make_preview() {   # $1 src $2 out.png -> one row per time at which some logos are on (up to 5 rows), stacked
+  local src=$1 out=$2 i j t r=0 nr
+  local -a cov=() rows=() set=() inputs=()
+  [[ $src == /* ]] || src="$PWD/$src"
+  [[ $out == /* ]] || out="$PWD/$out"
+  (( LG_N > 0 )) || return 1
+  for (( i = 0; i < LG_N && r < 5; i++ )); do
+    [[ -n ${cov[i]-} ]] && continue
+    t=$(logo_t_mid "$i"); set=()
+    for (( j = 0; j < LG_N; j++ )); do
+      if logo_active_at "$j" "$t"; then set+=("$j"); cov[j]=1; fi
+    done
+    cov[i]=1
+    [[ " ${set[*]} " == *" $i "* ]] || set+=("$i")
+    logo_row "$src" "$t" "$LGD/row$r.png" "${set[@]}" || { warn "  Preview row $((r + 1)) failed."; continue; }
+    rows+=("$LGD/row$r.png"); r=$(( r + 1 ))
+  done
+  nr=${#rows[@]}
+  (( nr > 0 )) || return 1
+  if (( nr == 1 )); then cp -f -- "${rows[0]}" "$out"
+  else
+    for i in "${rows[@]}"; do inputs+=(-i "$i"); done
+    ffmpeg -nostdin -v error -y "${inputs[@]}" -filter_complex "vstack=inputs=$nr" -frames:v 1 "$out" 2>>"$LOG"
+  fi
   [[ -s $out ]]
 }
 logo_where() {   # $1 index -> "top-left" ...
@@ -5925,25 +6311,141 @@ logo_where() {   # $1 index -> "top-left" ...
   if (( cx * 3 < LG_FW )); then h=left; elif (( cx * 3 > LG_FW * 2 )); then h=right; else h=centre; fi
   printf '%s-%s' "$v" "$h"
 }
+logo_list() {
+  local i
+  info "  Logo area(s) to remove (the numbers are on the preview picture):"
+  for (( i = 0; i < LG_N; i++ )); do
+    printf '    %d) %-13s x=%s y=%s  %sx%s px  [%s]%s%s\n' $(( i + 1 )) "$(logo_where "$i")" "${LG_BX[i]}" "${LG_BY[i]}" "${LG_BW[i]}" "${LG_BH[i]}" \
+      "$( [[ ${LG_MODE[i]} == shape ]] && echo outline || echo box )" \
+      "$( [[ -n ${LG_T[i]} ]] && printf '   only at %s s' "${LG_T[i]}" )" \
+      "$( (( LG_DX[i] >= 0 )) || printf '   (no texture donor next to it)' )"
+  done
+}
+logo_refresh() {   # rebuild regions + masks and redraw the preview ; $1 src ; $2 = "open" to show it
+  logo_regions || return 1
+  if [[ -n $LG_PREV ]]; then
+    if logo_make_preview "$1" "$LG_PREV"; then
+      LOGO_PREVIEW_FILE=$LG_PREV; info "  Preview (left: boxes with numbers, right: after removal): $(pretty "$LG_PREV")"
+      [[ ${2:-} == open ]] && (( LOGO_AUTOOPEN )) && open_file "$LG_PREV"
+    else warn "  Could not make the preview picture."; fi
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ editing (type the logo's number)
+logo_refine() {   # $1 index $2 src -> look again, finer, around that logo: new tight box + outline
+  local i=$1 src=$2 rx ry rw rh ex ey x2 y2 AW AH rc fw=$LG_FW fh=$LG_FH sv_sens=$LOGO_SENS got x y w h px py
+  ex=$(( LG_BW[i] * 4 / 10 )); ey=$(( LG_BH[i] * 4 / 10 )); (( ex < 24 )) && ex=24; (( ey < 24 )) && ey=24
+  rx=$(( LG_BX[i] - ex )); ry=$(( LG_BY[i] - ey )); x2=$(( LG_BX[i] + LG_BW[i] + ex )); y2=$(( LG_BY[i] + LG_BH[i] + ey ))
+  (( rx < 0 )) && rx=0; (( ry < 0 )) && ry=0; (( x2 > fw )) && x2=$fw; (( y2 > fh )) && y2=$fh
+  rx=$(( rx / 2 * 2 )); ry=$(( ry / 2 * 2 )); rw=$(( (x2 - rx) / 2 * 2 )); rh=$(( (y2 - ry) / 2 * 2 ))
+  (( rw >= 32 && rh >= 32 )) || { warn "  Region too small to re-check."; return 1; }
+  AW=$rw; (( AW > 480 )) && AW=480; AH=$(( (rh * AW + rw / 2) / rw )); (( AW % 2 )) && AW=$(( AW - 1 )); (( AH % 2 )) && AH=$(( AH + 1 ))
+  info "  Looking again, finer, around logo $((i + 1)) ..."
+  logo_sample_at "$src" "$LGD/rs.raw" "$AW" "$AH" "crop=$rw:$rh:$rx:$ry," < <(logo_times 21 "${LG_T[i]}")
+  (( LG_GOT >= 9 )) || { warn "  Could not read enough frames."; return 1; }
+  logo_odd "$LGD/rs.raw" "$AW" "$AH"
+  LOGO_SENS=high
+  logo_detect_core "rf$i" "$LGD" "$LGD/rs.raw" "$LG_GOT" "$AW" "$AH" 0 8; rc=$?
+  LOGO_SENS=$sv_sens
+  rm -f -- "$LGD/rs.raw"
+  (( rc == 0 )) || { warn "  Nothing sharper found there - the box is unchanged."; return 1; }
+  # a logo often consists of separate pieces (symbol + text): take the union of every sizeable piece
+  local k mx=0 ux0=999999 uy0=999999 ux1=-1 uy1=-1
+  for (( k = 0; k < DT_N; k++ )); do (( DT_C[k] > mx )) && mx=${DT_C[k]}; done
+  for (( k = 0; k < DT_N; k++ )); do
+    (( DT_C[k] * 100 >= mx * 15 )) || continue
+    (( DT_X0[k] < ux0 )) && ux0=${DT_X0[k]}; (( DT_Y0[k] < uy0 )) && uy0=${DT_Y0[k]}
+    (( DT_X1[k] > ux1 )) && ux1=${DT_X1[k]}; (( DT_Y1[k] > uy1 )) && uy1=${DT_Y1[k]}
+  done
+  logo_map "$ux0" "$uy0" "$ux1" "$uy1" "$AW" "$AH" "$rx" "$ry" "$rw" "$rh"
+  local newm="$LGD/rm${i}_$RANDOM.png"
+  ffmpeg -nostdin -v error -y -i "$LGD/rf$i.pgm" \
+    -vf "dilation,scale=${rw}:${rh}:flags=bilinear,lut=y='if(gt(val\\,64)\\,255\\,0)',format=gray,pad=${fw}:${fh}:${rx}:${ry}:black" -frames:v 1 "$newm" 2>>"$LOG"
+  [[ -s $newm ]] || { warn "  Could not build the new outline."; return 1; }
+  LG_BX[i]=$MP_X; LG_BY[i]=$MP_Y; LG_BW[i]=$MP_W; LG_BH[i]=$MP_H; LG_SRC[i]=$newm; LG_MODE[i]=shape
+  ok "  Logo $((i + 1)) re-checked: x=$MP_X y=$MP_Y ${MP_W}x${MP_H} px"
+  return 0
+}
+logo_clamp() {   # $1 index: keep the box inside the picture and at least 8x8
+  local i=$1 fw=$LG_FW fh=$LG_FH
+  (( LG_BW[i] < 8 )) && LG_BW[i]=8; (( LG_BH[i] < 8 )) && LG_BH[i]=8
+  (( LG_BW[i] > fw )) && LG_BW[i]=$fw; (( LG_BH[i] > fh )) && LG_BH[i]=$fh
+  (( LG_BX[i] < 0 )) && LG_BX[i]=0; (( LG_BY[i] < 0 )) && LG_BY[i]=0
+  (( LG_BX[i] + LG_BW[i] > fw )) && LG_BX[i]=$(( fw - LG_BW[i] )); (( LG_BY[i] + LG_BH[i] > fh )) && LG_BY[i]=$(( fh - LG_BH[i] ))
+  return 0
+}
+logo_edit_one() {   # $1 index $2 src -> interactive editor for one logo ; rc 1 = the logo was deleted
+  local i=$1 src=$2 ans cmd a1 a2 step n x y w h changed
+  while true; do
+    x=${LG_BX[i]}; y=${LG_BY[i]}; w=${LG_BW[i]}; h=${LG_BH[i]}
+    step=$(( (w > h ? w : h) / 10 )); (( step < 4 )) && step=4
+    printf '\n  %sLogo %d%s: x=%s y=%s  %sx%s px   [%s]%s   (picture %sx%s)\n' "$C_B" $(( i + 1 )) "$C_0" "$x" "$y" "$w" "$h" \
+      "$( [[ ${LG_MODE[i]} == shape ]] && echo "outline" || echo "box" )" "${LG_T[i]:+  only at ${LG_T[i]} s}" "$LG_FW" "$LG_FH"
+    echo "   +  /  -          grow / shrink the red box on all sides (+ 20 = by 20 px; default $step)"
+    echo "   l+ l- r+ r- t+ t- b+ b-   move one edge (left, right, top, bottom) out / in"
+    echo "   m DX DY          move the box     box X:Y:W:H   set it exactly"
+    echo "   r                look again, finer, around this logo (new outline)"
+    echo "   time A-B[,C-D]   remove it only in these seconds (blank after 'time' = always)"
+    echo "   d                delete this logo     Enter = done"
+    ans=$(ask "Logo $(( i + 1 ))" "")
+    [[ -z $ans ]] && return 0
+    read -r cmd a1 a2 <<<"$ans"
+    changed=0
+    case ${cmd,,} in
+      +|-)  n=${a1:-$step}; [[ $n =~ ^[0-9]+$ ]] || n=$step
+            if [[ $cmd == + ]]; then LG_BX[i]=$(( x - n )); LG_BY[i]=$(( y - n )); LG_BW[i]=$(( w + 2 * n )); LG_BH[i]=$(( h + 2 * n ))
+            else LG_BX[i]=$(( x + n )); LG_BY[i]=$(( y + n )); LG_BW[i]=$(( w - 2 * n )); LG_BH[i]=$(( h - 2 * n )); fi
+            changed=1;;
+      l+|l-|r+|r-|t+|t-|b+|b-)
+            n=${a1:-$step}; [[ $n =~ ^[0-9]+$ ]] || n=$step
+            case ${cmd,,} in
+              l+) LG_BX[i]=$(( x - n )); LG_BW[i]=$(( w + n ));;  l-) LG_BX[i]=$(( x + n )); LG_BW[i]=$(( w - n ));;
+              r+) LG_BW[i]=$(( w + n ));;                          r-) LG_BW[i]=$(( w - n ));;
+              t+) LG_BY[i]=$(( y - n )); LG_BH[i]=$(( h + n ));;  t-) LG_BY[i]=$(( y + n )); LG_BH[i]=$(( h - n ));;
+              b+) LG_BH[i]=$(( h + n ));;                          b-) LG_BH[i]=$(( h - n ));;
+            esac
+            changed=1;;
+      m)    if [[ $a1 =~ ^-?[0-9]+$ && $a2 =~ ^-?[0-9]+$ ]]; then LG_BX[i]=$(( x + a1 )); LG_BY[i]=$(( y + a2 )); changed=1
+            else warn "  Use:  m DX DY   (pixels, may be negative)"; fi;;
+      box)  a1=${a1//,/:}
+            if [[ $a1 =~ ^([0-9]+):([0-9]+):([0-9]+):([0-9]+)$ ]]; then LG_BX[i]=${BASH_REMATCH[1]}; LG_BY[i]=${BASH_REMATCH[2]}; LG_BW[i]=${BASH_REMATCH[3]}; LG_BH[i]=${BASH_REMATCH[4]}; changed=1
+            else warn "  Use:  box X:Y:W:H"; fi;;
+      r)    if logo_refine "$i" "$src"; then logo_refresh "$src" open; fi; continue;;
+      time) if [[ -z $a1 ]]; then LG_T[i]=""; changed=2
+            elif [[ ${a1}${a2:+,$a2} =~ ^[0-9.]+-[0-9.]+(,[0-9.]+-[0-9.]+)*$ ]]; then LG_T[i]=${a1}${a2:+,$a2}; changed=2
+            else warn "  Use:  time 4-12   or   time 4-12,30-41   (seconds)"; fi;;
+      d)    logo_del "$i"; logo_refresh "$src" open; return 1;;
+      *)    warn "  Not understood: $ans";;
+    esac
+    if (( changed == 1 )); then LG_MODE[i]=rect; logo_clamp "$i"; fi      # the red box itself is now exactly what gets removed
+    (( changed )) && logo_refresh "$src" open
+  done
+}
+
+# ------------------------------------------------------------ the whole flow for one video
 logo_prepare() {   # $1 src -> LGD with masks, LG_* filled. rc 0 = go, 1 = nothing to do (message shown), 2 = error
-  local src=$1 rc ans i dir base prev="" man tries=0
-  LG_N=0; LGD=""; LOGO_GRAPH=""
+  local src=$1 rc ans i dir base man tries=0 n
+  LG_N=0; LGD=""; LOGO_GRAPH=""; LG_USE=(); LG_PREV=""; LG_PV=0
+  LG_BX=(); LG_BY=(); LG_BW=(); LG_BH=(); LG_MODE=(); LG_SRC=(); LG_T=(); LG_EF=(); LG_AB=()
   logo_caps || return 2
   logo_dims "$src" || { err "Cannot read the picture size of: $(basename -- "$src")"; return 2; }
+  LG_FROM=${TRIM_START:-0}; LG_TO=${TRIM_END:-$DUR}
+  awk -v a="$LG_FROM" -v b="$LG_TO" 'BEGIN{ exit !(b - a >= 1) }' || { LG_FROM=0; LG_TO=$DUR; }
   mkdir -p "$CONF_DIR" 2>/dev/null
   LGD=$(mktemp -d) || { err "Cannot create temp dir."; return 2; }
   local -a keep=("${LOGO_BOXES[@]}")
+  LG_SRCVID=$src
   while true; do
-    tries=$(( tries + 1 ))
+    tries=$(( tries + 1 )); LG_N=0
     if (( ${#LOGO_BOXES[@]} )); then
       if ! logo_manual; then err "No valid box given."; rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 2; fi
     else
-      LG_SHAPE=mask
-      logo_detect "$src" "$LGD"; rc=$?
+      if [[ $LOGO_TYPE == moving ]]; then logo_detect_moving "$src" "$LGD"; rc=$?; else logo_detect_fixed "$src" "$LGD"; rc=$?; fi
       if (( rc == 2 )); then rm -rf -- "$LGD"; LGD=""; return 2; fi
       if (( rc == 1 )); then
-        warn "  No fixed logo found in $(basename -- "$src")."
-        if (( LOGO_CONFIRM )) && (( tries < 3 )); then
+        warn "  No $LOGO_TYPE logo found in $(basename -- "$src")."
+        if (( LOGO_CONFIRM )) && (( tries < 3 )) && [[ -z $ASK_MEMO_DIR ]]; then
           info "  Frame size: ${LG_FW}x${LG_FH}.  Type the logo's box as X:Y:W:H in pixels (blank = skip this video)."
           man=$(ask "Box" "")
           if [[ -n $man ]]; then LOGO_BOXES=("$man"); continue; fi
@@ -5951,46 +6453,76 @@ logo_prepare() {   # $1 src -> LGD with masks, LG_* filled. rc 0 = go, 1 = nothi
         rm -rf -- "$LGD"; LGD=""; return 1
       fi
     fi
-    logo_regions "$LGD" || { rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 2; }
-    info "  Logo area(s) to remove:"
-    for (( i = 0; i < LG_N; i++ )); do
-      printf '    %d) %-13s x=%s y=%s  %sx%s px%s\n' $(( i + 1 )) "$(logo_where "$i")" "${LG_BX[i]}" "${LG_BY[i]}" "${LG_BW[i]}" "${LG_BH[i]}" \
-        "$( (( LG_DX[i] >= 0 )) || printf '   (no texture donor next to it)' )"
-    done
-    dir=${OUTDIR:-$(dirname -- "$src")}; base=$(basename -- "$src"); base=${base%.*}
-    prev=""
-    if (( LOGO_PREVIEW || LOGO_CONFIRM )); then
-      prev=$(unique_file "$dir" "${base}_logo_preview" png)
-      if logo_preview "$src" "$prev"; then LOGO_PREVIEW_FILE=$prev; info "  Preview (left: found, right: after removal): $(pretty "$prev")"
-      else rm -f -- "$prev"; prev=""; warn "  Could not make the preview picture."; fi
-    fi
-    if (( LOGO_CONFIRM )) && (( ${#LOGO_BOXES[@]} == 0 )); then
-      ans=$(ask "Remove these?  y = yes   n = skip this video   m = type the box by hand   p = open the preview" "y")
-      case ${ans,,} in
-        n*) rm -rf -- "$LGD"; LGD=""; return 1;;
-        m*) man=$(ask "Box X:Y:W:H (frame is ${LG_FW}x${LG_FH})" ""); [[ -n $man ]] && LOGO_BOXES=("$man"); continue;;
-        p*) [[ -n $prev ]] && open_file "$prev"; ans=$(ask "Remove these? (y/n)" "y"); [[ ${ans,,} == y* ]] || { rm -rf -- "$LGD"; LGD=""; return 1; };;
-      esac
-    fi
     break
   done
+  dir=${OUTDIR:-$(dirname -- "$src")}; base=$(basename -- "$src"); base=${base%.*}
+  (( LOGO_PREVIEW || LOGO_CONFIRM )) && LG_PREV=$(unique_file "$dir" "${base}_logo_preview" png)
+  logo_refresh "$src" || { rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 2; }
+  logo_list
+  if (( LOGO_CONFIRM )) && (( ${#LOGO_BOXES[@]} == 0 )); then
+    if [[ -n $ASK_MEMO_DIR ]]; then     # several videos at once: one answer for all (no editing)
+      ans=$(ask "Remove these?  (y / n)" "y"); [[ ${ans,,} == n* ]] && { rm -rf -- "$LGD"; LGD=""; return 1; }
+    else
+      [[ -n $LG_PREV && -s $LG_PREV ]] && (( LOGO_AUTOOPEN )) && open_file "$LG_PREV"
+      while true; do
+        ans=$(ask "Remove these?  y = yes   n = skip   1-$LG_N = edit that logo   a = add a box   f = look again, finer   p = open the preview" "y")
+        case ${ans,,} in
+          y*|"") break;;
+          n*) rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 1;;
+          p*) [[ -n $LG_PREV ]] && open_file "$LG_PREV";;
+          a*) man=$(ask "New box X:Y:W:H  (optional seconds after @, e.g. 100:40:200:60@5-12)" "")
+              if [[ -n $man ]]; then
+                local sv=("${LOGO_BOXES[@]}") n0=$LG_N spec=""
+                [[ $man == *@* ]] && { spec=${man#*@}; man=${man%%@*}; }
+                man=${man//,/:}
+                if [[ $man =~ ^([0-9]+):([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+                  logo_add "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" rect "" "$spec" "" ""
+                  logo_clamp $(( LG_N - 1 )); logo_refresh "$src" open; logo_list
+                else warn "  Use X:Y:W:H"; fi
+              fi;;
+          f*) info "  Looking again with a finer, more sensitive scan (your edits are replaced) ..."
+              LOGO_FINE=1; local sv_s=$LOGO_SENS; LOGO_SENS=high; LG_N=0
+              if [[ $LOGO_TYPE == moving ]]; then logo_detect_moving "$src" "$LGD"; else logo_detect_fixed "$src" "$LGD"; fi
+              LOGO_SENS=$sv_s; LOGO_FINE=0
+              if (( LG_N == 0 )); then warn "  Still nothing found."; rm -rf -- "$LGD"; LGD=""; return 1; fi
+              logo_refresh "$src" open; logo_list;;
+          [0-9]*) n=${ans%% *}
+              if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= LG_N )); then
+                logo_edit_one $(( n - 1 )) "$src"; logo_list
+                if (( LG_N == 0 )); then warn "  No logo left - nothing to remove."; rm -rf -- "$LGD"; LGD=""; LOGO_BOXES=("${keep[@]}"); return 1; fi
+              else warn "  There is no logo $n."; fi;;
+        esac
+      done
+    fi
+  fi
   LOGO_BOXES=("${keep[@]}")
   return 0
 }
 logo_install() {   # $1 = the encoder's working dir -> copies the masks in, builds LOGO_GRAPH, removes $LGD
-  local i
-  for (( i = 0; i < LG_N; i++ )); do cp -f -- "$LGD/lm$i.png" "$1/lm$i.png"; done
+  local i a b s seg ts=${TRIM_START:-0} te=${TRIM_END:-$DUR} on
+  LG_USE=(); LG_PV=0
+  for (( i = 0; i < LG_N; i++ )); do
+    if [[ -z ${LG_T[i]} ]]; then LG_USE+=("$i"); continue; fi
+    on=0; IFS=',' read -ra segs <<<"${LG_T[i]}"
+    for seg in "${segs[@]}"; do
+      a=${seg%-*}; b=${seg#*-}
+      awk -v a="$a" -v b="$b" -v ts="$ts" -v te="$te" 'BEGIN{ exit !(b > ts && a < te) }' && on=1
+    done
+    (( on )) && LG_USE+=("$i")
+  done
+  for i in "${LG_USE[@]}"; do cp -f -- "$LGD/lm$i.png" "$1/lm$i.png"; done
   rm -rf -- "$LGD"; LGD=""
+  if (( ${#LG_USE[@]} == 0 )); then warn "  None of the logos is on in this part of the video."; LOGO_GRAPH=""; return 0; fi
   logo_graph "" ""
 }
 logo_defaults() {   # the dedicated tool keeps the picture quality (explicit options still win)
   CODEC=x264; CRF=17; SPEED=fast; HEIGHT=0; FPS=0; AUDIO=copy; TARGET_MB=0; SUFFIX="_nologo"; PRESET_NAME="logo-removal"
   [[ -z $SUB_FILE ]] && SUB_MODE=off      # no hunting for a matching .srt (an explicit --srt FILE still works)
 }
-logo_detect_report() {   # vc --delogo --logo-detect FILE: shows where the logos are, writes the preview, encodes nothing
+logo_detect_report() {   # vc --logo-detect FILE: shows where the logos are, writes the preview, encodes nothing
   local f rc
   for f in "$@"; do
-    printf '\n%s== Logo finder: %s ==%s\n' "$C_B" "$(basename -- "$f")" "$C_0"
+    printf '\n%s== Logo finder (%s): %s ==%s\n' "$C_B" "$LOGO_TYPE" "$(basename -- "$f")" "$C_0"
     probe "$f" || continue
     LOGO_PREVIEW=1
     logo_prepare "$f"; rc=$?
@@ -5998,18 +6530,21 @@ logo_detect_report() {   # vc --delogo --logo-detect FILE: shows where the logos
   done
 }
 logo_tool_one() {   # menu tool: one video (pick_target / FORCE_TARGET) with questions
-  local src sv_c sv_q sv_s sv_h sv_f sv_a sv_t sv_x sv_n sv_pn sv_p sv_cf
+  local src sv_c sv_q sv_s sv_h sv_f sv_a sv_t sv_x sv_n sv_pn sv_p sv_cf sv_ty sv_sm t
   pick_target || return 1; src=$PICK_RESULT
-  sv_c=$CODEC; sv_q=$CRF; sv_s=$SPEED; sv_h=$HEIGHT; sv_f=$FPS; sv_a=$AUDIO; sv_t=$TARGET_MB; sv_x=$SUFFIX; sv_pn=$PRESET_NAME; sv_p=$PARALLEL_JOBS; sv_cf=$LOGO_CONFIRM
+  echo " 1) fixed logo   - stays in one place (default)"
+  echo " 2) moving logo  - hops between places / comes and goes (slower scan)"
+  t=$(ask "Which kind" "1")
+  sv_c=$CODEC; sv_q=$CRF; sv_s=$SPEED; sv_h=$HEIGHT; sv_f=$FPS; sv_a=$AUDIO; sv_t=$TARGET_MB; sv_x=$SUFFIX; sv_pn=$PRESET_NAME; sv_p=$PARALLEL_JOBS; sv_cf=$LOGO_CONFIRM; sv_ty=$LOGO_TYPE; sv_sm=$SUB_MODE
   logo_defaults; PARALLEL_JOBS=1; LOGO_MODE=1; LOGO_CONFIRM=1
+  [[ $t == 2 ]] && LOGO_TYPE=moving || LOGO_TYPE=fixed
   local -a saved=("${SELECTED[@]}")
   SELECTED=("$src"); run_batch; sv_n=$?
   SELECTED=("${saved[@]}")
-  LOGO_MODE=0; LOGO_CONFIRM=$sv_cf; PARALLEL_JOBS=$sv_p
+  LOGO_MODE=0; LOGO_CONFIRM=$sv_cf; LOGO_TYPE=$sv_ty; PARALLEL_JOBS=$sv_p; SUB_MODE=$sv_sm
   CODEC=$sv_c; CRF=$sv_q; SPEED=$sv_s; HEIGHT=$sv_h; FPS=$sv_f; AUDIO=$sv_a; TARGET_MB=$sv_t; SUFFIX=$sv_x; PRESET_NAME=$sv_pn
   return $sv_n
 }
-
 logo_pick_ext() { local e=${1##*.}; e=${e,,}; (( LOGO_KEEPEXT )) || return 0; case $e in mp4|mkv|mov) OUT_EXT=$e;; esac; }   # the logo tool keeps the container of the source
 
 # ================================================================ SELF-TEST (v3.3)
@@ -6038,7 +6573,8 @@ _stc_funcs()   {
   local f miss=0
   for f in "${W6W_REQUIRED[@]}" compress_file repair_file quickfix_file run_batch par_batch queue_run find_videos extract_frames \
            preset_race repair_lab setup_run auto_tune probe diag_probe build_vf build_venc build_aenc selftest \
-           have_filter logo_caps logo_detect logo_regions logo_graph logo_prepare logo_install; do
+           have_filter logo_caps logo_detect_core logo_detect_fixed logo_detect_moving logo_present logo_regions logo_graph \
+           logo_make_preview logo_edit_one logo_refine logo_prepare logo_install; do
     declare -F "$f" >/dev/null || { echo "MISSING function: $f"; miss=1; }
   done
   (( miss == 0 ))
@@ -6083,6 +6619,34 @@ _stc_logo()    {
   v=${v#All:}; ST_NOTE="SSIM $v"
   echo "similarity of the logo area to the logo-free original (SSIM): $v"
   awk -v s="${v:-0}" 'BEGIN{ exit !(s >= 0.90) }'
+}
+_stc_logo_moving() {
+  have_filter removelogo && have_filter tmedian && have_filter alphamerge && have_filter movie && have_filter geq || return 99
+  local c="$ST_S/mv_clean.mp4" l="$ST_S/mv_logo.mp4" out r f key on
+  ffmpeg -nostdin -v error -y -f lavfi -i "color=c=gray:s=480x270:r=15:d=15,format=yuv420p,geq=lum='128+60*sin(X/70+T*0.9)+25*sin(Y/30-T*1.3)+(random(0)-0.5)*8':cb='128+30*sin(Y/50-T*0.7)':cr='128+30*sin((X+Y)/90+T)'" \
+    -c:v libx264 -crf 10 -preset ultrafast -pix_fmt yuv420p "$c" || return 1
+  # the same "logo" (square + two bars) hops: top-right 0-5 s, bottom-left 5-10 s, top-left 10-15 s
+  local d="" x y a b
+  for spec in "340 16 0 5" "16 220 5 10" "16 16 10 15"; do
+    read -r x y a b <<<"$spec"
+    d+="${d:+,}drawbox=x=$x:y=$y:w=22:h=22:color=white:t=fill:enable='between(t,$a,$b)',drawbox=x=$(( x + 30 )):y=$(( y + 2 )):w=80:h=5:color=white:t=fill:enable='between(t,$a,$b)',drawbox=x=$(( x + 30 )):y=$(( y + 12 )):w=80:h=5:color=white:t=fill:enable='between(t,$a,$b)'"
+  done
+  ffmpeg -nostdin -v error -y -i "$c" -vf "$d" -c:v libx264 -crf 10 -preset ultrafast -pix_fmt yuv420p "$l" || return 1
+  _stv --delogo --logo-mode moving --logo-window 3 -y -o "$ST_O/mv" "$l" || return 1
+  out=$ST_O/mv/mv_logo_nologo.mp4
+  [[ -s $out ]] || { echo "no output file"; return 1; }
+  ok=1; local worst=1
+  for key in "340 16 0 5" "16 220 5 10" "16 16 10 15"; do
+    read -r x y a b <<<"$key"
+    ffmpeg -nostdin -v error -y -i "$out" -i "$c" -filter_complex "[0:v]crop=122:30:$(( x - 4 )):$(( y - 4 ))[p];[1:v]crop=122:30:$(( x - 4 )):$(( y - 4 ))[q];[p][q]ssim=stats_file=$ST_O/mv/s_$x.txt" -f null - 2>/dev/null
+    r=$(awk -v a="$a" -v b="$b" -v fps=15 '{ if (match($0, /n:[0-9]+/)) { n = substr($0, RSTART + 2, RLENGTH - 2) + 0; t = n / fps
+          if (t >= a + 0.6 && t < b - 0.6 && match($0, /All:[0-9.]+/)) { s += substr($0, RSTART + 4, RLENGTH - 4); c++ } } } END { if (c) printf "%.3f", s / c; else print 0 }' "$ST_O/mv/s_$x.txt")
+    echo "place x=$x (on $a-${b}s): SSIM while the logo was there = $r"
+    awk -v r="$r" -v w="$worst" 'BEGIN{ exit !(r + 0 < w + 0) }' && worst=$r
+    awk -v r="$r" 'BEGIN{ exit !(r + 0 >= 0.85) }' || ok=0
+  done
+  ST_NOTE="3 places, worst SSIM $worst"
+  (( ok ))
 }
 _stc_diag()    { local o; o=$(_stv --diagnose "$ST_S/v.mp4" 2>&1); echo "$o"; [[ $o == *"Frame"* || $o == *"problem"* || $o == *"No sync"* || $o == *"Audio"* ]]; }
 _stc_quickfix() { cp "$ST_S/v.mp4" "$ST_S/q.mp4"; local o; o=$(_stv --quickfix "$ST_S/q.mp4" 2>&1); echo "$o"; [[ $o == *"verified"* ]]; }
@@ -6181,6 +6745,7 @@ selftest() {   # $1 quick (default) | full
   _st ".w6w password mode (other phone)"    _stc_w6w_password
   _st ".w6w convert (video + subtitle)"     _stc_w6w_convert
   if [[ $mode == full ]]; then
+    _st "moving logo (3 hops, with timeline)" _stc_logo_moving
     _st "parallel batch + screen rotation"  _stc_parallel
     _st "repair lab"                        _stc_lab
     _st "installer logic (fake packages)"   _stc_installer
@@ -6247,6 +6812,10 @@ main() {
       --logo-sens)     if (( $# >= 2 )); then LOGO_SENS=${2,,}; shift 2; else err "--logo-sens needs low | normal | high"; exit 1; fi;;
       --logo-fill)     if (( $# >= 2 )); then LOGO_FILL=${2,,}; shift 2; else err "--logo-fill needs smart | simple | box"; exit 1; fi;;
       --logo-preview)  LOGO_PREVIEW=1; shift;;
+      --logo-mode)     if (( $# >= 2 )); then LOGO_TYPE=${2,,}; LOGO_MODE=1; shift 2; else err "--logo-mode needs fixed | moving"; exit 1; fi;;
+      --logo-window)   if (( $# >= 2 )); then LOGO_WINDOW=$2; shift 2; else err "--logo-window needs seconds (default 5)"; exit 1; fi;;
+      --logo-windows)  if (( $# >= 2 )); then LOGO_MAXWIN=$2; shift 2; else err "--logo-windows needs a number (default 36)"; exit 1; fi;;
+      --logo-no-open)  LOGO_AUTOOPEN=0; shift;;
       --format)   if (( $# >= 2 )); then OUT_EXT=${2,,}; LOGO_KEEPEXT=0; shift 2; else err "--format needs mp4 | mkv | webm | mov | avi | ts"; exit 1; fi;;
       --no-deint) DEINT=0; shift;;
       --autocrop) AUTOCROP=1; shift;;
@@ -6308,6 +6877,9 @@ main() {
   case $OUT_EXT in mp4|mkv|webm|mov|avi|ts) ;; *) err "--format must be mp4, mkv, webm, mov, avi or ts."; exit 1;; esac
   case $LOGO_SENS in low|normal|high) ;; *) err "--logo-sens must be low, normal or high."; exit 1;; esac
   case $LOGO_FILL in smart|simple|box) ;; *) err "--logo-fill must be smart, simple or box."; exit 1;; esac
+  case $LOGO_TYPE in fixed|moving) ;; *) err "--logo-mode must be fixed or moving."; exit 1;; esac
+  [[ $LOGO_WINDOW =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v w="$LOGO_WINDOW" 'BEGIN{ exit !(w >= 1.5 && w <= 60) }' || { err "--logo-window must be 1.5 - 60 seconds."; exit 1; }
+  [[ $LOGO_MAXWIN =~ ^[0-9]+$ ]] && (( LOGO_MAXWIN >= 2 && LOGO_MAXWIN <= 300 )) || { err "--logo-windows must be 2 - 300."; exit 1; }
   case $TUNE_GOAL in ""|speed|balanced|size|quality) ;; *) err "--goal must be speed, balanced, size or quality."; exit 1;; esac
   [[ $CORES == auto || $CORES == all || $CORES =~ ^[0-9]+([-,][0-9]+)*$ ]] || { err "--cores must be auto, all or a list like 4-7."; exit 1; }
   [[ $THREADS =~ ^[0-9]+$ ]] && (( THREADS <= 128 )) || { err "--threads must be 0-128."; exit 1; }
