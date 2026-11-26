@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v3.5 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v3.5.1 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -18,6 +18,22 @@
 #     vc --delogo video.mp4   # find the logo / watermark by itself and paint it out (NEW)
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 3.5.1:
+#   + SUBTITLES INTO MKV, rebuilt (Subtitle Studio "Embed" and the --srt / --mkv compress path). Fixed:
+#     - existing PGS / VobSub (Blu-ray) subtitle tracks were thrown away; every existing track is now copied as it is
+#     - existing ASS / SSA tracks were converted to plain SRT (style and positions lost); they are now copied untouched
+#     - fonts attached to the MKV were dropped (ASS lost its look); attachments are kept
+#     - FLAC / DTS / TrueHD / Opus audio was re-encoded to AAC 128k - for ALL tracks, judged by the first one only;
+#       in an MKV the audio is now always copied (MP4: each track is judged on its own, 5.1 gets a fitting bitrate)
+#     - a Persian / Arabic .srt saved as Windows-1256 (or UTF-16, any non-UTF-8 text) made ffmpeg fail or store garbage:
+#       the encoding is detected and converted to UTF-8 (Persian: Arabic yeh / kaf -> ی / ک). SUB_CHARSET=CP1256 forces one.
+#       The same conversion now also runs before burning and in the compress path
+#     - .srt names containing [brackets] * ? were never found next to the video (find read them as wildcards)
+#     - MKV language tag is the 3-letter code; "Mkv" file extension; "persian" / "fa-IR" typed as the language work
+#     - a container without a duration no longer blocks embedding; free space is checked first; an empty or
+#       non-subtitle file gives a clear message; the result (track count, length) is checked before it replaces anything
+#   + NEW: the new track can be made the default one (other tracks lose the default flag); a summary says what was kept.
 #
 #  What's new in 3.5:
 #   + SUBTITLE FINDER: attaching an .srt no longer means typing a path. Subtitle Studio (embed / burn) and
@@ -220,7 +236,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="3.5"
+VERSION="3.5.1"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -902,9 +918,10 @@ sub_codecs_ok() {   # 0 = all text-based (safe to copy), 1 = bitmap subs present
   return $bad
 }
 find_srt() {   # $1 video [$2 "ask"] -> echoes the .srt that sits next to it (exact name first). With "ask" and several, shows a numbered list.
-  local dir base cands=() i c
+  local dir base gb cands=() i c
   dir=$(dirname -- "$1"); base=$(basename -- "$1"); base=${base%.*}
-  mapfile -t cands < <(find "$dir" -maxdepth 1 -type f \( -iname "$base.srt" -o -iname "$base.*.srt" \) -printf '%p\n' 2>/dev/null | sort)
+  gb=$(printf '%s' "$base" | sed 's/[][*?\\]/\\&/g')      # a name like "Movie [1080p]" must not be read as a wildcard pattern
+  mapfile -t cands < <(find "$dir" -maxdepth 1 -type f \( -iname "$gb.srt" -o -iname "$gb.*.srt" \) -printf '%p\n' 2>/dev/null | sort)
   (( ${#cands[@]} == 0 )) && return 1
   (( ${#cands[@]} == 1 )) && { printf '%s' "${cands[0]}"; return 0; }
   if [[ ${2:-} != ask ]] || ! is_tty; then   # no questions where nobody can answer: the exact-name file wins, else the first
@@ -992,6 +1009,7 @@ resolve_srt() {   # SUB_FILE > a .srt next to the video > the finder over the wh
   SRT_OUT=""
   local p
   if [[ -n $SUB_FILE && -f $SUB_FILE ]]; then SRT_OUT=$SUB_FILE; return 0; fi
+  [[ -n $SUB_FILE ]] && warn "Subtitle file not found: $SUB_FILE - looking for another one."
   if p=$(find_srt "$1" ask); then SRT_OUT=$p; return 0; fi
   if is_tty; then
     info "No .srt next to the video - pick one from your phone (or search by name):"; sleep 1
@@ -1046,7 +1064,7 @@ setup_burn() {   # $1 src ; sets SUBFILTER (needs TMPD) ; 0 = burning subtitles
   if [[ -n $SUB_FILE && -f $SUB_FILE ]]; then srt=$SUB_FILE
   else srt=$(find_srt "$1" 2>/dev/null) || srt=""; fi
   if [[ -z $srt ]]; then warn "No matching .srt found - subtitles skipped."; return 1; fi
-  cp -f -- "$srt" "$TMPD/sub.srt" || return 1
+  sub_stage_text "$srt" "$TMPD/sub.srt" "$SUB_LANG" || return 1
   if awk -v s="${TRIM_START:-0}" 'BEGIN{ exit !(s+0 > 0) }'; then
     shift_srt "$TMPD/sub.srt" "$TMPD/sub2.srt" "${TRIM_START:-0}" && mv -f "$TMPD/sub2.srt" "$TMPD/sub.srt" \
       && info "Subtitles re-timed to match the trim start."
@@ -1781,7 +1799,7 @@ compress_file() {
       warn "No matching .srt found - nothing embedded."
     else
       [[ -n $CT_SUBS ]] && info "Embedding subtitles: $(basename -- "$srt")"
-      cp -f -- "$srt" "$TMPD/sub.srt"
+      sub_stage_text "$srt" "$TMPD/sub.srt" "$SUB_LANG"
       if awk -v s="${TRIM_START:-0}" 'BEGIN{ exit !(s+0 > 0) }'; then
         shift_srt "$TMPD/sub.srt" "$TMPD/sub2.srt" "${TRIM_START:-0}" && mv -f "$TMPD/sub2.srt" "$TMPD/sub.srt" \
           && info "Subtitles re-timed to match the trim start."
@@ -1796,7 +1814,7 @@ compress_file() {
     (( ex_nsubs > 0 || ${#srt} > 0 )) && warn "${OUT_EXT^^} cannot hold subtitles - they are left out (use MKV/MP4 to keep them)."
     keepsubs=0; srt=""
   fi
-  if (( keepsubs )) && (( ex_nsubs > 0 )) && (( ex_bad )); then
+  if (( keepsubs )) && (( ex_nsubs > 0 )) && (( ex_bad )) && [[ $CT_FMT != matroska ]]; then   # MKV holds PGS / VobSub as they are
     warn "Bitmap subtitles (PGS/DVD) cannot be copied to this container - dropping them."
     keepsubs=0
   fi
@@ -1810,10 +1828,15 @@ compress_file() {
     maps+=(-map 1:0)
   fi
   [[ -n $CT_SUBS ]] && scodec=(-c:s "$CT_SUBS")
+  if [[ $CT_FMT == matroska ]] && (( keepsubs )) && (( ex_nsubs > 0 )); then
+    maps+=(-map '0:t?')                           # attached fonts (styled ASS needs them)
+    if sub_inspect "$src"; then mkv_sub_copy_args; scodec=("${MKV_SC[@]}"); fi   # existing tracks copied as they are (ASS style, PGS, VobSub)
+  fi
   if [[ -n $srt ]]; then
     subn=0; (( keepsubs )) && subn=$ex_nsubs      # index of the NEW track among kept subtitle tracks
+    [[ $CT_FMT == matroska ]] && scodec+=("-c:s:$subn" srt)
     local sublang=$SUB_LANG
-    [[ $OUT_EXT == mp4 || $OUT_EXT == mov ]] && sublang=$(lang3 "$sublang")
+    [[ $OUT_EXT == mp4 || $OUT_EXT == mov || $OUT_EXT == mkv ]] && sublang=$(lang3 "$sublang")
     submeta=(-metadata:s:s:$subn language="$sublang")
   fi
 
@@ -2529,43 +2552,243 @@ pick_target() {   # sets PICK_RESULT (prints prompts to stdout, not the result)
   return 1
 }
 
-# =========================================================== SUBTITLE STUDIO
-sub_embed_soft() {   # $1 video -> embed SRT as a selectable track (no re-encode)
-  local vid=$(readlink -f -- "$1") srt lang ext scodec fmt existing keepmaps subidx out rc base aenc tmp
-  resolve_srt "$vid" || { warn "Cancelled."; return 1; }
-  srt=$SRT_OUT
-  lang=$(ask "Language code (fa, en, ar, ...)" "$SUB_LANG")
-  ext="mp4"; scodec=(-c:s mov_text)
-  case ${vid##*.} in mkv|MKV) ext="mkv"; scodec=(-c:s srt);; esac
-  [[ $ext == mp4 ]] && lang=$(lang3 "$lang")
-  probe "$vid" || return 1
-  EDUR=$DUR
-  aenc=(-c:a copy)
-  case $SRC_ACODEC in ""|none) aenc=(-an);; aac|mp3|ac3|eac3) ;; *) aenc=(-c:a aac -b:a 128k);; esac
-  existing=$(count_subs "$vid")
-  keepmaps=(-map '0:s?')
-  subidx=$existing
-  if (( existing > 0 )) && ! sub_codecs_ok "$vid"; then
-    warn "Existing bitmap subtitles cannot be copied - only the new SRT is embedded."
-    keepmaps=(); subidx=0
+# ---- subtitle helpers (v3.5.1) -------------------------------------------------------------
+sub_lang_norm() {   # what the person typed -> 2/3-letter language code ("Persian" -> fa, "fa-IR" -> fa, junk -> und)
+  local l=${1,,}
+  l=${l//[[:space:]]/}; l=${l%%[-_]*}
+  case $l in
+    persian|farsi|parsi) echo fa; return;;   english) echo en; return;;   arabic) echo ar; return;;
+    turkish) echo tr; return;;   kurdish) echo ku; return;;   russian) echo ru; return;;
+    german) echo de; return;;    french) echo fr; return;;    spanish) echo es; return;;
+    italian) echo it; return;;   hindi) echo hi; return;;     urdu) echo ur; return;;
+    chinese) echo zh; return;;   japanese) echo ja; return;;  korean) echo ko; return;;
+    "") echo und; return;;
+  esac
+  if [[ $l =~ ^[a-z]{2,3}$ ]]; then echo "$l"; else echo und; fi
+}
+free_bytes() {   # $1 dir -> bytes free there (0 = unknown)
+  df -Pk -- "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ { printf "%.0f", $4 * 1024; f = 1 } END { if (!f) printf "0" }'
+}
+sub_is_utf8() {   # $1 file -> 0 = valid UTF-8 text
+  if command -v iconv >/dev/null 2>&1; then iconv -f UTF-8 -t UTF-8 < "$1" >/dev/null 2>&1; return; fi
+  ! ffmpeg -nostdin -v error -i "$1" -f null - 2>&1 | grep -qi 'invalid utf-8'
+}
+sub_text_utf8() {   # $1 in  $2 out (name ends .srt/.ass/.vtt)  $3 lang -> 0 = $2 is clean UTF-8 subtitle text ; 1 = unusable (SUB_ERR says why)
+  # Persian / Arabic subtitles are very often saved as Windows-1256 (or UTF-16): ffmpeg then fails or stores garbage.
+  local in=$1 out=$2 lang=${3:-} bom enc="" c cands want tmp
+  SUB_ERR=""; SUB_NOTE=""
+  [[ -s $in ]] || { SUB_ERR="the subtitle file is empty"; return 1; }
+  tmp="$out.tmp$$"
+  bom=$(head -c 4 -- "$in" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  case $bom in
+    fffe0000*|0000feff*) enc=UTF-32;;
+    fffe*|feff*)         enc=UTF-16;;
+  esac
+  if [[ -n $enc ]]; then
+    if command -v iconv >/dev/null 2>&1 && iconv -f "$enc" -t UTF-8 < "$in" > "$tmp" 2>/dev/null && [[ -s $tmp ]]; then
+      SUB_NOTE="the text was $enc - converted to UTF-8"
+    else
+      cp -f -- "$in" "$tmp" || { SUB_ERR="cannot read the subtitle file"; return 1; }   # ffmpeg reads UTF-16 with a BOM by itself
+    fi
+  else
+    if [[ $bom == efbbbf* ]]; then tail -c +4 -- "$in" > "$tmp"; else cp -f -- "$in" "$tmp"; fi
+    [[ -s $tmp ]] || { rm -f -- "$tmp"; SUB_ERR="cannot read the subtitle file"; return 1; }
+    if ! sub_is_utf8 "$tmp"; then
+      case ${lang,,} in
+        fa|ar|ur|ku|ps|sd|ug|prs) cands="CP1256 ISO-8859-6 CP1252";;
+        tr|az)                   cands="CP1254 CP1252";;
+        ru|uk|bg|be|sr|mk|kk|ky|tg|mn) cands="CP1251 KOI8-R";;
+        el)                      cands="CP1253 ISO-8859-7";;
+        he|yi)                   cands="CP1255 ISO-8859-8";;
+        pl|cs|sk|hu|ro|hr|sl|sq|bs) cands="CP1250 ISO-8859-2";;
+        lt|lv|et)                cands="CP1257";;
+        th) cands="CP874";;   vi) cands="CP1258";;   zh) cands="GB18030 BIG5";;   ja) cands="CP932 EUC-JP";;   ko) cands="CP949";;
+        *)                       cands="CP1252";;
+      esac
+      [[ -n ${SUB_CHARSET:-} ]] && cands=$SUB_CHARSET
+      enc=""
+      for c in $cands; do
+        if command -v iconv >/dev/null 2>&1; then
+          iconv -f "$c" -t UTF-8 < "$tmp" > "$tmp.c" 2>/dev/null && [[ -s $tmp.c ]] && { enc=$c; mv -f -- "$tmp.c" "$tmp"; break; }
+        elif [[ ${out##*.} == srt ]]; then
+          ffmpeg -nostdin -v error -y -sub_charenc "$c" -i "$tmp" -f srt "$tmp.c" 2>/dev/null && [[ -s $tmp.c ]] && { enc=$c; mv -f -- "$tmp.c" "$tmp"; break; }
+        fi
+      done
+      rm -f -- "$tmp.c"
+      if [[ -z $enc ]]; then
+        rm -f -- "$tmp"
+        SUB_ERR="the text is not UTF-8 and could not be converted (pkg install libiconv, or set SUB_CHARSET=CP1256)"; return 1
+      fi
+      SUB_NOTE="the text was $enc - converted to UTF-8"
+      if [[ ${lang,,} == fa && $enc == CP1256 ]]; then      # legacy files use the ARABIC yeh / kaf; Persian needs ی / ک
+        LC_ALL=C sed -e "s/$(printf '\xd9\x8a')/$(printf '\xdb\x8c')/g" -e "s/$(printf '\xd9\x83')/$(printf '\xda\xa9')/g" "$tmp" > "$tmp.c" \
+          && [[ -s $tmp.c ]] && mv -f -- "$tmp.c" "$tmp"
+        rm -f -- "$tmp.c"; SUB_NOTE+=" (Arabic yeh/kaf -> Persian ی/ک)"
+      fi
+    fi
   fi
+  mv -f -- "$tmp" "$out" || { rm -f -- "$tmp"; SUB_ERR="cannot write the temporary subtitle file"; return 1; }
+  case ${out##*.} in ass|ssa) want='Dialogue:';; *) want='-->';; esac
+  grep -aq -- "$want" "$out" || { SUB_ERR="no subtitle lines found (is it really a text subtitle file)"; return 1; }
+  return 0
+}
+sub_stage_text() {   # $1 in  $2 out  $3 lang -> $2 = UTF-8 copy of the subtitle file; falls back to a plain copy (never fails the caller)
+  if sub_text_utf8 "$1" "$2" "${3:-}"; then [[ -n $SUB_NOTE ]] && info "  Subtitle file: $SUB_NOTE."; return 0; fi
+  cp -f -- "$1" "$2"
+}
+sub_inspect() {   # $1 video -> SI_* in ONE ffprobe call (replaces three): counts, per-stream codecs, duration
+  local line kv k v P=() ctype codec ch dur tdur dflt
+  SI_NV=0; SI_NA=0; SI_NS=0; SI_NT=0; SI_ACODEC=(); SI_ACH=(); SI_SCODEC=(); SI_SDEF=0; SI_DUR=""; SI_VDUR=""
+  [[ -f $1 ]] || { err "Not a file: $1"; return 1; }
+  while IFS= read -r line; do
+    ctype=""; codec=""; ch=0; dur=""; tdur=""; dflt=0
+    IFS='|' read -ra P <<<"$line"
+    for kv in "${P[@]:1}"; do
+      k=${kv%%=*}; v=${kv#*=}
+      case $k in
+        codec_type) ctype=$v;;  codec_name) codec=$v;;  channels) [[ $v =~ ^[0-9]+$ ]] && ch=$v;;
+        duration) dur=$v;;  tag:DURATION) tdur=$v;;  disposition:default) [[ $v == 1 ]] && dflt=1;;
+      esac
+    done
+    case ${P[0]} in
+      format) SI_DUR=$dur;;
+      stream)
+        case $ctype in
+          video)      SI_NV=$(( SI_NV + 1 )); if [[ -z $SI_VDUR ]]; then SI_VDUR=$dur; [[ $SI_VDUR =~ ^[0-9.]+$ ]] || SI_VDUR=$tdur; fi;;
+          audio)      SI_NA=$(( SI_NA + 1 )); SI_ACODEC+=("$codec"); SI_ACH+=("$ch");;
+          subtitle)   SI_NS=$(( SI_NS + 1 )); SI_SCODEC+=("$codec"); (( dflt )) && SI_SDEF=1;;
+          attachment) SI_NT=$(( SI_NT + 1 ));;
+        esac;;
+    esac
+  done < <(ffprobe -v error -show_entries \
+    'format=duration:stream=codec_type,codec_name,channels,duration:stream_tags=DURATION:stream_disposition=default' \
+    -of compact -- "$1" 2>/dev/null)
+  (( SI_NV > 0 )) || { err "No video stream: $(basename -- "$1")"; return 1; }
+  if ! [[ $SI_DUR =~ ^[0-9]+(\.[0-9]+)?$ ]]; then          # container has no duration (live capture, cut file): not fatal for a stream copy
+    if [[ $SI_VDUR =~ ^[0-9]+(\.[0-9]+)?$ ]]; then SI_DUR=$SI_VDUR
+    elif [[ $SI_VDUR =~ ^[0-9]+:[0-9]+:[0-9.]+$ ]]; then SI_DUR=$(awk -F: -v t="$SI_VDUR" 'BEGIN{ split(t, a, ":"); printf "%.3f", a[1]*3600 + a[2]*60 + a[3] }')
+    else SI_DUR=0; fi
+  fi
+  return 0
+}
+mkv_sub_copy_args() {   # needs SI_SCODEC -> MKV_SC: copy every existing subtitle track AS IT IS (ASS style, PGS / VobSub bitmaps);
+  local i                # only tracks Matroska cannot hold (MP4 mov_text, old text formats) are turned into SRT
+  MKV_SC=(-c:s copy)
+  for i in "${!SI_SCODEC[@]}"; do
+    case ${SI_SCODEC[i]} in
+      mov_text|text|microdvd|sami|realtext|jacosub|subviewer1|subviewer|vplayer|pjs|mpl2|stl) MKV_SC+=("-c:s:$i" srt);;
+    esac
+  done
+}
+
+# =========================================================== SUBTITLE STUDIO
+sub_embed_soft() {   # $1 video -> add a text subtitle file as a NEW selectable track; picture and audio are never re-encoded (MKV: nothing is lost)
+  local rc
+  TMPD=$(mktemp -d) || { err "Cannot create temp dir."; return 1; }
+  sub_embed_core "$1"; rc=$?
+  rm -rf -- "$TMPD"; TMPD=""
+  return $rc
+}
+sub_embed_core() {
+  local vid srt sub_in sext lang ext newc out base tmp rc i k kept=0 dropped=0 nre=0 subidx sz need free ab dflt n_out odur c
+  local -a fmt vmap amap smap tmap acod scod meta disp
+  vid=$(readlink -f -- "$1") || return 1
+  [[ -f $vid ]] || { err "Not a file: $1"; return 1; }
+  resolve_srt "$vid" || { warn "Cancelled."; return 1; }
+  sub_in=$SRT_OUT
+  lang=$(ask "Language code (fa, en, ar, ...)" "$SUB_LANG")
+  c=$(sub_lang_norm "$lang")
+  [[ $c == und ]] && [[ -n $lang && ${lang,,} != und ]] && warn "\"$lang\" is not a language code I know - the track is tagged \"und\" (fa, en, ar, tr, ...)."
+  lang=$(lang3 "$c")
+  ext="mp4"
+  case ${vid##*.} in [mM][kK][vV]|[mM][kK]3[dD]) ext="mkv";; esac
+  sext=${sub_in##*.}; sext=${sext,,}
+  case $sext in srt|ass|ssa|vtt) ;; *) sext=srt;; esac
+  srt="$TMPD/sub.$sext"
+  if ! sub_text_utf8 "$sub_in" "$srt" "$c"; then err "$(basename -- "$sub_in"): $SUB_ERR"; return 1; fi
+  [[ -n $SUB_NOTE ]] && info "  Subtitle file: $SUB_NOTE."
+  if [[ $ext == mkv ]]; then
+    case $sext in ass|ssa) newc=ass;; vtt) newc=webvtt;; *) newc=srt;; esac
+  else newc=mov_text; fi
+  sub_inspect "$vid" || return 1
+  DUR=$SI_DUR; EDUR=$DUR
+
+  # ---- what goes into the new file
+  amap=(-map '0:a?'); tmap=(); smap=(); scod=(); acod=(-c:a copy)
+  if [[ $ext == mkv ]]; then
+    vmap=(-map 0:v)                                   # every video stream
+    (( SI_NS > 0 )) && smap=(-map '0:s?')             # every existing subtitle track, bitmap ones too (PGS / VobSub fit into MKV)
+    kept=$SI_NS
+    (( SI_NT > 0 )) && tmap=(-map '0:t?')             # attached fonts (styled ASS needs them) and covers
+    mkv_sub_copy_args; scod=("${MKV_SC[@]}")
+  else
+    vmap=(-map 0:v:0)
+    for i in "${!SI_SCODEC[@]}"; do
+      case ${SI_SCODEC[i]} in
+        subrip|srt|ass|ssa|mov_text|webvtt|text|stl) smap+=(-map "0:s:$i"); kept=$(( kept + 1 ));;
+        *) dropped=$(( dropped + 1 ));;
+      esac
+    done
+    (( dropped )) && warn "$dropped bitmap subtitle track(s) (PGS / VobSub) cannot go into MP4 and are left out - an MKV keeps them."
+    scod=(-c:s mov_text)
+  fi
+  if (( SI_NA == 0 )); then amap=(); acod=(-an)
+  elif [[ $ext == mp4 ]]; then      # MP4 holds only some audio codecs: judge EVERY track, not just the first
+    for (( i = 0; i < SI_NA; i++ )); do
+      case ${SI_ACODEC[i]} in
+        aac|mp3|ac3|eac3) ;;
+        *) ab=128; (( SI_ACH[i] > 2 )) && ab=$(( 64 * SI_ACH[i] ))
+           acod+=("-c:a:$i" aac "-b:a:$i" "${ab}k"); nre=$(( nre + 1 ));;
+      esac
+    done
+  fi
+  subidx=$kept
+  meta=(-metadata:s:s:$subidx language="$lang")
+  disp=()
+  dflt=y
+  (( SI_NS > 0 )) && ! yesno "Make the new track the default one (shown automatically)?" y && dflt=n
+  if [[ $dflt == y ]]; then
+    for (( i = 0; i < kept; i++ )); do disp+=("-disposition:s:$i" -default); done
+    disp+=("-disposition:s:$subidx" +default)
+  fi
+
+  # ---- output name, free space, temp file
   base=$(basename -- "$vid"); base=${base%.*}
   out=$(unique_file "$(dirname -- "$vid")" "${base}_subbed" "$ext")
+  sz=$(fsize "$vid"); need=$(( sz + sz / 50 + 33554432 ))
+  free=$(free_bytes "$(dirname -- "$vid")")
+  if (( free > 0 && free < need )); then
+    err "Not enough free space for the new file: need about $(human "$need"), only $(human "$free") free in $(pretty "$(dirname -- "$vid")")."
+    return 1
+  fi
   mkdir -p "$CONF_DIR" 2>/dev/null
   if [[ $ext == mp4 ]]; then
-    out_tmp "$out" "$(fsize "$vid")"; tmp=$OT_TMP
+    out_tmp "$out" "$sz"; tmp=$OT_TMP
     fmt=(-f mp4); (( OT_DIRECT )) || fmt+=(-movflags +faststart)
   else
     tmp="$out.part"; OT_DIRECT=0
     fmt=(-f matroska)
   fi
   CUR_TMP=$tmp
-  run_ffmpeg "subs" 1 1 -i "$vid" -i "$srt" -map 0:v:0 -map '0:a?' "${keepmaps[@]}" -map 1:0 \
-    -c:v copy "${aenc[@]}" "${scodec[@]}" -metadata:s:s:$subidx language="$lang" \
+  run_ffmpeg "subs" 1 1 -i "$vid" -i "$srt" "${vmap[@]}" "${amap[@]}" "${smap[@]}" "${tmap[@]}" -map 1:0 \
+    -c:v copy "${acod[@]}" "${scod[@]}" "-c:s:$subidx" "$newc" "${meta[@]}" "${disp[@]}" \
     "${fmt[@]}" -max_muxing_queue_size 2048 "$tmp"
   rc=$?; CUR_TMP=""
+
+  # ---- check the result BEFORE it replaces anything
+  if (( rc == 0 )) && [[ -s $tmp ]]; then
+    n_out=$(count_subs "$tmp")
+    odur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$tmp" 2>/dev/null)
+    if (( n_out != kept + 1 )); then
+      err "Check failed: the new file has $n_out subtitle track(s), expected $(( kept + 1 ))."; rc=1
+    elif [[ $odur =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v a="$odur" -v b="${DUR:-0}" 'BEGIN{ exit !(b > 5 && a < b - 3 && a < b * 0.99) }'; then
+      err "Check failed: the new file is shorter ($odur s) than the original ($DUR s)."; rc=1
+    fi
+  fi
   if (( rc == 0 )) && [[ -s $tmp ]] && commit_out "$tmp" "$out"; then
     ok "Subtitled file: $(pretty "$out")"
+    local anote="copied" nt=0; (( nre )) && anote="$nre re-encoded to AAC for MP4"; [[ $ext == mkv ]] && nt=$SI_NT
+    info "  + new track: $lang ($newc)   kept: $SI_NA audio ($anote), $kept subtitle track(s), $nt attachment(s)"
     command -v termux-media-scan >/dev/null 2>&1 && { timeout 10 termux-media-scan "$out" >/dev/null 2>&1 & }
     yesno "Open it now?" n && open_file "$out"
     return 0
@@ -2606,7 +2829,7 @@ sub_burn() {   # $1 video -> burn SRT permanently into the picture (re-encode)
     venc=(-c:v libx265 -preset fast -crf 20 -tag:v hvc1 -pix_fmt yuv420p -x265-params log-level=error)
   fi
   TMPD=$(mktemp -d) || return 1
-  cp -f -- "$srt" "$TMPD/sub.srt"
+  sub_stage_text "$srt" "$TMPD/sub.srt" "$SUB_LANG"
   mkdir -p "$CONF_DIR" 2>/dev/null
   info "Burning subtitles (this re-encodes the video)..."
   ( cd "$TMPD" && run_ffmpeg "burn" 1 1 -i "$vid" -map 0:v:0 -map '0:a?' \
@@ -4900,13 +5123,13 @@ Usage:
   vc [options] FILE|DIR ...   preload files/folders (menu opens unless -y)
 
 Options:
-  -p PRESET   balanced | quality | small | tiny | social | compat | fast | turbo | target | hardware | av1
+  -p PRESET   balanced | quality | small | tiny | social | compat | fast | turbo | target | hardware | av1 | web
   -t MB       target size in MB (two-pass), e.g. -t 95
   -c CRF      constant quality (x265: 22-30, x264: 18-27, av1: 30-45; lower = better)
   -r PIXELS   max short side: 1080, 720, 480 ... (0 = keep original)
   -f FPS      max frame rate (0 = keep)
   -s SPEED    ultrafast ... medium ... veryslow
-  -k CODEC    x265 | x264 | av1 | hw265 | hw264
+  -k CODEC    x265 | x264 | av1 | vp9 | hw265 | hw264
   -a AUDIO    copy | none | <kbps>   e.g. -a 64
   -S TIME     trim start (90, 1:30, 0:01:30)
   -E TIME     trim end
@@ -6574,7 +6797,8 @@ _stc_funcs()   {
   for f in "${W6W_REQUIRED[@]}" compress_file repair_file quickfix_file run_batch par_batch queue_run find_videos extract_frames \
            preset_race repair_lab setup_run auto_tune probe diag_probe build_vf build_venc build_aenc selftest \
            have_filter logo_caps logo_detect_core logo_detect_fixed logo_detect_moving logo_present logo_regions logo_graph \
-           logo_make_preview logo_edit_one logo_refine logo_prepare logo_install; do
+           logo_make_preview logo_edit_one logo_refine logo_prepare logo_install \
+           sub_embed_soft sub_embed_core sub_inspect sub_text_utf8 sub_stage_text sub_is_utf8 sub_lang_norm mkv_sub_copy_args free_bytes; do
     declare -F "$f" >/dev/null || { echo "MISSING function: $f"; miss=1; }
   done
   (( miss == 0 ))
@@ -6619,6 +6843,22 @@ _stc_logo()    {
   v=${v#All:}; ST_NOTE="SSIM $v"
   echo "similarity of the logo area to the logo-free original (SSIM): $v"
   awk -v s="${v:-0}" 'BEGIN{ exit !(s >= 0.90) }'
+}
+_stc_subs_mkv() {   # a Windows-1256 Persian .srt into an MKV that already has FLAC audio + an ASS track: nothing may be lost, the text must arrive as UTF-8
+  local m="$ST_S/sm.mkv" o="$ST_S/sm_subbed.mkv" t
+  printf '[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour\nStyle: Default,Arial,28,&H00FFFFFF\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.50,0:00:02.00,Default,test\n' > "$ST_S/sm.ass"
+  printf '1\r\n00:00:00,500 --> 00:00:01,500\r\n\323\341\307\343\r\n\r\n' > "$ST_S/sm.srt"      # the word "salam" in Windows-1256 (not valid UTF-8)
+  ffmpeg -nostdin -v error -y -i "$ST_S/v.mp4" -i "$ST_S/sm.ass" -map 0:v -map 0:a -map 1:s -c:v copy -c:a flac -c:s ass \
+    -metadata:s:s:0 language=eng "$m" || { echo "cannot build the test MKV"; return 1; }
+  rm -f -- "$o"
+  SUB_FILE="$ST_S/sm.srt" SUB_LANG=fa sub_embed_soft "$m" || return 1
+  [[ -s $o ]] || { echo "no output file"; return 1; }
+  [[ $(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$o") == flac ]] || { echo "the FLAC audio was re-encoded"; return 1; }
+  t=$(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 "$o" | tr '\n' ,)
+  [[ $t == ass,subrip, ]] || { echo "subtitle tracks are: $t (expected ass,subrip,)"; return 1; }
+  t=$(ffmpeg -nostdin -v error -i "$o" -map 0:s:1 -f srt - 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+  [[ $t == *d8b3d984d8a7d985* ]] || { echo "the Persian text did not arrive as UTF-8"; return 1; }
+  return 0
 }
 _stc_logo_moving() {
   have_filter removelogo && have_filter tmedian && have_filter alphamerge && have_filter movie && have_filter geq || return 99
@@ -6744,6 +6984,7 @@ selftest() {   # $1 quick (default) | full
   _st ".w6w wrong key refused"              _stc_w6w_wrongkey
   _st ".w6w password mode (other phone)"    _stc_w6w_password
   _st ".w6w convert (video + subtitle)"     _stc_w6w_convert
+  _st "subtitles into MKV (nothing lost)"   _stc_subs_mkv
   if [[ $mode == full ]]; then
     _st "moving logo (3 hops, with timeline)" _stc_logo_moving
     _st "parallel batch + screen rotation"  _stc_parallel
