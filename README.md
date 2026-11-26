@@ -39,7 +39,6 @@ Compress, repair, subtitle, clean and vault your videos right inside **Termux**.
 ### ⚡ One-line install (recommended)
 
 ```bash
-termux-setup-storage          # allow access to your phone's storage (tap "Allow")
 curl -fsSL https://raw.githubusercontent.com/Alireza123456w6w/V.C.-a-video-compresser-for-termux/main/install.sh | bash
 ```
 
@@ -454,7 +453,6 @@ Created by **W6W** · [offers-pishnahadat.vercel.app](https://offers-pishnahadat
 </div>
 
 ```bash
-termux-setup-storage          # دسترسی به حافظه‌ی گوشی (روی Allow بزن)
 curl -fsSL https://raw.githubusercontent.com/Alireza123456w6w/V.C.-a-video-compresser-for-termux/main/install.sh | bash
 ```
 
