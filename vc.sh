@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress (vc) v3.5.1 - ffmpeg video compression toolkit for Termux
+#  VidCompress (vc) v3.5.2 - ffmpeg video compression toolkit for Termux
 #  Creator : W6W
 #  Website : offers-pishnahadat.vercel.app
 #
@@ -18,6 +18,13 @@
 #     vc --delogo video.mp4   # find the logo / watermark by itself and paint it out (NEW)
 #     vc -y -p target -t 95 video.mp4     # CLI: compress to ~95 MB
 #     vc -h                   # all options
+#
+#  What's new in 3.5.2:
+#   + FIXED (found by the self-test on a real phone): converting a Windows-1256 / UTF-16 / legacy subtitle needed `iconv`, which
+#     Termux may not have - the embed then failed. UTF-8 detection and the conversion of the single-byte code pages
+#     (Windows-1250..1258, 874: Persian, Arabic, Russian, Turkish, Greek, Hebrew, Baltic, Central European, Thai, Vietnamese)
+#     are now built in (pure awk). iconv is only needed for Chinese / Japanese / Korean files.
+#   + The self-test got a second subtitle test (encodings without iconv) and shows the ffmpeg error when the MKV test fails.
 #
 #  What's new in 3.5.1:
 #   + SUBTITLES INTO MKV, rebuilt (Subtitle Studio "Embed" and the --srt / --mkv compress path). Fixed:
@@ -236,7 +243,7 @@
 #     "after finishing" action
 # =============================================================================
 
-VERSION="3.5.1"
+VERSION="3.5.2"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vidcompress"
@@ -2569,9 +2576,60 @@ sub_lang_norm() {   # what the person typed -> 2/3-letter language code ("Persia
 free_bytes() {   # $1 dir -> bytes free there (0 = unknown)
   df -Pk -- "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ { printf "%.0f", $4 * 1024; f = 1 } END { if (!f) printf "0" }'
 }
-sub_is_utf8() {   # $1 file -> 0 = valid UTF-8 text
-  if command -v iconv >/dev/null 2>&1; then iconv -f UTF-8 -t UTF-8 < "$1" >/dev/null 2>&1; return; fi
-  ! ffmpeg -nostdin -v error -i "$1" -f null - 2>&1 | grep -qi 'invalid utf-8'
+sub_has_iconv() { command -v iconv >/dev/null 2>&1; }
+_sub_is_utf8_awk() {   # $1 file -> 0 = valid UTF-8 text (pure awk)
+  LC_ALL=C awk '
+    !/^([\001-\177]|[\302-\337][\200-\277]|\340[\240-\277][\200-\277]|[\341-\354\356\357][\200-\277][\200-\277]|\355[\200-\237][\200-\277]|\360[\220-\277][\200-\277][\200-\277]|[\361-\363][\200-\277][\200-\277][\200-\277]|\364[\200-\217][\200-\277][\200-\277])*$/ { bad = 1; exit }
+    END { exit bad }
+  ' "$1"
+}
+sub_cp_table() {   # $1 charset -> the 128 Unicode code points (hex) of bytes 0x80..0xFF; empty = no built-in table
+  case ${1,,} in
+    cp1250|windows-1250) echo "20ac 0081 201a 0083 201e 2026 2020 2021 0088 2030 0160 2039 015a 0164 017d 0179 0090 2018 2019 201c 201d 2022 2013 2014 0098 2122 0161 203a 015b 0165 017e 017a 00a0 02c7 02d8 0141 00a4 0104 00a6 00a7 00a8 00a9 015e 00ab 00ac 00ad 00ae 017b 00b0 00b1 02db 0142 00b4 00b5 00b6 00b7 00b8 0105 015f 00bb 013d 02dd 013e 017c 0154 00c1 00c2 0102 00c4 0139 0106 00c7 010c 00c9 0118 00cb 011a 00cd 00ce 010e 0110 0143 0147 00d3 00d4 0150 00d6 00d7 0158 016e 00da 0170 00dc 00dd 0162 00df 0155 00e1 00e2 0103 00e4 013a 0107 00e7 010d 00e9 0119 00eb 011b 00ed 00ee 010f 0111 0144 0148 00f3 00f4 0151 00f6 00f7 0159 016f 00fa 0171 00fc 00fd 0163 02d9";;
+    cp1251|windows-1251) echo "0402 0403 201a 0453 201e 2026 2020 2021 20ac 2030 0409 2039 040a 040c 040b 040f 0452 2018 2019 201c 201d 2022 2013 2014 0098 2122 0459 203a 045a 045c 045b 045f 00a0 040e 045e 0408 00a4 0490 00a6 00a7 0401 00a9 0404 00ab 00ac 00ad 00ae 0407 00b0 00b1 0406 0456 0491 00b5 00b6 00b7 0451 2116 0454 00bb 0458 0405 0455 0457 0410 0411 0412 0413 0414 0415 0416 0417 0418 0419 041a 041b 041c 041d 041e 041f 0420 0421 0422 0423 0424 0425 0426 0427 0428 0429 042a 042b 042c 042d 042e 042f 0430 0431 0432 0433 0434 0435 0436 0437 0438 0439 043a 043b 043c 043d 043e 043f 0440 0441 0442 0443 0444 0445 0446 0447 0448 0449 044a 044b 044c 044d 044e 044f";;
+    cp1252|windows-1252|latin1|iso-8859-1) echo "20ac 0081 201a 0192 201e 2026 2020 2021 02c6 2030 0160 2039 0152 008d 017d 008f 0090 2018 2019 201c 201d 2022 2013 2014 02dc 2122 0161 203a 0153 009d 017e 0178 00a0 00a1 00a2 00a3 00a4 00a5 00a6 00a7 00a8 00a9 00aa 00ab 00ac 00ad 00ae 00af 00b0 00b1 00b2 00b3 00b4 00b5 00b6 00b7 00b8 00b9 00ba 00bb 00bc 00bd 00be 00bf 00c0 00c1 00c2 00c3 00c4 00c5 00c6 00c7 00c8 00c9 00ca 00cb 00cc 00cd 00ce 00cf 00d0 00d1 00d2 00d3 00d4 00d5 00d6 00d7 00d8 00d9 00da 00db 00dc 00dd 00de 00df 00e0 00e1 00e2 00e3 00e4 00e5 00e6 00e7 00e8 00e9 00ea 00eb 00ec 00ed 00ee 00ef 00f0 00f1 00f2 00f3 00f4 00f5 00f6 00f7 00f8 00f9 00fa 00fb 00fc 00fd 00fe 00ff";;
+    cp1253|windows-1253) echo "20ac 0081 201a 0192 201e 2026 2020 2021 0088 2030 008a 2039 008c 008d 008e 008f 0090 2018 2019 201c 201d 2022 2013 2014 0098 2122 009a 203a 009c 009d 009e 009f 00a0 0385 0386 00a3 00a4 00a5 00a6 00a7 00a8 00a9 00aa 00ab 00ac 00ad 00ae 2015 00b0 00b1 00b2 00b3 0384 00b5 00b6 00b7 0388 0389 038a 00bb 038c 00bd 038e 038f 0390 0391 0392 0393 0394 0395 0396 0397 0398 0399 039a 039b 039c 039d 039e 039f 03a0 03a1 00d2 03a3 03a4 03a5 03a6 03a7 03a8 03a9 03aa 03ab 03ac 03ad 03ae 03af 03b0 03b1 03b2 03b3 03b4 03b5 03b6 03b7 03b8 03b9 03ba 03bb 03bc 03bd 03be 03bf 03c0 03c1 03c2 03c3 03c4 03c5 03c6 03c7 03c8 03c9 03ca 03cb 03cc 03cd 03ce 00ff";;
+    cp1254|windows-1254) echo "20ac 0081 201a 0192 201e 2026 2020 2021 02c6 2030 0160 2039 0152 008d 008e 008f 0090 2018 2019 201c 201d 2022 2013 2014 02dc 2122 0161 203a 0153 009d 009e 0178 00a0 00a1 00a2 00a3 00a4 00a5 00a6 00a7 00a8 00a9 00aa 00ab 00ac 00ad 00ae 00af 00b0 00b1 00b2 00b3 00b4 00b5 00b6 00b7 00b8 00b9 00ba 00bb 00bc 00bd 00be 00bf 00c0 00c1 00c2 00c3 00c4 00c5 00c6 00c7 00c8 00c9 00ca 00cb 00cc 00cd 00ce 00cf 011e 00d1 00d2 00d3 00d4 00d5 00d6 00d7 00d8 00d9 00da 00db 00dc 0130 015e 00df 00e0 00e1 00e2 00e3 00e4 00e5 00e6 00e7 00e8 00e9 00ea 00eb 00ec 00ed 00ee 00ef 011f 00f1 00f2 00f3 00f4 00f5 00f6 00f7 00f8 00f9 00fa 00fb 00fc 0131 015f 00ff";;
+    cp1255|windows-1255) echo "20ac 0081 201a 0192 201e 2026 2020 2021 02c6 2030 008a 2039 008c 008d 008e 008f 0090 2018 2019 201c 201d 2022 2013 2014 02dc 2122 009a 203a 009c 009d 009e 009f 00a0 00a1 00a2 00a3 20aa 00a5 00a6 00a7 00a8 00a9 00d7 00ab 00ac 00ad 00ae 00af 00b0 00b1 00b2 00b3 00b4 00b5 00b6 00b7 00b8 00b9 00f7 00bb 00bc 00bd 00be 00bf 05b0 05b1 05b2 05b3 05b4 05b5 05b6 05b7 05b8 05b9 00ca 05bb 05bc 05bd 05be 05bf 05c0 05c1 05c2 05c3 05f0 05f1 05f2 05f3 05f4 00d9 00da 00db 00dc 00dd 00de 00df 05d0 05d1 05d2 05d3 05d4 05d5 05d6 05d7 05d8 05d9 05da 05db 05dc 05dd 05de 05df 05e0 05e1 05e2 05e3 05e4 05e5 05e6 05e7 05e8 05e9 05ea 00fb 00fc 200e 200f 00ff";;
+    cp1256|windows-1256) echo "20ac 067e 201a 0192 201e 2026 2020 2021 02c6 2030 0679 2039 0152 0686 0698 0688 06af 2018 2019 201c 201d 2022 2013 2014 06a9 2122 0691 203a 0153 200c 200d 06ba 00a0 060c 00a2 00a3 00a4 00a5 00a6 00a7 00a8 00a9 06be 00ab 00ac 00ad 00ae 00af 00b0 00b1 00b2 00b3 00b4 00b5 00b6 00b7 00b8 00b9 061b 00bb 00bc 00bd 00be 061f 06c1 0621 0622 0623 0624 0625 0626 0627 0628 0629 062a 062b 062c 062d 062e 062f 0630 0631 0632 0633 0634 0635 0636 00d7 0637 0638 0639 063a 0640 0641 0642 0643 00e0 0644 00e2 0645 0646 0647 0648 00e7 00e8 00e9 00ea 00eb 0649 064a 00ee 00ef 064b 064c 064d 064e 00f4 064f 0650 00f7 0651 00f9 0652 00fb 00fc 200e 200f 06d2";;
+    cp1257|windows-1257) echo "20ac 0081 201a 0083 201e 2026 2020 2021 0088 2030 008a 2039 008c 00a8 02c7 00b8 0090 2018 2019 201c 201d 2022 2013 2014 0098 2122 009a 203a 009c 00af 02db 009f 00a0 00a1 00a2 00a3 00a4 00a5 00a6 00a7 00d8 00a9 0156 00ab 00ac 00ad 00ae 00c6 00b0 00b1 00b2 00b3 00b4 00b5 00b6 00b7 00f8 00b9 0157 00bb 00bc 00bd 00be 00e6 0104 012e 0100 0106 00c4 00c5 0118 0112 010c 00c9 0179 0116 0122 0136 012a 013b 0160 0143 0145 00d3 014c 00d5 00d6 00d7 0172 0141 015a 016a 00dc 017b 017d 00df 0105 012f 0101 0107 00e4 00e5 0119 0113 010d 00e9 017a 0117 0123 0137 012b 013c 0161 0144 0146 00f3 014d 00f5 00f6 00f7 0173 0142 015b 016b 00fc 017c 017e 02d9";;
+    cp1258|windows-1258) echo "20ac 0081 201a 0192 201e 2026 2020 2021 02c6 2030 008a 2039 0152 008d 008e 008f 0090 2018 2019 201c 201d 2022 2013 2014 02dc 2122 009a 203a 0153 009d 009e 0178 00a0 00a1 00a2 00a3 00a4 00a5 00a6 00a7 00a8 00a9 00aa 00ab 00ac 00ad 00ae 00af 00b0 00b1 00b2 00b3 00b4 00b5 00b6 00b7 00b8 00b9 00ba 00bb 00bc 00bd 00be 00bf 00c0 00c1 00c2 0102 00c4 00c5 00c6 00c7 00c8 00c9 00ca 00cb 0300 00cd 00ce 00cf 0110 00d1 0309 00d3 00d4 01a0 00d6 00d7 00d8 00d9 00da 00db 00dc 01af 0303 00df 00e0 00e1 00e2 0103 00e4 00e5 00e6 00e7 00e8 00e9 00ea 00eb 0301 00ed 00ee 00ef 0111 00f1 0323 00f3 00f4 01a1 00f6 00f7 00f8 00f9 00fa 00fb 00fc 01b0 20ab 00ff";;
+    cp874|windows-874) echo "20ac 0081 0082 0083 0084 2026 0086 0087 0088 0089 008a 008b 008c 008d 008e 008f 0090 2018 2019 201c 201d 2022 2013 2014 0098 0099 009a 009b 009c 009d 009e 009f 00a0 0e01 0e02 0e03 0e04 0e05 0e06 0e07 0e08 0e09 0e0a 0e0b 0e0c 0e0d 0e0e 0e0f 0e10 0e11 0e12 0e13 0e14 0e15 0e16 0e17 0e18 0e19 0e1a 0e1b 0e1c 0e1d 0e1e 0e1f 0e20 0e21 0e22 0e23 0e24 0e25 0e26 0e27 0e28 0e29 0e2a 0e2b 0e2c 0e2d 0e2e 0e2f 0e30 0e31 0e32 0e33 0e34 0e35 0e36 0e37 0e38 0e39 0e3a 00db 00dc 00dd 00de 0e3f 0e40 0e41 0e42 0e43 0e44 0e45 0e46 0e47 0e48 0e49 0e4a 0e4b 0e4c 0e4d 0e4e 0e4f 0e50 0e51 0e52 0e53 0e54 0e55 0e56 0e57 0e58 0e59 0e5a 0e5b 00fc 00fd 00fe 00ff";;
+  esac
+}
+_sub_cp_run() {   # $1 in  $2 out  $3 charset -> 0 ok (pure awk)
+  local tbl; tbl=$(sub_cp_table "$3"); [[ -n $tbl ]] || return 1
+  LC_ALL=C awk -v tbl="$tbl" '
+    function u8(cp) {
+      if (cp < 128)  return sprintf("%c", cp)
+      if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+      return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+    }
+    function hex(s,  i, n) { n = 0; for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1; return n }
+    BEGIN { n = split(tbl, t, " "); for (i = 1; i <= n; i++) m[sprintf("%c", 127 + i)] = u8(hex(t[i])) }
+    { line = $0
+      if (line ~ /[\200-\377]/) { out = ""; l = length(line); for (i = 1; i <= l; i++) { c = substr(line, i, 1); out = out ((c in m) ? m[c] : c) } line = out }
+      print line }
+  ' "$1" > "$2" 2>/dev/null && [[ -s $2 ]]
+}
+SUB_AWK_OK=""
+sub_awk_ok() {   # one-time self-check: some awk builds mishandle raw bytes - then we fall back to iconv instead of risking damaged text
+  [[ -n $SUB_AWK_OK ]] && { [[ $SUB_AWK_OK == 1 ]]; return; }
+  local d; d=$(mktemp -d 2>/dev/null) || { SUB_AWK_OK=0; return 1; }
+  printf '\330\263\331\204\n' > "$d/a"; printf 'x\323\341\n' > "$d/b"; printf '\323\341\307\343\n' > "$d/c"
+  if _sub_is_utf8_awk "$d/a" && ! _sub_is_utf8_awk "$d/b" && _sub_cp_run "$d/c" "$d/o" cp1256 \
+     && [[ $(od -An -v -tx1 "$d/o" | tr -d ' \n') == d8b3d984d8a7d985* ]]; then SUB_AWK_OK=1; else SUB_AWK_OK=0; fi
+  rm -rf -- "$d"
+  [[ $SUB_AWK_OK == 1 ]]
+}
+sub_is_utf8() {   # $1 file -> 0 = valid UTF-8 text. Works on phones WITHOUT iconv (awk first, iconv as the backup)
+  if sub_awk_ok; then _sub_is_utf8_awk "$1"; return; fi
+  if sub_has_iconv; then iconv -f UTF-8 -t UTF-8 < "$1" >/dev/null 2>&1; return; fi
+  return 0
+}
+sub_cp_to_utf8() {   # $1 in  $2 out  $3 charset -> 0 ok. Built-in single-byte code pages (Windows-1250..1258, 874): NO iconv needed
+  sub_awk_ok || return 1
+  _sub_cp_run "$1" "$2" "$3"
 }
 sub_text_utf8() {   # $1 in  $2 out (name ends .srt/.ass/.vtt)  $3 lang -> 0 = $2 is clean UTF-8 subtitle text ; 1 = unusable (SUB_ERR says why)
   # Persian / Arabic subtitles are very often saved as Windows-1256 (or UTF-16): ffmpeg then fails or stores garbage.
@@ -2595,32 +2653,36 @@ sub_text_utf8() {   # $1 in  $2 out (name ends .srt/.ass/.vtt)  $3 lang -> 0 = $
     [[ -s $tmp ]] || { rm -f -- "$tmp"; SUB_ERR="cannot read the subtitle file"; return 1; }
     if ! sub_is_utf8 "$tmp"; then
       case ${lang,,} in
-        fa|ar|ur|ku|ps|sd|ug|prs) cands="CP1256 ISO-8859-6 CP1252";;
-        tr|az)                   cands="CP1254 CP1252";;
-        ru|uk|bg|be|sr|mk|kk|ky|tg|mn) cands="CP1251 KOI8-R";;
-        el)                      cands="CP1253 ISO-8859-7";;
-        he|yi)                   cands="CP1255 ISO-8859-8";;
-        pl|cs|sk|hu|ro|hr|sl|sq|bs) cands="CP1250 ISO-8859-2";;
-        lt|lv|et)                cands="CP1257";;
-        th) cands="CP874";;   vi) cands="CP1258";;   zh) cands="GB18030 BIG5";;   ja) cands="CP932 EUC-JP";;   ko) cands="CP949";;
-        *)                       cands="CP1252";;
+        fa|ar|ur|ku|ps|sd|ug|prs) cands="cp1256";;
+        tr|az)                   cands="cp1254";;
+        ru|uk|bg|be|sr|mk|kk|ky|tg|mn) cands="cp1251";;
+        el)                      cands="cp1253";;
+        he|yi)                   cands="cp1255";;
+        pl|cs|sk|hu|ro|hr|sl|sq|bs) cands="cp1250";;
+        lt|lv|et)                cands="cp1257";;
+        th) cands="cp874";;   vi) cands="cp1258";;   zh) cands="GB18030 BIG5";;   ja) cands="CP932 EUC-JP";;   ko) cands="CP949";;
+        *)                       cands="cp1252";;
       esac
       [[ -n ${SUB_CHARSET:-} ]] && cands=$SUB_CHARSET
       enc=""
       for c in $cands; do
-        if command -v iconv >/dev/null 2>&1; then
-          iconv -f "$c" -t UTF-8 < "$tmp" > "$tmp.c" 2>/dev/null && [[ -s $tmp.c ]] && { enc=$c; mv -f -- "$tmp.c" "$tmp"; break; }
-        elif [[ ${out##*.} == srt ]]; then
-          ffmpeg -nostdin -v error -y -sub_charenc "$c" -i "$tmp" -f srt "$tmp.c" 2>/dev/null && [[ -s $tmp.c ]] && { enc=$c; mv -f -- "$tmp.c" "$tmp"; break; }
+        if sub_cp_to_utf8 "$tmp" "$tmp.c" "$c"; then enc=$c; break; fi       # built-in code pages: works without iconv
+        if sub_has_iconv && iconv -f "$c" -t UTF-8 < "$tmp" > "$tmp.c" 2>/dev/null && [[ -s $tmp.c ]]; then enc=$c; break; fi
+        if [[ ${out##*.} == srt ]]; then                                       # last resort: ffmpeg's own converter
+          cp -f -- "$tmp" "$tmp.in.srt"
+          if ffmpeg -nostdin -v error -y -sub_charenc "$c" -i "$tmp.in.srt" -f srt "$tmp.c" 2>/dev/null && [[ -s $tmp.c ]]; then enc=$c; fi
+          rm -f -- "$tmp.in.srt"
+          [[ -n $enc ]] && break
         fi
       done
+      if [[ -n $enc ]]; then mv -f -- "$tmp.c" "$tmp"; fi
       rm -f -- "$tmp.c"
       if [[ -z $enc ]]; then
         rm -f -- "$tmp"
-        SUB_ERR="the text is not UTF-8 and could not be converted (pkg install libiconv, or set SUB_CHARSET=CP1256)"; return 1
+        SUB_ERR="the text is not UTF-8 and could not be converted (multi-byte encodings need iconv: pkg install libiconv; or set SUB_CHARSET=CP1256)"; return 1
       fi
-      SUB_NOTE="the text was $enc - converted to UTF-8"
-      if [[ ${lang,,} == fa && $enc == CP1256 ]]; then      # legacy files use the ARABIC yeh / kaf; Persian needs ی / ک
+      SUB_NOTE="the text was ${enc^^} - converted to UTF-8"
+      if [[ ${lang,,} == fa && ${enc,,} == cp1256 ]]; then      # legacy files use the ARABIC yeh / kaf; Persian needs ی / ک
         LC_ALL=C sed -e "s/$(printf '\xd9\x8a')/$(printf '\xdb\x8c')/g" -e "s/$(printf '\xd9\x83')/$(printf '\xda\xa9')/g" "$tmp" > "$tmp.c" \
           && [[ -s $tmp.c ]] && mv -f -- "$tmp.c" "$tmp"
         rm -f -- "$tmp.c"; SUB_NOTE+=" (Arabic yeh/kaf -> Persian ی/ک)"
@@ -6798,7 +6860,7 @@ _stc_funcs()   {
            preset_race repair_lab setup_run auto_tune probe diag_probe build_vf build_venc build_aenc selftest \
            have_filter logo_caps logo_detect_core logo_detect_fixed logo_detect_moving logo_present logo_regions logo_graph \
            logo_make_preview logo_edit_one logo_refine logo_prepare logo_install \
-           sub_embed_soft sub_embed_core sub_inspect sub_text_utf8 sub_stage_text sub_is_utf8 sub_lang_norm mkv_sub_copy_args free_bytes; do
+           sub_embed_soft sub_embed_core sub_inspect sub_text_utf8 sub_stage_text sub_is_utf8 sub_cp_to_utf8 sub_cp_table sub_awk_ok sub_has_iconv sub_lang_norm mkv_sub_copy_args free_bytes; do
     declare -F "$f" >/dev/null || { echo "MISSING function: $f"; miss=1; }
   done
   (( miss == 0 ))
@@ -6851,13 +6913,30 @@ _stc_subs_mkv() {   # a Windows-1256 Persian .srt into an MKV that already has F
   ffmpeg -nostdin -v error -y -i "$ST_S/v.mp4" -i "$ST_S/sm.ass" -map 0:v -map 0:a -map 1:s -c:v copy -c:a flac -c:s ass \
     -metadata:s:s:0 language=eng "$m" || { echo "cannot build the test MKV"; return 1; }
   rm -f -- "$o"
-  SUB_FILE="$ST_S/sm.srt" SUB_LANG=fa sub_embed_soft "$m" || return 1
+  SUB_FILE="$ST_S/sm.srt" SUB_LANG=fa sub_embed_soft "$m" || { echo "embedding failed: $(tail -n 3 "$LOG" 2>/dev/null | tr '\n' ' ')"; return 1; }
   [[ -s $o ]] || { echo "no output file"; return 1; }
   [[ $(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$o") == flac ]] || { echo "the FLAC audio was re-encoded"; return 1; }
   t=$(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 "$o" | tr '\n' ,)
   [[ $t == ass,subrip, ]] || { echo "subtitle tracks are: $t (expected ass,subrip,)"; return 1; }
   t=$(ffmpeg -nostdin -v error -i "$o" -map 0:s:1 -f srt - 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
   [[ $t == *d8b3d984d8a7d985* ]] || { echo "the Persian text did not arrive as UTF-8"; return 1; }
+  return 0
+}
+_stc_sub_encodings() {   # Persian / Russian / Turkish legacy subtitle encodings and UTF-8 detection - all without iconv
+  local d="$ST_S/enc" t
+  mkdir -p "$d"
+  printf '1\r\n00:00:00,500 --> 00:00:01,500\r\n\323\341\307\343\r\n\r\n' > "$d/fa.srt"                    # Windows-1256: salam
+  printf '1\r\n00:00:00,500 --> 00:00:01,500\r\n\317\360\350\342\345\362\r\n\r\n' > "$d/ru.srt"          # Windows-1251: privet
+  printf '1\r\n00:00:00,500 --> 00:00:01,500\r\n\376\r\n\r\n' > "$d/tr.srt"                              # Windows-1254: s-cedilla
+  printf '1\n00:00:00,500 --> 00:00:01,500\n\330\263\331\204\330\247\331\205\n\n' > "$d/ok.srt"      # already UTF-8
+  sub_is_utf8 "$d/ok.srt"  || { echo "valid UTF-8 was not recognised"; return 1; }
+  sub_is_utf8 "$d/fa.srt" && { echo "Windows-1256 text was taken for UTF-8"; return 1; }
+  sub_text_utf8 "$d/fa.srt" "$d/fa.out.srt" fa || { echo "fa: $SUB_ERR"; return 1; }
+  t=$(od -An -v -tx1 "$d/fa.out.srt" | tr -d ' \n'); [[ $t == *d8b3d984d8a7d985* ]] || { echo "Persian text is wrong after conversion"; return 1; }
+  sub_text_utf8 "$d/ru.srt" "$d/ru.out.srt" ru || { echo "ru: $SUB_ERR"; return 1; }
+  t=$(od -An -v -tx1 "$d/ru.out.srt" | tr -d ' \n'); [[ $t == *d09fd180d0b8d0b2d0b5d182* ]] || { echo "Russian text is wrong after conversion"; return 1; }
+  sub_text_utf8 "$d/tr.srt" "$d/tr.out.srt" tr || { echo "tr: $SUB_ERR"; return 1; }
+  t=$(od -An -v -tx1 "$d/tr.out.srt" | tr -d ' \n'); [[ $t == *c59f* ]] || { echo "Turkish text is wrong after conversion"; return 1; }
   return 0
 }
 _stc_logo_moving() {
@@ -6984,6 +7063,7 @@ selftest() {   # $1 quick (default) | full
   _st ".w6w wrong key refused"              _stc_w6w_wrongkey
   _st ".w6w password mode (other phone)"    _stc_w6w_password
   _st ".w6w convert (video + subtitle)"     _stc_w6w_convert
+  _st "subtitle encodings (no iconv needed)" _stc_sub_encodings
   _st "subtitles into MKV (nothing lost)"   _stc_subs_mkv
   if [[ $mode == full ]]; then
     _st "moving logo (3 hops, with timeline)" _stc_logo_moving

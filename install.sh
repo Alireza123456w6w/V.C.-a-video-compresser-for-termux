@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  VidCompress Manager 1.0  |  Creator: W6W  |  offers-pishnahadat.vercel.app
+#  VidCompress Manager 1.1  |  Creator: W6W  |  offers-pishnahadat.vercel.app
 #
 #  Install, update, repair, roll back and uninstall VidCompress (vc) - from a
 #  touch-friendly menu or from the command line.
@@ -27,7 +27,7 @@
 #  Environment:  VC_BRANCH  VC_REPO  VC_RAW_BASE  VC_SHA256  VC_BIN_DIR
 # =============================================================================
 
-MGR_VERSION="1.0"
+MGR_VERSION="1.1"
 CREATOR="W6W"
 WEBSITE="offers-pishnahadat.vercel.app"
 REPO_DEFAULT="Alireza123456w6w/V.C.-a-video-compresser-for-termux"
@@ -169,10 +169,13 @@ validate_script() {   # $1 file  $2 label  $3 marker text that must appear in it
   return 0
 }
 fetch_vc() {   # -> $WORK/vc.new validated, REMOTE_VER set
-  if ! fetch "$RAW_BASE/vc.sh" "$WORK/vc.new"; then
+  local frc
+  fetch "$RAW_BASE/vc.sh" "$WORK/vc.new"; frc=$?
+  if (( frc != 0 )); then
     err "Download failed: $RAW_BASE/vc.sh"
     [[ -s $WORK/curl.err ]] && dim "  $(tail -n 1 "$WORK/curl.err")"
-    err "Check your internet connection and the branch name (now: $BRANCH)."
+    if (( frc == 22 )); then err "GitHub answered \"not found\": is the file really named vc.sh, and is the branch \"$BRANCH\" right? (Advanced -> change branch)"
+    else err "Check your internet connection."; fi
     return 2
   fi
   validate_script "$WORK/vc.new" "vc.sh" "VidCompress" || return 1
@@ -185,15 +188,22 @@ fetch_vc() {   # -> $WORK/vc.new validated, REMOTE_VER set
   fi
   return 0
 }
-remote_version_quick() {   # newest vc version without downloading everything (first 128 KB)
-  local data
-  data=$(curl -fsSL --connect-timeout 6 --max-time 10 -r 0-131071 "$RAW_BASE/vc.sh" 2>/dev/null) || return 1
+remote_version_quick() {   # newest vc version from the first 128 KB.   return 0 ok | 1 no connection | 3 file not found on GitHub
+  local data rc code
+  data=$(curl -sSL --connect-timeout 6 --max-time 10 -r 0-131071 -w '\n__HTTP__%{http_code}' "$RAW_BASE/vc.sh" 2>/dev/null); rc=$?
+  (( rc == 0 )) || return 1
+  code=${data##*__HTTP__}; data=${data%$'\n'__HTTP__*}
+  case $code in 404|403|410) return 3;; esac
+  [[ $code == 2* || $code == 0 || $code == 000 ]] || return 1
   printf '%s\n' "$data" | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -1
 }
-refresh_latest() {
-  LATEST_VER=$(remote_version_quick); LATEST_STATE=""
-  if [[ -z $LATEST_VER ]]; then LATEST_STATE="offline"; return 1; fi
-  local lv; lv=$(local_ver)
+refresh_latest() {   # sets LATEST_VER and LATEST_STATE: current | update | new | offline | notfound
+  local rc lv
+  LATEST_VER=$(remote_version_quick); rc=$?
+  LATEST_STATE=""
+  if (( rc == 1 )); then LATEST_STATE="offline"; return 1; fi
+  if (( rc == 3 )) || [[ -z $LATEST_VER ]]; then LATEST_STATE="notfound"; return 1; fi
+  lv=$(local_ver)
   if [[ -z $lv ]]; then LATEST_STATE="new"
   elif ver_gt "$LATEST_VER" "$lv"; then LATEST_STATE="update"
   else LATEST_STATE="current"; fi
@@ -212,7 +222,7 @@ put_file() {   # $1 source  $2 destination   (atomic: build next to it, then ren
   return 1
 }
 BACKUPS=()
-list_backups() { BACKUPS=(); local f; for f in $(ls -1t "$BACKUP_DIR"/vc-*.sh 2>/dev/null); do BACKUPS+=("$f"); done; }
+list_backups() { BACKUPS=(); local f; while IFS= read -r f; do [[ -n $f ]] && BACKUPS+=("$f"); done < <(ls -1t "$BACKUP_DIR"/vc-*.sh 2>/dev/null); }
 backup_vc() {
   [[ -f $BIN_DIR/vc ]] || return 0
   (( DRY )) && { info "[dry-run] would back up the current vc"; return 0; }
@@ -312,7 +322,10 @@ do_install() {   # $1 = install | update | repair
 }
 do_check() {
   local lv; lv=$(local_ver)
-  if ! refresh_latest; then err "Cannot reach GitHub (offline?)."; return 2; fi
+  if ! refresh_latest; then
+    if [[ $LATEST_STATE == notfound ]]; then err "vc.sh was not found on GitHub (branch \"$BRANCH\") - check the file name and the branch."; else err "Cannot reach GitHub (offline?)."; fi
+    return 2
+  fi
   if [[ -z $lv ]]; then info "vc is not installed. Latest version: $LATEST_VER"; return 10; fi
   if [[ $LATEST_STATE == update ]]; then info "Update available: $lv -> $LATEST_VER   (run: vcman --update)"; return 10; fi
   ok "vc $lv is up to date."; return 0
@@ -388,6 +401,7 @@ show_status() {
       update)  row "Latest" "${C_Y}$LATEST_VER - update available${C_0}";;
       current) row "Latest" "${C_G}$LATEST_VER - up to date${C_0}";;
       offline) row "Latest" "${C_D}offline${C_0}";;
+      notfound) row "Latest" "${C_Y}vc.sh not found on branch \"$BRANCH\"${C_0}";;
     esac
   fi
   list_backups; row "Backups" "${#BACKUPS[@]} previous version(s)"
@@ -422,10 +436,11 @@ show_status() {
 }
 
 # --------------------------------------------------------------- uninstall ---
+SKIPPED=0
 remove_file() {   # $1 path  $2 check function (only remove files that really are ours)
   local f=$1 chk=${2:-}
   [[ -e $f || -L $f ]] || return 0
-  if [[ -n $chk ]] && ! $chk "$f"; then warn "Skipped $f (it is not a VidCompress file)."; return 0; fi
+  if [[ -n $chk ]] && ! $chk "$f"; then warn "Skipped $f (it is not a VidCompress file)."; SKIPPED=$((SKIPPED + 1)); return 0; fi
   if (( DRY )); then info "[dry-run] would remove $f"; else rm -f -- "$f" && info "  removed $f"; fi
 }
 is_vcdel_file() { [[ -f $1 ]] && grep -q 'vcman' "$1" 2>/dev/null; }
@@ -474,7 +489,7 @@ run_uninstall() {   # $1: 1 = commands only | 2 = + data (key kept) | 3 = + data
   hash -r 2>/dev/null
   echo
   if (( DRY )); then info "Dry run finished."; return 0; fi
-  ok "VidCompress was removed."
+  if (( SKIPPED )); then ok "VidCompress was removed ($SKIPPED file(s) that are not ours were left alone)."; else ok "VidCompress was removed."; fi
   case $level in
     1) dim "   Your settings, profiles and .w6w key are still in $CONF_DIR (reinstall any time).";;
     2) dim "   Settings and logs were deleted. The .w6w key was kept: $CONF_DIR/w6w.key";;
@@ -579,6 +594,7 @@ menu_header() {
     current) row "Latest" "${C_G}$LATEST_VER  (up to date)${C_0}";;
     new)     row "Latest" "$LATEST_VER";;
     offline) row "Latest" "${C_D}offline - could not check${C_0}";;
+    notfound) row "Latest" "${C_Y}vc.sh not found on branch \"$BRANCH\" (Advanced -> change branch)${C_0}";;
     *)       row "Latest" "${C_D}not checked${C_0}";;
   esac
   command -v ffmpeg >/dev/null 2>&1 && row "ffmpeg" "${C_G}✔${C_0} $(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')" || row "ffmpeg" "${C_R}✘ missing${C_0}"
